@@ -1,0 +1,30 @@
+# Канонический экземпляр. На сервере лежит в
+# /opt/briefgenerator/deploy/conf.d/cryptomcp.aithinglab.com.caddy
+#
+# CI этот файл НЕ трогает: общий Caddy обслуживает все проекты сразу, и деплой
+# одного не должен затирать роутинг соседнего. Правки вносятся вручную.
+#
+# Аутентификация живёт в самом приложении (см. cryptomcp/app.py), а не здесь:
+# иначе Caddy понадобилась бы переменная с токеном, то есть правка compose
+# чужого проекта.
+
+cryptomcp.aithinglab.com {
+	encode zstd gzip
+
+	# MCP по streamable-http держит длинные ответы и SSE-поток, поэтому
+	# буферизация ответа отключена, а таймаут чтения увеличен: пагинация
+	# истории на 5m занимает до нескольких секунд.
+	reverse_proxy cryptomcp:8000 {
+		flush_interval -1
+		transport http {
+			read_timeout 120s
+		}
+	}
+
+	log {
+		output file /var/log/caddy/cryptomcp.log {
+			roll_size 10mb
+			roll_keep 5
+		}
+	}
+}

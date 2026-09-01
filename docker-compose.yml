@@ -1,0 +1,38 @@
+# Разворачивается в /opt/cryptomcp на Hetzner под пользователем deploy.
+#
+# Портов наружу не публикует: снаружи виден только общий Caddy, который ходит
+# в контейнер по имени внутри сети briefgenerator_internal. Мост через
+# 172.28.0.1 с правилами ufw здесь не нужен — он нужен пользователю vibecoding
+# с rootless-докером, а deploy работает с тем же демоном, что и Caddy.
+
+services:
+  cryptomcp:
+    build: .
+    container_name: cryptomcp
+    restart: unless-stopped
+    environment:
+      CRYPTOMCP_TRANSPORT: streamable-http
+      CRYPTOMCP_HOST: 0.0.0.0
+      CRYPTOMCP_PORT: 8000
+      CRYPTOMCP_PUBLIC_HOST: cryptomcp.aithinglab.com
+      CRYPTOMCP_LOG_LEVEL: INFO
+      # Токен приходит из .env рядом с этим файлом, в репозиторий не попадает.
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?нужен MCP_AUTH_TOKEN в .env}
+    volumes:
+      # Журнал индекса (PLAN §4.11) должен переживать пересборку образа:
+      # его ценность именно в накоплении, начатом с первого дня.
+      - cryptomcp_journal:/app/journal
+    networks:
+      - briefgenerator_internal
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  cryptomcp_journal:
+
+networks:
+  briefgenerator_internal:
+    external: true

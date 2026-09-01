@@ -1,0 +1,88 @@
+name: test & deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: установка зависимостей
+        run: pip install -e ".[dev]"
+
+      - name: линт
+        run: ruff check cryptomcp/ tests/
+
+      - name: тесты
+        # Тесты не ходят в сеть: всё на синтетических рядах, поэтому CI
+        # не зависит от доступности Binance и не расходует лимит веса.
+        run: pytest -q
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ключ SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "${{ secrets.SSH_PORT }}" -H "${{ secrets.SSH_HOST }}" \
+            >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: выгрузка файлов
+        # Caddy-конфиг сознательно исключён: общий файл на сервере правится
+        # вручную, чтобы деплой одного проекта не затирал роутинг соседнего.
+        run: |
+          rsync -az --delete \
+            -e "ssh -p ${{ secrets.SSH_PORT }} -i ~/.ssh/id_ed25519" \
+            --exclude '.git' --exclude '.venv' --exclude 'journal' \
+            --exclude 'deploy' --exclude '.github' \
+            ./ "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/cryptomcp/"
+
+      - name: сборка и запуск
+        run: |
+          ssh -p "${{ secrets.SSH_PORT }}" -i ~/.ssh/id_ed25519 \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "cd /opt/cryptomcp && \
+             printf 'MCP_AUTH_TOKEN=%s\n' '${{ secrets.MCP_AUTH_TOKEN }}' > .env && \
+             chmod 600 .env && \
+             docker compose up -d --build && \
+             docker image prune -f"
+
+      - name: health-check
+        # Проверяем изнутри сети: снаружи ответ зависит ещё и от DNS с Caddy,
+        # и падение здесь не отличить от проблемы с прокси.
+        run: |
+          ssh -p "${{ secrets.SSH_PORT }}" -i ~/.ssh/id_ed25519 \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            'for i in $(seq 1 20); do
+               if docker exec cryptomcp python -c "import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/health\", timeout=3)" 2>/dev/null; then
+                 echo "health ok"; exit 0
+               fi
+               sleep 3
+             done
+             echo "health не поднялся"; docker logs --tail 50 cryptomcp; exit 1'
+
+      - name: проверка через домен
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+            https://cryptomcp.aithinglab.com/health || true)
+          echo "внешний health: HTTP $code"
+          test "$code" = "200"
