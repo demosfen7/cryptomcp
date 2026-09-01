@@ -1,30 +1,23 @@
-# Канонический экземпляр. На сервере лежит в
-# /opt/briefgenerator/deploy/conf.d/cryptomcp.aithinglab.com.caddy
+# Сайт cryptomcp для прод-Caddy. Копируется в conf.d Caddy briefgenerator:
+#   /opt/briefgenerator/deploy/conf.d/cryptomcp.aithinglab.com.caddy
+# Проксирует на контейнер cryptomcp (/opt/cryptomcp). Авто-HTTPS (Let's Encrypt).
 #
-# CI этот файл НЕ трогает: общий Caddy обслуживает все проекты сразу, и деплой
+# CI этот файл НЕ копирует: общий Caddy обслуживает все проекты сразу, и деплой
 # одного не должен затирать роутинг соседнего. Правки вносятся вручную.
 #
-# Аутентификация живёт в самом приложении (см. cryptomcp/app.py), а не здесь:
-# иначе Caddy понадобилась бы переменная с токеном, то есть правка compose
-# чужого проекта.
-
+# Аутентификация живёт в самом приложении (cryptomcp/app.py), а не здесь: иначе
+# Caddy понадобилась бы переменная с токеном, то есть правка compose чужого
+# проекта. Путь /health намеренно открыт — им пользуется деплой.
 cryptomcp.aithinglab.com {
 	encode zstd gzip
+	header Strict-Transport-Security "max-age=31536000"
 
-	# MCP по streamable-http держит длинные ответы и SSE-поток, поэтому
-	# буферизация ответа отключена, а таймаут чтения увеличен: пагинация
-	# истории на 5m занимает до нескольких секунд.
 	reverse_proxy cryptomcp:8000 {
+		# MCP по streamable-http держит SSE-поток — буферизация ответа не нужна.
 		flush_interval -1
 		transport http {
-			read_timeout 120s
-		}
-	}
-
-	log {
-		output file /var/log/caddy/cryptomcp.log {
-			roll_size 10mb
-			roll_keep 5
+			# Постраничная догрузка истории на 5m занимает несколько секунд.
+			response_header_timeout 180s
 		}
 	}
 }
