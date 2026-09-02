@@ -26,7 +26,12 @@ from .levels import Level, Pivots
 from .markets import FUTURES, Market
 from .series import Series
 from .symbols import SymbolInfo, format_price
-from .volume import MIN_SAMPLES_PER_SLOT, baseline_series
+from .volume import (
+    MIN_SAMPLES_PER_SLOT,
+    TAKER_PRESSURE,
+    Absorption,
+    baseline_series,
+)
 
 #: Ближе этого расстояния уровень считается «под ценой», и показывается
 #: следующий за ним — иначе видно, что цена на уровне, но не видно, куда ход.
@@ -616,3 +621,30 @@ def render_scan_history(
         "запись одна на закрытую свечу, поэтому шаг строк равен таймфрейму",
     ]
     return "\n".join(lines)
+
+
+def render_absorption(data: Absorption | None, *, skipped: str | None = None) -> str:
+    """Блок поглощения — по младшему ряду, отдельной секцией.
+
+    Печатается отдельно от группы 2 сознательно: там объём СВОЕГО таймфрейма и
+    его затухание, здесь — набор позиции внутри дня. Слить их в одну секцию
+    значило бы предложить сравнить числа, посчитанные по разным рядам.
+    """
+    if data is None or skipped is not None:
+        return f"\n\n6. Поглощение (младший ТФ)\n   n/a — {skipped}"
+
+    # «3+ подряд» — та граница, ниже которой серия неотличима от выброса.
+    streak = f"{data.taker_streak} подряд" if data.taker_streak else "нет"
+    return "\n".join([
+        f"\n\n6. Поглощение (ряд {data.interval}, окно {data.window} свечей)",
+        f"   бары набора      {data.bars} "
+        f"(объём ≥3x при |Δцены| <0.5 ATR)",
+        f"   takerB           средняя {data.taker_mean:.2f} · "
+        f"максимум {data.taker_max:.2f} · "
+        f"выше {TAKER_PRESSURE:.2f}: {data.taker_above} свечей",
+        f"   серия выше 0.50  {streak}",
+        f"   объём последней  {data.volume_ratio:.2f}x"
+        + ("~ слабая база" if data.weak_basis else ""),
+        "   считается на младшем ряду: дневное разрешение стирает поглощение "
+        "внутри свечи",
+    ])

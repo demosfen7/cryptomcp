@@ -10,13 +10,20 @@
 
 from __future__ import annotations
 
+import logging
+import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 
+from . import storage
 from .client import BinanceClient
 from .indicators import Metric, with_percentile
+from .reader import archive_path
+
+log = logging.getLogger("cryptomcp.derivatives")
 
 HOURS_PER_YEAR = 24 * 365
 
@@ -63,6 +70,9 @@ class Funding:
     percentile: Metric | None = None
     #: Последние начисления, старые→новые: (время, ставка).
     history: tuple[tuple[int, float], ...] = ()
+    #: Откуда взяты числа: "биржа" или "архив". В ретроспективе это не
+    #: украшение — за пределами хранимого биржей окна источник только один.
+    source: str = "биржа"
 
     @property
     def annualized_pct(self) -> float:
@@ -111,6 +121,8 @@ class OpenInterest:
     percentile: Metric | None = None
     #: Почасовой ряд, старые→новые: (время, контракты, цена).
     history: tuple[tuple[int, float, float], ...] = ()
+    #: Откуда взяты числа: "биржа" или "архив".
+    source: str = "биржа"
 
     def quadrant(
         self, window: str, threshold: float = DEFAULT_OI_THRESHOLD
@@ -176,12 +188,147 @@ def classify_price_oi(
     return "новые шорты" if oi_change > 0 else "закрытие лонгов"
 
 
-class DerivativesReader:
-    """Собирает фандинг и открытый интерес по символу."""
+def build_open_interest(
+    symbol: str,
+    short: Sequence[tuple[int, float, float]],
+    short_step_minutes: int,
+    long: Sequence[tuple[int, float, float]],
+    long_step_minutes: int,
+    *,
+    windows: tuple[str, ...],
+    contracts: float | None = None,
+    source: str = "биржа",
+) -> OpenInterest:
+    """Собрать выдачу из готовых рядов (время, контракты, стоимость).
 
-    def __init__(self, client: BinanceClient) -> None:
+    Один сборщик на оба источника сознательно. Биржа и архив отдают одни и те
+    же величины разной формой, и посчитать дельты дважды в двух местах значило
+    бы повторить болезнь «два пути, два числа», которая в этом проекте всплывала
+    трижды. Здесь разные только рядоприносящие функции; арифметика одна.
+
+    ``short`` кормит дельты (мелкий шаг — свежий отсчёт), ``long`` — ряд и
+    перцентиль (крупный шаг — длинный охват). Причина разделения та же, что и
+    была: 500 пятиминутных точек это 41 час, и перцентиль на них означал бы
+    «против позавчера».
+    """
+    if not short:
+        return OpenInterest(symbol, contracts or 0.0, 0.0, {}, {}, source=source)
+
+    oi_series = np.array([row[1] for row in short])
+    value_series = np.array([row[2] for row in short])
+    # Цена восстанавливается из пары «стоимость / контракты»: отдельный запрос
+    # свечей ради этого не нужен, а моменты замеров совпадают точно.
+    price_series = np.divide(
+        value_series, oi_series,
+        out=np.full_like(value_series, np.nan), where=oi_series > 0,
+    )
+
+    change: dict[str, float] = {}
+    price_change: dict[str, float] = {}
+    for window in windows:
+        back = _window_minutes(window) // short_step_minutes
+        if back <= 0 or back >= len(oi_series):
+            continue
+        change[window] = _pct_change(oi_series[-1], oi_series[-1 - back])
+        price_change[window] = _pct_change(price_series[-1], price_series[-1 - back])
+
+    base = list(long) or list(short)
+    base_step = long_step_minutes if long else short_step_minutes
+    base_oi = np.array([row[1] for row in base])
+    base_value = np.array([row[2] for row in base])
+    base_price = np.divide(
+        base_value, base_oi,
+        out=np.full_like(base_value, np.nan), where=base_oi > 0,
+    )
+    tail = slice(max(0, len(base) - OI_HISTORY_POINTS), len(base))
+    history = tuple(
+        (int(base[i][0]), float(base_oi[i]), float(base_price[i]))
+        for i in range(tail.start, tail.stop)
+    )
+
+    span_days = len(base_oi) * base_step / (60 * 24)
+    percentile = with_percentile(
+        "open_interest", base_oi[-1], base_oi[:-1], span_days,
+        span_exemption=OI_SPAN_EXEMPTION,
+    )
+
+    return OpenInterest(
+        symbol=symbol,
+        contracts=contracts if contracts is not None else float(oi_series[-1]),
+        notional_usdt=float(value_series[-1]),
+        change=change,
+        price_change=price_change,
+        percentile=percentile,
+        history=history,
+        source=source,
+    )
+
+
+def build_funding(
+    symbol: str,
+    settlements: Sequence[tuple[int, float]],
+    interval_hours: int,
+    *,
+    rate: float | None = None,
+    next_funding_ms: int = 0,
+    mark_price: float = 0.0,
+    index_price: float = 0.0,
+    source: str = "биржа",
+) -> Funding:
+    """Собрать фандинг из ряда начислений, старые→новые.
+
+    ``rate`` задаётся отдельно, потому что у живого запроса это ТЕКУЩАЯ ставка
+    из premiumIndex, ещё не начисленная, а в ретроспективе — последнее
+    начисление до запрошенного момента. Величины разные по смыслу, и подменять
+    одну другой нельзя.
+    """
+    percentile: Metric | None = None
+    current = rate
+    if settlements:
+        values = np.array([value for _, value in settlements])
+        if current is None:
+            current = float(values[-1])
+        span_days = (settlements[-1][0] - settlements[0][0]) / 86_400_000
+        percentile = with_percentile(
+            "funding", current, values[:-1], span_days,
+            unit="", threshold=90, threshold_side="above",
+        )
+    return Funding(
+        symbol=symbol,
+        rate=current or 0.0,
+        interval_hours=interval_hours,
+        next_funding_ms=next_funding_ms,
+        mark_price=mark_price,
+        index_price=index_price,
+        percentile=percentile,
+        history=tuple(settlements[-FUNDING_HISTORY_POINTS:]),
+        source=source,
+    )
+
+
+class DerivativesReader:
+    """Собирает фандинг и открытый интерес по символу.
+
+    Ретроспектива (``as_of_ms``) читается из архива сборщика, а не из биржи, и
+    это не оптимизация: раздел /futures/data/ отдаёт тридцать суток, дальше
+    архив — единственный источник, который вообще существует. Где архив не
+    покрывает запрошенный момент, запрос уходит на биржу с endTime, и источник
+    подписывается в выдаче.
+    """
+
+    def __init__(self, client: BinanceClient, path: str | None = None) -> None:
         self._client = client
         self._intervals: dict[str, int] | None = None
+        self._path = path if path is not None else archive_path()
+
+    def _archive(self) -> sqlite3.Connection | None:
+        if self._path is None:
+            return None
+        try:
+            return storage.connect(self._path, read_only=True)
+        except sqlite3.Error as error:  # база занята или повреждена — не беда
+            log.warning("архив деривативов недоступен: %s", error)
+            return None
 
     async def funding_intervals(self) -> dict[str, int]:
         if self._intervals is None:
@@ -191,43 +338,60 @@ class DerivativesReader:
             }
         return self._intervals
 
-    async def funding(self, symbol: str, *, history: bool = True) -> Funding:
+    async def funding(
+        self, symbol: str, *, history: bool = True, as_of_ms: int | None = None
+    ) -> Funding:
         symbol = symbol.upper()
-        premium = await self._client.premium_index(symbol)
         intervals = await self.funding_intervals()
         interval_h = intervals.get(symbol, DEFAULT_FUNDING_INTERVAL_H)
-        rate = float(premium["lastFundingRate"])
 
-        percentile: Metric | None = None
-        settlements: tuple[tuple[int, float], ...] = ()
+        if as_of_ms is not None:
+            settlements, source = await self._funding_history(symbol, as_of_ms)
+            # Маркировочная и индексная цены существуют только «сейчас»:
+            # premiumIndex не отдаёт их за прошлое ни в каком виде. Поэтому
+            # базиса в ретроспективе нет, и подставлять вместо него что-то
+            # похожее было бы выдумыванием числа.
+            return build_funding(symbol, settlements, interval_h, source=source)
+
+        premium = await self._client.premium_index(symbol)
+        settlements = []
         if history:
             # История фандинга глубокая — проверено на 900 суток назад,
             # поэтому правило §4.2 выполняется без всяких послаблений.
             rows = await self._client.funding_rate(symbol, limit=1000)
-            if rows:
-                values = np.array([float(r["fundingRate"]) for r in rows])
-                span_days = (
-                    int(rows[-1]["fundingTime"]) - int(rows[0]["fundingTime"])
-                ) / 86_400_000
-                percentile = with_percentile(
-                    "funding", rate, values[:-1], span_days,
-                    unit="", threshold=90, threshold_side="above",
-                )
-                settlements = tuple(
-                    (int(r["fundingTime"]), float(r["fundingRate"]))
-                    for r in rows[-FUNDING_HISTORY_POINTS:]
-                )
-
-        return Funding(
-            symbol=symbol,
-            rate=rate,
-            interval_hours=interval_h,
+            settlements = [
+                (int(r["fundingTime"]), float(r["fundingRate"])) for r in rows
+            ]
+        return build_funding(
+            symbol, settlements, interval_h,
+            rate=float(premium["lastFundingRate"]),
             next_funding_ms=int(premium["nextFundingTime"]),
             mark_price=float(premium["markPrice"]),
             index_price=float(premium["indexPrice"]),
-            percentile=percentile,
-            history=settlements,
         )
+
+    async def _funding_history(
+        self, symbol: str, as_of_ms: int
+    ) -> tuple[list[tuple[int, float]], str]:
+        """Начисления до момента: сперва архив, при промахе — биржа."""
+        con = self._archive()
+        if con is not None:
+            try:
+                rows = storage.funding_window(con, symbol, as_of_ms, limit=1000)
+            except sqlite3.Error as error:
+                log.warning("фандинг не прочитан из архива (%s): %s", symbol, error)
+                rows = []
+            finally:
+                con.close()
+            # Одного начисления мало: перцентиль считается по ряду, и короткий
+            # архив хуже биржи, которая отдаёт историю за годы.
+            if len(rows) > 1:
+                return rows, "архив"
+
+        raw = await self._client.funding_rate(symbol, limit=1000, end_time=as_of_ms)
+        return [
+            (int(r["fundingTime"]), float(r["fundingRate"])) for r in raw
+        ], "биржа"
 
     async def open_interest(
         self,
@@ -236,6 +400,7 @@ class DerivativesReader:
         period: str = "5m",
         windows: tuple[str, ...] = ("1h", "4h", "24h"),
         history_period: str = "1h",
+        as_of_ms: int | None = None,
     ) -> OpenInterest:
         """Открытый интерес: дельты по окнам, почасовой ряд и перцентиль.
 
@@ -248,65 +413,85 @@ class DerivativesReader:
         единицу веса и кэшируется на пять минут.
         """
         symbol = symbol.upper()
+        if as_of_ms is not None:
+            return await self._open_interest_as_of(
+                symbol, as_of_ms, period=period, windows=windows,
+                history_period=history_period,
+            )
+
         current = await self._client.open_interest(symbol)
-        rows = await self._client.open_interest_hist(symbol, period=period, limit=500)
-        long_rows = await self._client.open_interest_hist(
-            symbol, period=history_period, limit=500
+        short = _oi_rows(
+            await self._client.open_interest_hist(symbol, period=period, limit=500)
+        )
+        long_rows = _oi_rows(
+            await self._client.open_interest_hist(
+                symbol, period=history_period, limit=500
+            )
+        )
+        return build_open_interest(
+            symbol, short, _period_minutes(period),
+            long_rows, _period_minutes(history_period),
+            windows=windows, contracts=float(current["openInterest"]),
         )
 
-        contracts = float(current["openInterest"])
-        if not rows:
-            return OpenInterest(symbol, contracts, 0.0, {}, {})
+    async def _open_interest_as_of(
+        self,
+        symbol: str,
+        as_of_ms: int,
+        *,
+        period: str,
+        windows: tuple[str, ...],
+        history_period: str,
+    ) -> OpenInterest:
+        """Открытый интерес на момент в прошлом.
 
-        oi_series = np.array([float(r["sumOpenInterest"]) for r in rows])
-        value_series = np.array([float(r["sumOpenInterestValue"]) for r in rows])
-        # Цена восстанавливается из пары «стоимость / контракты»: отдельный
-        # запрос свечей ради этого не нужен, а моменты замеров совпадают точно.
-        price_series = np.divide(
-            value_series, oi_series,
-            out=np.full_like(value_series, np.nan), where=oi_series > 0,
+        Архив хранит шаг 5m за тридцать суток, то есть покрывает и дельты, и
+        длинный ряд одним чтением: часовая база получается прореживанием того
+        же ряда. Биржа за те же тридцать суток отдаёт 500 точек часового шага,
+        то есть двадцать суток, — архив здесь не просто дешевле, он длиннее.
+        """
+        step = _period_minutes(period)
+        long_step = _period_minutes(history_period)
+        con = self._archive()
+        if con is not None:
+            try:
+                rows = storage.derivatives_window(
+                    con, symbol, as_of_ms - OI_HISTORY_DAYS * 86_400_000, as_of_ms
+                )
+            except sqlite3.Error as error:
+                log.warning("OI не прочитан из архива (%s): %s", symbol, error)
+                rows = []
+            finally:
+                con.close()
+            if len(rows) > 1:
+                every = max(1, long_step // step)
+                return build_open_interest(
+                    symbol, rows, step, rows[::every], long_step,
+                    windows=windows, source="архив",
+                )
+
+        short = _oi_rows(
+            await self._client.open_interest_hist(
+                symbol, period=period, limit=500, end_time=as_of_ms
+            )
+        )
+        long_rows = _oi_rows(
+            await self._client.open_interest_hist(
+                symbol, period=history_period, limit=500, end_time=as_of_ms
+            )
+        )
+        return build_open_interest(
+            symbol, short, step, long_rows, long_step, windows=windows,
         )
 
-        step_minutes = _period_minutes(period)
-        change: dict[str, float] = {}
-        price_change: dict[str, float] = {}
-        for window in windows:
-            back = _window_minutes(window) // step_minutes
-            if back <= 0 or back >= len(oi_series):
-                continue
-            change[window] = _pct_change(oi_series[-1], oi_series[-1 - back])
-            price_change[window] = _pct_change(price_series[-1], price_series[-1 - back])
 
-        # Ряд и перцентиль — по длинной истории; дельты выше — по короткой.
-        base_rows = long_rows or rows
-        base_step = _period_minutes(history_period if long_rows else period)
-        base_oi = np.array([float(r["sumOpenInterest"]) for r in base_rows])
-        base_value = np.array([float(r["sumOpenInterestValue"]) for r in base_rows])
-        base_price = np.divide(
-            base_value, base_oi,
-            out=np.full_like(base_value, np.nan), where=base_oi > 0,
-        )
-        tail = slice(max(0, len(base_rows) - OI_HISTORY_POINTS), len(base_rows))
-        oi_history = tuple(
-            (int(base_rows[i]["timestamp"]), float(base_oi[i]), float(base_price[i]))
-            for i in range(tail.start, tail.stop)
-        )
-
-        span_days = len(base_oi) * base_step / (60 * 24)
-        percentile = with_percentile(
-            "open_interest", base_oi[-1], base_oi[:-1], span_days,
-            span_exemption=OI_SPAN_EXEMPTION,
-        )
-
-        return OpenInterest(
-            symbol=symbol,
-            contracts=contracts,
-            notional_usdt=float(value_series[-1]),
-            change=change,
-            price_change=price_change,
-            percentile=percentile,
-            history=oi_history,
-        )
+def _oi_rows(raw: list[dict]) -> list[tuple[int, float, float]]:
+    """Ответ биржи → тот же вид, в каком ряд лежит в архиве."""
+    return [
+        (int(r["timestamp"]), float(r["sumOpenInterest"]),
+         float(r["sumOpenInterestValue"]))
+        for r in raw
+    ]
 
 
 def _pct_change(current: float, previous: float) -> float:

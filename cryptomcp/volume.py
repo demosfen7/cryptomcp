@@ -232,3 +232,90 @@ def volume_context(series: Series, atr_values: np.ndarray) -> VolumeContext:
         anomalous_bars=anomalous_bars(series, atr_values),
         taker_buy_mean=taker_mean,
     )
+
+
+#: Нейтраль доли тейкер-покупок: половина объёма прошла по рынку в покупку.
+TAKER_NEUTRAL = 0.50
+
+#: Выше этого доля считается перевесом покупателя, а не шумом вокруг нейтрали.
+TAKER_PRESSURE = 0.55
+
+#: Окно, на котором меряется поглощение. То же, что у аномальных баров.
+ABSORPTION_WINDOW = 30
+
+
+@dataclass(frozen=True)
+class Absorption:
+    """Признаки поглощения на МЛАДШЕМ таймфрейме.
+
+    Отдельная от `VolumeContext` величина, потому что считается по другому ряду.
+    Сжатие измеряется на своём таймфрейме, накопление — всегда на часовом или
+    мельче, и вот почему: у ASTER перед пробоем 19.08 дневная свеча показывала
+    ноль аномальных баров и долю тейкер-покупок 0.48, то есть «покупателя нет».
+    Всё поглощение произошло ВНУТРИ этой свечи — 7.15x объёма при теле +0.03%
+    в 06:00 и семь часов повышенного объёма при стоящей цене, с долей
+    тейкер-покупок до 0.72. Определение аномального бара при этом одно и то же;
+    разное только разрешение, и дневное стирает признак полностью.
+
+    Средней по окну для той же причины мало: 0.48 на дневке прячет часы по
+    0.57, 0.60 и 0.72. Серия важнее разового выброса — она означает устойчивый
+    перевес покупателя, а не одну заявку.
+    """
+
+    interval: str
+    bars: int
+    window: int
+    taker_mean: float
+    taker_max: float
+    taker_above: int
+    taker_streak: int
+    volume_ratio: float
+    weak_basis: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "interval": self.interval,
+            "absorption_bars": self.bars,
+            "window": self.window,
+            "taker_mean": round(self.taker_mean, 3),
+            "taker_max": round(self.taker_max, 3),
+            "taker_above_pressure": self.taker_above,
+            "taker_longest_streak": self.taker_streak,
+            "volume_ratio": round(self.volume_ratio, 3),
+        }
+
+
+def longest_streak(values: np.ndarray, threshold: float) -> int:
+    """Самая длинная серия подряд выше порога."""
+    best = current = 0
+    for value in values:
+        if not np.isnan(value) and value > threshold:
+            current += 1
+            best = max(best, current)
+        else:
+            current = 0
+    return best
+
+
+def absorption(
+    series: Series, atr_values: np.ndarray, *, window: int = ABSORPTION_WINDOW
+) -> Absorption:
+    """Поглощение по младшему ряду: бары набора и разрешение по тейкерам."""
+    taker = series.taker_buy_ratio[-window:]
+    volumes = series.quote_volume
+    baseline, _, samples = seasonal_baseline(series)
+    ratio = (
+        float(volumes[-1] / baseline)
+        if baseline and not np.isnan(baseline) else float("nan")
+    )
+    return Absorption(
+        interval=series.interval,
+        bars=anomalous_bars(series, atr_values, window=window),
+        window=min(window, len(taker)),
+        taker_mean=float(np.nanmean(taker)) if len(taker) else float("nan"),
+        taker_max=float(np.nanmax(taker)) if len(taker) else float("nan"),
+        taker_above=int(np.sum(taker > TAKER_PRESSURE)) if len(taker) else 0,
+        taker_streak=longest_streak(taker, TAKER_NEUTRAL),
+        volume_ratio=ratio,
+        weak_basis=samples < MIN_SAMPLES_PER_SLOT,
+    )

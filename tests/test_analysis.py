@@ -271,3 +271,26 @@ class TestPercentileBase:
         history, span = percentile_base(values, "4h")
         assert len(history) == 360
         assert not np.isnan(history).any()
+
+
+class TestAccumulationInterval:
+    """Сжатие меряется на своём ТФ, накопление — всегда на 1h или мельче."""
+
+    def test_higher_timeframes_drop_to_hourly(self):
+        from cryptomcp.analysis import accumulation_interval
+
+        assert accumulation_interval("1w") == "1h"
+        assert accumulation_interval("1d") == "1h"
+        assert accumulation_interval("4h") == "1h"
+
+    def test_hourly_and_below_step_down(self):
+        """На своём же ряду «поглощение» было бы повтором объёмной группы."""
+        from cryptomcp.analysis import accumulation_interval
+
+        assert accumulation_interval("1h") == "15m"
+        assert accumulation_interval("15m") == "5m"
+
+    def test_lowest_stays_put(self):
+        from cryptomcp.analysis import accumulation_interval
+
+        assert accumulation_interval("1m") == "1m"

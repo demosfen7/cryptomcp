@@ -68,6 +68,33 @@ def required_candles(interval: str) -> int:
     return max(PERCENTILE_WINDOW + 1, by_span + 1)
 
 
+#: Крупнейший таймфрейм, на котором ещё видно поглощение внутри дня.
+ACCUMULATION_CEILING = "1h"
+
+#: Лестница вниз для выбора ряда под накопление.
+_LADDER_DOWN = ("1w", "1d", "4h", "1h", "15m", "5m", "1m")
+
+
+def accumulation_interval(interval: str) -> str:
+    """На каком ряду считать накопление для сжатия, найденного на ``interval``.
+
+    Правило: сжатие меряется на своём таймфрейме, накопление — всегда на
+    часовом или мельче. Причина в §4.19: дневное разрешение стирает поглощение
+    целиком, потому что оно происходит внутри одной свечи.
+
+    Для запросов от 1h и ниже берётся ступень вниз: на своём же ряду
+    «поглощение» было бы просто повтором объёмной группы.
+    """
+    from .series import interval_ms
+
+    if interval_ms(interval) > interval_ms(ACCUMULATION_CEILING):
+        return ACCUMULATION_CEILING
+    if interval not in _LADDER_DOWN:
+        return interval
+    index = _LADDER_DOWN.index(interval)
+    return _LADDER_DOWN[min(index + 1, len(_LADDER_DOWN) - 1)]
+
+
 def percentile_base(values: np.ndarray, interval: str) -> tuple[np.ndarray, float]:
     """База для перцентиля и её КАЛЕНДАРНЫЙ охват.
 

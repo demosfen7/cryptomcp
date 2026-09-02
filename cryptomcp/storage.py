@@ -646,6 +646,39 @@ def upsert_funding(
     return len(payload)
 
 
+def derivatives_window(
+    con: sqlite3.Connection, symbol: str, start_ms: int, end_ms: int
+) -> list[tuple[int, float, float]]:
+    """Точки открытого интереса за окно, старые→новые: (время, контракты, стоимость).
+
+    Ради ретроспективы архив и заводился: за пределами тридцати суток биржа
+    этих чисел не отдаёт вовсе, а здесь они лежат с шагом 5m.
+    """
+    rows = con.execute(
+        "SELECT ts, open_interest, open_interest_value FROM derivatives "
+        "WHERE symbol = ? AND ts >= ? AND ts <= ? "
+        "AND open_interest IS NOT NULL ORDER BY ts",
+        (symbol.upper(), start_ms, end_ms),
+    ).fetchall()
+    return [
+        (int(row["ts"]), float(row["open_interest"]), float(row["open_interest_value"]))
+        for row in rows
+        if row["open_interest_value"] is not None
+    ]
+
+
+def funding_window(
+    con: sqlite3.Connection, symbol: str, end_ms: int, limit: int = 1000
+) -> list[tuple[int, float]]:
+    """Последние начисления фандинга до момента, старые→новые."""
+    rows = con.execute(
+        "SELECT ts, rate FROM funding WHERE symbol = ? AND ts <= ? "
+        "ORDER BY ts DESC LIMIT ?",
+        (symbol.upper(), end_ms, limit),
+    ).fetchall()
+    return [(int(row["ts"]), float(row["rate"])) for row in reversed(rows)]
+
+
 def upsert_universe(
     con: sqlite3.Connection, date: str, rows: Sequence[dict[str, Any]]
 ) -> int:

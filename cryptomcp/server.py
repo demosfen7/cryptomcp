@@ -21,19 +21,26 @@ import sys
 from mcp.server.mcpserver import MCPServer
 
 from . import SQUEEZE_FORMULA_VERSION, storage
-from .analysis import MIN_CANDLES, TimeframeView, analyse_timeframe, weekly_pivots_from
+from .analysis import (
+    MIN_CANDLES,
+    TimeframeView,
+    accumulation_interval,
+    analyse_timeframe,
+    weekly_pivots_from,
+)
 from .client import BinanceClient
 from .collector import watchlist_view
 from .config import Config
 from .derivatives import DerivativesReader
 from .errors import ErrorKind, ToolError, bad_params
 from .fetcher import CandleFetcher
-from .indicators import MIN_PERCENTILE_SPAN_DAYS
+from .indicators import MIN_PERCENTILE_SPAN_DAYS, atr
 from .journal import Journal
 from .markets import MARKETS, Market
 from .reader import ArchiveReader, archive_path
 from .render import (
     closed_through,
+    render_absorption,
     render_derivatives,
     render_klines,
     render_levels,
@@ -41,9 +48,12 @@ from .render import (
     render_scan_history,
     render_snapshot,
     render_squeeze_metrics,
+    skip_label,
+    utc,
 )
 from .series import INTERVAL_MS
 from .symbols import SymbolRegistry, format_price
+from .volume import absorption
 
 #: Максимум сырых свечей на запрос: третий уровень предназначен для чтения
 #: формы, а не для выгрузки истории (PLAN §5).
@@ -268,9 +278,13 @@ async def get_squeeze_metrics(
             fetcher, info.symbol, (interval,), as_of_ms, market=mkt.name
         )
         view = views[interval]
+        absorption_block = await _absorption(
+            fetcher, info.symbol, interval, as_of_ms
+        )
         return (
             f"{info.symbol}{mkt.suffix} ({mkt.label})\n\n"
             + render_squeeze_metrics(view)
+            + absorption_block
         )
     except ToolError as error:
         return _fail(error)
@@ -373,18 +387,37 @@ async def get_key_levels(
         "сравнение между монетами бессмысленно, интервал начисления у разных "
         "символов 1, 4 или 8 часов. Динамика OI считается по числу контрактов, "
         "а не по стоимости в USDT, и классифицируется: приток новых денег, "
-        "закрытие шортов, набор позиций без движения цены и так далее."
+        "закрытие шортов, набор позиций без движения цены и так далее. "
+        "Параметр as_of_ms показывает состояние на момент в прошлом: ряды и "
+        "дельты сдвигаются к нему. Ретроспектива читается из архива сборщика, "
+        "а где он момент не покрывает — с биржи, у которой история открытого "
+        "интереса обрезана 30 сутками; источник подписан в выдаче. Базиса в "
+        "ретроспективе нет: маркировочная и индексная цены существуют только "
+        "для текущего момента."
     )
 )
-async def get_derivatives(symbol: str) -> str:
+async def get_derivatives(symbol: str, as_of_ms: int | None = None) -> str:
     try:
         # Фандинга и открытого интереса у спота не существует: инструмент
         # всегда работает по фьючерсам, параметра market у него нет.
         _, _, registry, derivatives, _ = await _ctx("futures")
         info = await registry.get(symbol)
-        funding = await derivatives.funding(info.symbol)  # type: ignore[union-attr]
-        oi = await derivatives.open_interest(info.symbol)  # type: ignore[union-attr]
-        return f"{info.symbol}\n\n" + render_derivatives(
+        funding = await derivatives.funding(  # type: ignore[union-attr]
+            info.symbol, as_of_ms=as_of_ms
+        )
+        oi = await derivatives.open_interest(  # type: ignore[union-attr]
+            info.symbol, as_of_ms=as_of_ms
+        )
+
+        head = info.symbol
+        if as_of_ms is not None:
+            sources = " и ".join(sorted({funding.source, oi.source}))
+            head += (
+                f" · состояние на {utc(as_of_ms)} UTC · источник: {sources}"
+                "\nбазис в ретроспективе недоступен: маркировочная и индексная "
+                "цены существуют только для текущего момента"
+            )
+        return f"{head}\n\n" + render_derivatives(
             funding, oi, history=True, precision=info.price_precision
         )
     except ToolError as error:
@@ -495,6 +528,31 @@ async def list_symbols(
         return "\n".join(lines)
     except ToolError as error:
         return _fail(error)
+
+
+async def _absorption(
+    fetcher: ArchiveReader, symbol: str, interval: str, as_of_ms: int | None
+) -> str:
+    """Блок поглощения по младшему ряду.
+
+    Отдельный запрос ряда, и он оправдан: на дневном разрешении поглощение
+    внутри свечи не видно вовсе (§4.19), то есть без него главный признак
+    накопления просто отсутствует. Нехватка истории на младшем ТФ — не повод
+    отменить всю выдачу: печатается причина, как и у любой метрики без базы.
+    """
+    lower = accumulation_interval(interval)
+    if lower == interval:
+        return ""
+    try:
+        series = await fetcher.get(
+            symbol, lower, as_of_ms=as_of_ms, min_candles=MIN_CANDLES,
+            target_span_days=_target_span(lower),
+        )
+    except ToolError as error:
+        return render_absorption(None, skipped=skip_label(error))
+
+    atr_values = atr(series.high, series.low, series.close, 14)
+    return render_absorption(absorption(series, atr_values))
 
 
 def _archive() -> sqlite3.Connection:

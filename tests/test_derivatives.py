@@ -157,3 +157,68 @@ class TestContractsNotNotional:
         assert classify_price_oi(price_change, oi_change_by_notional) == (
             "приток новых денег"
         )
+
+
+class TestRetrospective:
+    """Ретроспектива деривативов: один сборщик на биржу и архив."""
+
+    NOW = 1_787_184_000_000
+    STEP_5M = 5 * 60_000
+
+    def rows(self, count=300, start_oi=1000.0, price=0.6):
+        return [
+            (self.NOW - (count - 1 - i) * self.STEP_5M,
+             start_oi + i, (start_oi + i) * price)
+            for i in range(count)
+        ]
+
+    def test_same_arithmetic_for_both_sources(self):
+        """Биржа и архив обязаны давать одинаковые числа на одном ряду."""
+        from cryptomcp.derivatives import _oi_rows, build_open_interest
+
+        rows = self.rows()
+        raw = [
+            {"timestamp": ts, "sumOpenInterest": str(oi),
+             "sumOpenInterestValue": str(value)}
+            for ts, oi, value in rows
+        ]
+        from_archive = build_open_interest(
+            "AAAUSDT", rows, 5, rows[::12], 60,
+            windows=("1h", "4h"), source="архив",
+        )
+        from_exchange = build_open_interest(
+            "AAAUSDT", _oi_rows(raw), 5, _oi_rows(raw[::12]), 60,
+            windows=("1h", "4h"),
+        )
+        assert from_archive.change == from_exchange.change
+        assert from_archive.price_change == from_exchange.price_change
+        assert from_archive.contracts == from_exchange.contracts
+        assert from_archive.source == "архив"
+
+    def test_contracts_taken_from_series_when_not_given(self):
+        """В прошлом «текущего» OI не существует — берётся последняя точка ряда."""
+        from cryptomcp.derivatives import build_open_interest
+
+        rows = self.rows()
+        view = build_open_interest("AAAUSDT", rows, 5, rows, 5, windows=("1h",))
+        assert view.contracts == rows[-1][1]
+
+    def test_empty_series_is_not_a_crash(self):
+        from cryptomcp.derivatives import build_open_interest
+
+        view = build_open_interest("AAAUSDT", [], 5, [], 60, windows=("1h",))
+        assert view.change == {} and view.contracts == 0.0
+
+    def test_funding_rate_defaults_to_last_settlement(self):
+        """В ретроспективе ставка — последнее начисление, а не текущая из premium."""
+        from cryptomcp.derivatives import build_funding
+
+        settlements = [(self.NOW - i * 4 * 3_600_000, 0.0001 * (10 - i))
+                       for i in range(10, 0, -1)]
+        funding = build_funding("AAAUSDT", settlements, 4, source="архив")
+
+        assert funding.rate == settlements[-1][1]
+        assert funding.source == "архив"
+        # Базиса в прошлом нет: маркировочная и индексная цены только «сейчас».
+        assert funding.mark_price == 0.0
+        assert funding.basis_pct != funding.basis_pct  # NaN

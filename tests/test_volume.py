@@ -185,3 +185,52 @@ class TestTakerBuy:
         s = build_series(raw, "T", "4h", raw[-1][6] + 10_000, grace_ms=0)
         ctx = volume_context(s, np.full(len(s), 1.0))
         assert ctx.taker_buy_mean == pytest.approx(0.7)
+
+
+class TestAbsorption:
+    """Разрешение по тейкерам: средняя прячет то, ради чего блок и заведён.
+
+    У ASTER 19.08 дневная средняя 0.48 при часах по 0.57, 0.60 и 0.72.
+    """
+
+    def series(self, taker):
+        import numpy as np
+
+        from cryptomcp.series import INTERVAL_MS, build_series
+
+        step = INTERVAL_MS["1h"]
+        raw = []
+        for i, value in enumerate(taker):
+            quote = 1000.0
+            raw.append([
+                i * step, "100.0", "101.0", "99.0", "100.0", "10.0",
+                (i + 1) * step - 1, f"{quote}", 10,
+                f"{5.0}", f"{quote * value}", "0",
+            ])
+        return build_series(raw, "TESTUSDT", "1h", len(taker) * step + 10_000,
+                            grace_ms=0), np.zeros(len(taker))
+
+    def test_mean_hides_the_peaks(self):
+        from cryptomcp.volume import absorption
+
+        taker = [0.40] * 26 + [0.57, 0.60, 0.72, 0.45]
+        series, atr_values = self.series(taker)
+        data = absorption(series, atr_values)
+
+        assert data.taker_mean < 0.50, "средняя действительно ничего не показывает"
+        assert data.taker_max == pytest.approx(0.72, abs=0.01)
+        assert data.taker_above == 3
+
+    def test_streak_counts_consecutive_only(self):
+        from cryptomcp.volume import absorption
+
+        taker = [0.60, 0.60, 0.40] + [0.55, 0.56, 0.57, 0.58] + [0.40] * 23
+        series, atr_values = self.series(taker)
+
+        assert absorption(series, atr_values).taker_streak == 4
+
+    def test_interval_is_reported(self):
+        from cryptomcp.volume import absorption
+
+        series, atr_values = self.series([0.5] * 30)
+        assert absorption(series, atr_values).interval == "1h"
