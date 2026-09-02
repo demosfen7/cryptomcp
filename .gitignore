@@ -19,3 +19,6 @@ journal/
 .idea/
 .vscode/
 .DS_Store
+
+# Содержит боевой токен доступа к MCP-серверу.
+.mcp.json
