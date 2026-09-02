@@ -9,12 +9,42 @@ from __future__ import annotations
 
 import pytest
 
+from cryptomcp.analysis import TimeframeView
 from cryptomcp.errors import ErrorKind, unknown_symbol
 from cryptomcp.fetcher import pages_needed
+from cryptomcp.indicators import Metric
 from cryptomcp.journal import Journal
+from cryptomcp.levels import VolumeProfile
 from cryptomcp.markets import FUTURES, MARKETS, SPOT
 from cryptomcp.render import render_snapshot
 from cryptomcp.symbols import STABLE_BASES, SymbolInfo, SymbolRegistry
+from cryptomcp.volume import VolumeContext
+
+INFO = SymbolInfo("TESTUSDT", "TEST", "USDT", 0.0001, 4, "PERPETUAL", "TRADING")
+
+
+def view(**overrides) -> TimeframeView:
+    """Заготовка представления.
+
+    Своя, а не общая с test_render: импорт одного тест-модуля из другого
+    требует корня репозитория в sys.path, а он там оказывается только при
+    editable-установке. В CI такой импорт падал.
+    """
+    defaults = dict(
+        interval="4h", price=100.0, atr_value=2.0, atr_pct=2.0, rsi_value=50.0,
+        ema_state="above", structure="HH/HL", position_in_range=0.5,
+        bbw=Metric("BBW", 0.04, pct_rank=10.0, n_obs=360, span_days=90),
+        atr_metric=Metric("ATR", 2.0, pct_rank=10.0, n_obs=360, span_days=90),
+        atr_declining_bars=10,
+        range_low=95.0, range_high=105.0, range_width=0.10, range_width_atr=5.0,
+        range_threshold=0.06, narrow_bars=0,
+        volume=VolumeContext(0.7, "медиана слота", 250, 0.6, 3, 0.55),
+        profile=VolumeProfile(100.0, 95.0, 105.0, 1e6, 60),
+        divergence=None,
+        meta={"closed_through_ms": 4 * 3_600_000 - 1, "missing": 0},
+    )
+    defaults.update(overrides)
+    return TimeframeView(**defaults)
 
 
 class FakeClient:
@@ -128,14 +158,9 @@ class TestUnknownSymbolPointsAtTheOtherMarket:
 
 
 class TestSpotRendering:
-    def view_and_info(self):
-        from tests.test_render import INFO, view
-        return INFO, view()
-
     def test_header_names_the_market(self):
-        info, v = self.view_and_info()
         text = render_snapshot(
-            info, {"4h": v}, live_price=1.5, change_24h=1.0,
+            INFO, {"4h": view()}, live_price=1.5, change_24h=1.0,
             quote_volume_24h=3.9e6, now_ms=0, market=SPOT,
         )
         assert text.startswith("TESTUSDT (спот)")
@@ -143,25 +168,22 @@ class TestSpotRendering:
 
     def test_small_turnover_is_shown_in_millions(self):
         """У спота обороты на два порядка меньше: 0.00B ничего не сообщает."""
-        info, v = self.view_and_info()
         text = render_snapshot(
-            info, {"4h": v}, live_price=1.5, change_24h=1.0,
+            INFO, {"4h": view()}, live_price=1.5, change_24h=1.0,
             quote_volume_24h=3.9e6, now_ms=0, market=SPOT,
         )
         assert "оборот 3.9M USDT" in text
 
     def test_absent_derivatives_are_explained(self):
-        info, v = self.view_and_info()
         text = render_snapshot(
-            info, {"4h": v}, live_price=1.5, change_24h=1.0,
+            INFO, {"4h": view()}, live_price=1.5, change_24h=1.0,
             quote_volume_24h=3.9e6, now_ms=0, market=SPOT,
         )
         assert "у спота не существует" in text
 
     def test_futures_says_nothing_about_spot(self):
-        info, v = self.view_and_info()
         text = render_snapshot(
-            info, {"4h": v}, live_price=1.5, change_24h=1.0,
+            INFO, {"4h": view()}, live_price=1.5, change_24h=1.0,
             quote_volume_24h=2e9, now_ms=0,
         )
         assert text.startswith("TESTUSDT.P (USDⓈ-M perp)")
@@ -171,8 +193,6 @@ class TestSpotRendering:
 class TestJournalKeepsMarketsApart:
     def test_market_is_written(self, tmp_path):
         import json
-
-        from tests.test_render import view
 
         path = tmp_path / "squeeze.jsonl"
         journal = Journal(str(path))
@@ -184,8 +204,6 @@ class TestJournalKeepsMarketsApart:
 
     def test_futures_is_the_default(self, tmp_path):
         import json
-
-        from tests.test_render import view
 
         path = tmp_path / "squeeze.jsonl"
         Journal(str(path)).record("CAKEUSDT", view(squeeze_index=0.5))
