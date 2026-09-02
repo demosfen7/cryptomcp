@@ -16,12 +16,18 @@ services:
       CRYPTOMCP_PORT: 8000
       CRYPTOMCP_PUBLIC_HOST: cryptomcp.aithinglab.com
       CRYPTOMCP_LOG_LEVEL: INFO
+      CRYPTOMCP_DB: /app/data/market.sqlite
       # Токен приходит из .env рядом с этим файлом, в репозиторий не попадает.
       MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?нужен MCP_AUTH_TOKEN в .env}
     volumes:
       # Журнал индекса (PLAN §4.11) должен переживать пересборку образа:
       # его ценность именно в накоплении, начатом с первого дня.
       - cryptomcp_journal:/app/journal
+      # Архив. Сервер из него ЧИТАЕТ (историю рядов), писатель — только
+      # сборщик. Том смонтирован на запись, потому что читателю WAL всё равно
+      # нужен доступ к -wal и -shm; дисциплину «пишет один» держит код, а не
+      # права доступа.
+      - cryptomcp_data:/app/data
     networks:
       - briefgenerator_internal
     logging:

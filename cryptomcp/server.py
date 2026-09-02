@@ -28,6 +28,7 @@ from .fetcher import CandleFetcher
 from .indicators import MIN_PERCENTILE_SPAN_DAYS
 from .journal import Journal
 from .markets import MARKETS, Market
+from .reader import ArchiveReader
 from .render import (
     closed_through,
     render_derivatives,
@@ -91,14 +92,17 @@ def _market(name: str) -> Market:
 
 async def _ctx(
     market_name: str = "futures",
-) -> tuple[BinanceClient, CandleFetcher, SymbolRegistry, DerivativesReader | None, Market]:
+) -> tuple[BinanceClient, ArchiveReader, SymbolRegistry, DerivativesReader | None, Market]:
     market = _market(market_name)
     async with _lock:
         client = _clients.get(market.name)
         if client is None:
             client = _clients[market.name] = BinanceClient(market)
     derivatives = DerivativesReader(client) if market.has_derivatives else None
-    return client, CandleFetcher(client), SymbolRegistry(client), derivatives, market
+    # Ряды идут из архива с догрузкой хвоста; где архива нет — прямо из биржи.
+    # Контракт get() у обёртки тот же, поэтому инструменты о ней не знают.
+    reader = ArchiveReader(CandleFetcher(client), market.name)
+    return client, reader, SymbolRegistry(client), derivatives, market
 
 
 def _fail(error: ToolError) -> str:
@@ -123,7 +127,7 @@ def _target_span(interval: str) -> float | None:
 
 
 async def _views(
-    fetcher: CandleFetcher,
+    fetcher: ArchiveReader,
     symbol: str,
     timeframes: tuple[str, ...],
     as_of_ms: int | None,

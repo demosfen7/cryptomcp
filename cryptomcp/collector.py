@@ -30,11 +30,12 @@ import time
 from typing import Any
 
 from . import SQUEEZE_FORMULA_VERSION, storage
-from .analysis import MIN_CANDLES, analyse_timeframe
+from .analysis import MIN_CANDLES, analyse_timeframe, required_candles
 from .client import BinanceClient
 from .config import Config
 from .errors import ToolError
 from .markets import FUTURES, SPOT
+from .reader import WARMUP
 from .series import build_series, series_from_records
 
 log = logging.getLogger("cryptomcp.collector")
@@ -373,7 +374,12 @@ def run_scan(con: sqlite3.Connection) -> int:
     written = 0
     for tf in SCAN_TIMEFRAMES:
         for symbol, source in storage.archived_symbols(con, tf):
-            records = storage.load_candles(con, symbol, tf, limit=1500)
+            # То же каноническое окно, что у сервера: иначе один и тот же
+            # символ получал бы в scan_log и в снапшоте разные индексы,
+            # отличающиеся только глубиной ряда.
+            records = storage.load_candles(
+                con, symbol, tf, required_candles(tf) + WARMUP
+            )
             series = series_from_records(records, symbol, tf)
             if len(series) < MIN_CANDLES:
                 continue

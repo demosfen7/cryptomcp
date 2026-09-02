@@ -54,6 +54,10 @@ class CandleFetcher:
         self._client = client
         self._cache: dict[Any, tuple[float, Series]] = {}
 
+    @property
+    def client(self) -> BinanceClient:
+        return self._client
+
     async def get(
         self,
         symbol: str,

@@ -267,14 +267,24 @@ def ohlcv_coverage(con: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def load_candles(
-    con: sqlite3.Connection, symbol: str, tf: str, limit: int = 1500
+    con: sqlite3.Connection,
+    symbol: str,
+    tf: str,
+    limit: int = 1500,
+    before_ms: int | None = None,
 ) -> list[tuple[Any, ...]]:
-    """Последние ``limit`` свечей из архива, по возрастанию времени."""
-    rows = con.execute(
-        f"SELECT ts, {', '.join(OHLCV_COLUMNS)} FROM ohlcv "
-        "WHERE symbol = ? AND tf = ? ORDER BY ts DESC LIMIT ?",
-        (symbol, tf, limit),
-    ).fetchall()
+    """Последние ``limit`` свечей из архива, по возрастанию времени.
+
+    ``before_ms`` — правая граница для ретроспективы. Отбор делает база, а не
+    вызывающий: взять последние ``limit`` свечей и отфильтровать их по дате
+    значило бы получить огрызок окна вместо окна на нужный момент.
+    """
+    sql = f"SELECT ts, {', '.join(OHLCV_COLUMNS)} FROM ohlcv WHERE symbol = ? AND tf = ?"
+    params: list[Any] = [symbol, tf]
+    if before_ms is not None:
+        sql += " AND ts <= ?"
+        params.append(before_ms)
+    rows = con.execute(sql + " ORDER BY ts DESC LIMIT ?", (*params, limit)).fetchall()
     return [tuple(row) for row in reversed(rows)]
 
 

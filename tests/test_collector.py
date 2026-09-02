@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from cryptomcp import storage
+from cryptomcp import SQUEEZE_FORMULA_VERSION, storage
 from cryptomcp.collector import PERIOD_MS, _series, collect, fetch_window
 from cryptomcp.errors import unknown_symbol
 
@@ -400,7 +400,8 @@ class TestScanAndOutcomes:
         con.execute(
             "INSERT INTO scan_log (ts_ms, symbol, source, tf, formula_version, "
             "price, closed_through_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (start, "CAKEUSDT", "spot", "4h", "v2", 100.0, start),
+            (start, "CAKEUSDT", "spot", "4h", SQUEEZE_FORMULA_VERSION,
+             100.0, start),
         )
         con.commit()
 
@@ -426,7 +427,8 @@ class TestScanAndOutcomes:
         con.execute(
             "INSERT INTO scan_log (ts_ms, symbol, source, tf, formula_version, "
             "price, closed_through_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (start, "CAKEUSDT", "spot", "4h", "v2", 100.0, start),
+            (start, "CAKEUSDT", "spot", "4h", SQUEEZE_FORMULA_VERSION,
+             100.0, start),
         )
         con.commit()
 
@@ -445,7 +447,8 @@ class TestScanAndOutcomes:
         con.execute(
             "INSERT INTO scan_log (ts_ms, symbol, source, tf, formula_version, "
             "price, closed_through_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (start, "CAKEUSDT", "spot", "4h", "v2", 100.0, start),
+            (start, "CAKEUSDT", "spot", "4h", SQUEEZE_FORMULA_VERSION,
+             100.0, start),
         )
         con.commit()
         now = start + 100 * 86_400_000
@@ -467,8 +470,8 @@ class TestWatchlist:
         con.execute(
             "INSERT OR REPLACE INTO scan_log (ts_ms, symbol, source, tf, "
             "formula_version, squeeze_index, price, range_low, range_high, "
-            "closed_through_ms) VALUES (?, ?, 'spot', '4h', 'v2', ?, ?, ?, ?, ?)",
-            (ts, symbol, index, price, low, high, ts),
+            "closed_through_ms) VALUES (?, ?, 'spot', '4h', ?, ?, ?, ?, ?, ?)",
+            (ts, symbol, SQUEEZE_FORMULA_VERSION, index, price, low, high, ts),
         )
 
     def market(self, con, ts, count=50, overrides=None, price=100.0):
