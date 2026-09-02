@@ -337,3 +337,121 @@ class TestArchivePlan:
         plan = await archive_plan(con, [], ["BTCUSDT"], {"BTCUSDT"})
         assert plan[0][2] == MID_LADDER
         assert [tf for tf, _ in plan[0][2]] == ["1d", "4h"]
+
+
+class TestScanAndOutcomes:
+    """Скан считается из архива и не ходит в биржу вовсе."""
+
+    def fill(self, con, symbol, tf, count, step_ms, start_ts=1_600_000_000_000):
+        import random
+
+        random.seed(3)
+        price = 100.0
+        rows = []
+        for i in range(count):
+            price *= 1 + random.gauss(0, 0.004)
+            rows.append((start_ts + i * step_ms, price, price * 1.01, price * 0.99,
+                         price, 10.0, 1000.0, 5, 5.0, 500.0))
+        storage.upsert_ohlcv(con, symbol, tf, "spot", rows)
+        con.commit()
+        return rows
+
+    def test_scan_writes_one_row_per_symbol(self, con):
+        from cryptomcp.collector import run_scan
+
+        self.fill(con, "CAKEUSDT", "4h", 400, 4 * 3_600_000)
+        assert run_scan(con) == 1
+        row = con.execute("SELECT * FROM scan_log").fetchone()
+        assert row["symbol"] == "CAKEUSDT"
+        assert row["tf"] == "4h"
+        assert row["squeeze_index"] is not None
+
+    def test_repeat_scan_adds_nothing(self, con):
+        from cryptomcp.collector import run_scan
+
+        self.fill(con, "CAKEUSDT", "4h", 400, 4 * 3_600_000)
+        run_scan(con)
+        assert run_scan(con) == 0
+
+    def test_short_history_is_skipped(self, con):
+        """Меньше шестидесяти свечей — считать нечего, и это не ошибка."""
+        from cryptomcp.collector import run_scan
+
+        self.fill(con, "НОВАЯUSDT", "4h", 30, 4 * 3_600_000)
+        assert run_scan(con) == 0
+
+    def test_outcome_measured_by_high_and_low(self, con):
+        from cryptomcp.collector import settle_outcomes
+
+        step = 3_600_000
+        start = 1_600_000_000_000
+        candles = [
+            (start, 100.0, 100.0, 100.0, 100.0, 1.0, 1.0, 1, 1.0, 1.0),
+            (start + step, 100.0, 130.0, 95.0, 101.0, 1.0, 1.0, 1, 1.0, 1.0),
+            (start + 2 * step, 101.0, 102.0, 70.0, 99.0, 1.0, 1.0, 1, 1.0, 1.0),
+        ]
+        # Дальше ровный хвост: горизонт должен быть покрыт архивом целиком,
+        # иначе запись справедливо откладывается до следующего прогона.
+        candles += [
+            (start + i * step, 100.0, 101.0, 99.0, 100.0, 1.0, 1.0, 1, 1.0, 1.0)
+            for i in range(3, 30)
+        ]
+        storage.upsert_ohlcv(con, "CAKEUSDT", "1h", "spot", candles)
+        con.execute(
+            "INSERT INTO scan_log (ts_ms, symbol, source, tf, formula_version, "
+            "price, closed_through_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (start, "CAKEUSDT", "spot", "4h", "v2", 100.0, start),
+        )
+        con.commit()
+
+        settled = settle_outcomes(con, now_ms=start + 100 * 86_400_000)
+
+        assert settled >= 1
+        row = con.execute(
+            "SELECT * FROM outcomes WHERE horizon = '24h'"
+        ).fetchone()
+        assert row["max_price"] == 130.0
+        assert row["min_price"] == 70.0
+        assert row["max_pct"] == pytest.approx(30.0)
+        assert row["min_pct"] == pytest.approx(-30.0)
+
+    def test_horizon_not_covered_by_archive_is_postponed(self, con):
+        """Половина окна дала бы заниженный размах — лучше подождать."""
+        from cryptomcp.collector import settle_outcomes
+
+        start = 1_600_000_000_000
+        storage.upsert_ohlcv(con, "CAKEUSDT", "1h", "spot", [
+            (start + 3_600_000, 100.0, 101.0, 99.0, 100.0, 1.0, 1.0, 1, 1.0, 1.0),
+        ])
+        con.execute(
+            "INSERT INTO scan_log (ts_ms, symbol, source, tf, formula_version, "
+            "price, closed_through_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (start, "CAKEUSDT", "spot", "4h", "v2", 100.0, start),
+        )
+        con.commit()
+
+        assert settle_outcomes(con, now_ms=start + 100 * 86_400_000) == 0
+        assert con.execute("SELECT COUNT(*) c FROM outcomes").fetchone()["c"] == 0
+
+    def test_settling_is_idempotent(self, con):
+        from cryptomcp.collector import settle_outcomes
+
+        step = 3_600_000
+        start = 1_600_000_000_000
+        storage.upsert_ohlcv(con, "CAKEUSDT", "1h", "spot", [
+            (start + i * step, 100.0, 101.0, 99.0, 100.0, 1.0, 1.0, 1, 1.0, 1.0)
+            for i in range(200)
+        ])
+        con.execute(
+            "INSERT INTO scan_log (ts_ms, symbol, source, tf, formula_version, "
+            "price, closed_through_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (start, "CAKEUSDT", "spot", "4h", "v2", 100.0, start),
+        )
+        con.commit()
+        now = start + 100 * 86_400_000
+
+        first = settle_outcomes(con, now_ms=now)
+        second = settle_outcomes(con, now_ms=now)
+
+        assert first > 0
+        assert second == 0

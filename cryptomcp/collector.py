@@ -29,11 +29,13 @@ import sqlite3
 import time
 from typing import Any
 
-from . import storage
+from . import SQUEEZE_FORMULA_VERSION, storage
+from .analysis import MIN_CANDLES, analyse_timeframe
 from .client import BinanceClient
+from .config import Config
 from .errors import ToolError
 from .markets import FUTURES, SPOT
-from .series import build_series
+from .series import build_series, series_from_records
 
 log = logging.getLogger("cryptomcp.collector")
 
@@ -83,6 +85,20 @@ LADDER: tuple[tuple[str, int], ...] = (
 
 #: Средний слой: монеты вне ядра архивируются только по старшим ТФ.
 MID_LADDER: tuple[tuple[str, int], ...] = (("1d", 5 * 365), ("4h", 3 * 365))
+
+#: На каких таймфреймах считать индекс в фоновом скане.
+SCAN_TIMEFRAMES = ("4h", "1d")
+
+#: Горизонты, на которых замеряется исход. По High/Low внутри периода, а не по
+#: цене закрытия: цель, которую цена достала и с которой откатилась, по
+#: закрытию не засчиталась бы вовсе.
+HORIZONS: tuple[tuple[str, int], ...] = (
+    ("24h", 24 * 3_600_000),
+    ("72h", 72 * 3_600_000),
+    ("7d", 7 * 86_400_000),
+)
+
+config = Config.load()
 
 
 def _env_float(name: str, default: float) -> float:
@@ -335,6 +351,76 @@ async def archive_plan(
     return plan
 
 
+def run_scan(con: sqlite3.Connection) -> int:
+    """Посчитать индекс по всему архиву и записать в scan_log.
+
+    Ни одного запроса к бирже: свечи уже лежат в базе, а перцентилям хватает
+    её глубины (4h за три года при требуемых шестидесяти сутках). Поэтому скан
+    стоит только процессорного времени, и его не жалко гонять каждый час.
+
+    Строка пишется одна на закрытую свечу — это обеспечено уникальным
+    индексом в схеме. Иначе четырёхчасовое наблюдение попадало бы в статистику
+    четыре раза и перевешивало бы дневное.
+    """
+    written = 0
+    for tf in SCAN_TIMEFRAMES:
+        for symbol, source in storage.archived_symbols(con, tf):
+            records = storage.load_candles(con, symbol, tf, limit=1500)
+            series = series_from_records(records, symbol, tf)
+            if len(series) < MIN_CANDLES:
+                continue
+            view = analyse_timeframe(series, config)
+            if storage.record_scan(
+                con, symbol, source, view,
+                formula_version=SQUEEZE_FORMULA_VERSION,
+            ):
+                written += 1
+    con.commit()
+    return written
+
+
+def settle_outcomes(con: sqlite3.Connection, now_ms: int | None = None) -> int:
+    """Досчитать исходы у записей скана, чей горизонт истёк.
+
+    Считается по самому мелкому архивному таймфрейму символа: на дневках цель,
+    задетую внутри дня, видно только как диапазон свечи. И считается по
+    High/Low, а не по закрытию — иначе достигнутая и откатившаяся цель не
+    засчитывается вовсе.
+
+    Запись, для которой архив ещё не покрыл весь горизонт, пропускается и
+    будет взята следующим прогоном: половина окна дала бы заниженный размах.
+    """
+    now_ms = now_ms or int(dt.datetime.now(dt.UTC).timestamp() * 1000)
+    settled = 0
+    for horizon, span in HORIZONS:
+        for row in storage.pending_outcomes(con, horizon, span, now_ms):
+            tf = storage.finest_tf(con, row["symbol"])
+            if tf is None:
+                continue
+            end_ms = row["ts_ms"] + span
+            last = storage.last_ohlcv_ts(con, row["symbol"], tf)
+            if last is None or last < end_ms:
+                continue
+            window = storage.price_extremes(con, row["symbol"], tf, row["ts_ms"], end_ms)
+            if not window:
+                continue
+            price = row["price"]
+            storage.record_outcome(con, row["id"], horizon, {
+                "max_price": window["high"],
+                "min_price": window["low"],
+                "max_pct": round((window["high"] / price - 1) * 100, 4),
+                "min_pct": round((window["low"] / price - 1) * 100, 4),
+                "close_pct": (
+                    round((window["close"] / price - 1) * 100, 4)
+                    if window["close"] else None
+                ),
+                "candles": window["candles"],
+            })
+            settled += 1
+    con.commit()
+    return settled
+
+
 async def universe_rows(client: BinanceClient) -> list[dict[str, Any]]:
     """Все торгуемые перпетуалы к USDT, по убыванию оборота за сутки."""
     from .symbols import SymbolRegistry
@@ -460,6 +546,18 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
         )
         con.commit()
         log.info("свечи: записано %d, не собрано рядов %d", candles, len(candle_failures))
+
+        # Скан и исходы считаются из базы, к бирже не ходят вовсе, поэтому
+        # стоят копейки и идут последними — после того как архив пополнен.
+        started = time.monotonic()
+        scanned = run_scan(con)
+        settled = settle_outcomes(con)
+        storage.record_run(
+            con, "scan", symbols=scanned, rows=scanned + settled,
+            seconds=time.monotonic() - started,
+        )
+        con.commit()
+        log.info("скан: новых записей %d, посчитано исходов %d", scanned, settled)
     finally:
         await client.aclose()
         await spot.aclose()

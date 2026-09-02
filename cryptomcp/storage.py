@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import sqlite3
 from collections.abc import Iterable, Sequence
@@ -82,6 +83,56 @@ CREATE TABLE IF NOT EXISTS symbols (
     first_kline_ms INTEGER,
     first_seen     TEXT,
     PRIMARY KEY (symbol, market)
+) WITHOUT ROWID;
+
+-- Единственная таблица с обычным rowid: на неё ссылаются outcomes, а
+-- составной ключ в такой ссылке был бы вчетверо толще целого id.
+CREATE TABLE IF NOT EXISTS scan_log (
+    id                INTEGER PRIMARY KEY,
+    ts_ms             INTEGER NOT NULL,
+    symbol            TEXT    NOT NULL,
+    source            TEXT    NOT NULL,
+    tf                TEXT    NOT NULL,
+    formula_version   TEXT    NOT NULL,
+    squeeze_index     REAL,
+    components        TEXT,
+    excluded          TEXT,
+    price             REAL,
+    range_low         REAL,
+    range_high        REAL,
+    range_width_pct   REAL,
+    narrow_bars       INTEGER,
+    atr_pct           REAL,
+    rsi               REAL,
+    bbw_pct_rank      REAL,
+    volume_ratio      REAL,
+    taker_buy_mean    REAL,
+    ema_state         TEXT,
+    structure         TEXT,
+    closed_through_ms INTEGER
+);
+
+-- Одна строка на закрытую свечу, а не на прогон. Сканер ходит раз в час, а
+-- четырёхчасовая свеча закрывается раз в четыре: без этого ограничения одно и
+-- то же наблюдение попадало бы в статистику четырежды и перевешивало бы
+-- остальные. Ограничение объявлено в схеме, а не в коде, чтобы его нельзя было
+-- обойти по невнимательности.
+CREATE UNIQUE INDEX IF NOT EXISTS scan_log_candle
+    ON scan_log (symbol, tf, closed_through_ms);
+CREATE INDEX IF NOT EXISTS scan_log_symbol_tf_ts ON scan_log (symbol, tf, ts_ms);
+CREATE INDEX IF NOT EXISTS scan_log_ts ON scan_log (ts_ms);
+
+CREATE TABLE IF NOT EXISTS outcomes (
+    scan_id     INTEGER NOT NULL,
+    horizon     TEXT    NOT NULL,
+    max_price   REAL,
+    min_price   REAL,
+    max_pct     REAL,
+    min_pct     REAL,
+    close_pct   REAL,
+    candles     INTEGER,
+    computed_at INTEGER,
+    PRIMARY KEY (scan_id, horizon)
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS collector_runs (
@@ -183,6 +234,155 @@ def ohlcv_coverage(con: sqlite3.Connection) -> list[dict[str, Any]]:
         "FROM ohlcv GROUP BY symbol, tf ORDER BY symbol, tf"
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def load_candles(
+    con: sqlite3.Connection, symbol: str, tf: str, limit: int = 1500
+) -> list[tuple[Any, ...]]:
+    """Последние ``limit`` свечей из архива, по возрастанию времени."""
+    rows = con.execute(
+        f"SELECT ts, {', '.join(OHLCV_COLUMNS)} FROM ohlcv "
+        "WHERE symbol = ? AND tf = ? ORDER BY ts DESC LIMIT ?",
+        (symbol, tf, limit),
+    ).fetchall()
+    return [tuple(row) for row in reversed(rows)]
+
+
+def archived_symbols(con: sqlite3.Connection, tf: str) -> list[tuple[str, str]]:
+    """Пары «символ, источник», по которым есть свечи этого таймфрейма."""
+    rows = con.execute(
+        "SELECT symbol, MIN(source) AS source FROM ohlcv WHERE tf = ? "
+        "GROUP BY symbol ORDER BY symbol",
+        (tf,),
+    ).fetchall()
+    return [(row["symbol"], row["source"]) for row in rows]
+
+
+def finest_tf(con: sqlite3.Connection, symbol: str) -> str | None:
+    """Самый мелкий архивный таймфрейм символа.
+
+    Исход считается по High/Low внутри горизонта, и чем мельче свечи, тем
+    точнее найдены экстремумы: на дневках цель, задетая внутри дня, попадёт
+    в диапазон свечи, а на часовых видно и когда именно.
+    """
+    order = {"1h": 0, "4h": 1, "1d": 2, "1w": 3}
+    rows = con.execute(
+        "SELECT DISTINCT tf FROM ohlcv WHERE symbol = ?", (symbol,)
+    ).fetchall()
+    available = sorted((row["tf"] for row in rows), key=lambda tf: order.get(tf, 99))
+    return available[0] if available else None
+
+
+def price_extremes(
+    con: sqlite3.Connection, symbol: str, tf: str, start_ms: int, end_ms: int
+) -> dict[str, Any] | None:
+    """Максимум, минимум и последнее закрытие в окне.
+
+    По High/Low, а не по закрытию: цель, которую цена достала и с которой
+    откатилась, по закрытию не засчиталась бы вовсе.
+    """
+    row = con.execute(
+        "SELECT MAX(h) AS high, MIN(l) AS low, COUNT(*) AS candles, MAX(ts) AS last_ts "
+        "FROM ohlcv WHERE symbol = ? AND tf = ? AND ts > ? AND ts <= ?",
+        (symbol, tf, start_ms, end_ms),
+    ).fetchone()
+    if not row or not row["candles"]:
+        return None
+    close = con.execute(
+        "SELECT c FROM ohlcv WHERE symbol = ? AND tf = ? AND ts = ?",
+        (symbol, tf, row["last_ts"]),
+    ).fetchone()
+    return {
+        "high": row["high"],
+        "low": row["low"],
+        "candles": row["candles"],
+        "close": close["c"] if close else None,
+    }
+
+
+def record_scan(
+    con: sqlite3.Connection,
+    symbol: str,
+    source: str,
+    view: Any,
+    *,
+    formula_version: str,
+    ts_ms: int | None = None,
+) -> int:
+    """Строка журнала сканирования.
+
+    Пишутся не только индекс, но и все его компоненты по отдельности. Через
+    два месяца вопрос будет не «работает ли индекс», а «какая из пяти групп
+    в нём работает» — и ответить на него можно только по разложению.
+    """
+    payload = (
+        ts_ms if ts_ms is not None else int(dt.datetime.now(dt.UTC).timestamp() * 1000),
+        symbol,
+        source,
+        view.interval,
+        formula_version,
+        view.squeeze_index,
+        json.dumps(view.components, ensure_ascii=False),
+        json.dumps(view.excluded, ensure_ascii=False),
+        view.price,
+        view.range_low,
+        view.range_high,
+        round(view.range_width * 100, 4),
+        view.narrow_bars,
+        round(view.atr_pct, 4),
+        round(view.rsi_value, 2),
+        view.bbw.pct_rank,
+        round(view.volume.ratio, 4) if view.volume.ratio == view.volume.ratio else None,
+        round(view.volume.taker_buy_mean, 4)
+        if view.volume.taker_buy_mean == view.volume.taker_buy_mean
+        else None,
+        view.ema_state,
+        view.structure,
+        view.meta.get("closed_through_ms"),
+    )
+    cursor = con.execute(
+        "INSERT OR IGNORE INTO scan_log (ts_ms, symbol, source, tf, formula_version, "
+        "squeeze_index, components, excluded, price, range_low, range_high, "
+        "range_width_pct, narrow_bars, atr_pct, rsi, bbw_pct_rank, volume_ratio, "
+        "taker_buy_mean, ema_state, structure, closed_through_ms) "
+        "VALUES (" + ", ".join("?" * 21) + ")",
+        payload,
+    )
+    # rowcount == 0 означает, что свеча уже записана предыдущим прогоном.
+    return int(cursor.lastrowid or 0) if cursor.rowcount else 0
+
+
+def pending_outcomes(
+    con: sqlite3.Connection, horizon: str, horizon_ms: int, now_ms: int, limit: int = 500
+) -> list[dict[str, Any]]:
+    """Записи скана, у которых горизонт истёк, а исход не посчитан."""
+    rows = con.execute(
+        "SELECT s.id, s.symbol, s.tf, s.ts_ms, s.price FROM scan_log s "
+        "LEFT JOIN outcomes o ON o.scan_id = s.id AND o.horizon = ? "
+        "WHERE o.scan_id IS NULL AND s.ts_ms + ? <= ? AND s.price > 0 "
+        "ORDER BY s.ts_ms LIMIT ?",
+        (horizon, horizon_ms, now_ms, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def record_outcome(
+    con: sqlite3.Connection, scan_id: int, horizon: str, values: dict[str, Any]
+) -> None:
+    con.execute(
+        "INSERT INTO outcomes (scan_id, horizon, max_price, min_price, max_pct, "
+        "min_pct, close_pct, candles, computed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT (scan_id, horizon) DO UPDATE SET "
+        "max_price = excluded.max_price, min_price = excluded.min_price, "
+        "max_pct = excluded.max_pct, min_pct = excluded.min_pct, "
+        "close_pct = excluded.close_pct, candles = excluded.candles, "
+        "computed_at = excluded.computed_at",
+        (
+            scan_id, horizon, values["max_price"], values["min_price"],
+            values["max_pct"], values["min_pct"], values["close_pct"],
+            values["candles"], int(dt.datetime.now(dt.UTC).timestamp() * 1000),
+        ),
+    )
 
 
 def upsert_derivatives(

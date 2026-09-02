@@ -180,6 +180,44 @@ def count_missing(df: pd.DataFrame, interval: str) -> int:
     return int(np.clip(steps - 1, 0, None).sum())
 
 
+def series_from_records(
+    records: Sequence[Sequence[Any]], symbol: str, interval: str
+) -> Series:
+    """Ряд из архива: (ts, o, h, l, c, volume, quote_volume, trades, taker×2).
+
+    Отсечения незакрытой свечи здесь нет и не нужно: в архив она не попадает
+    по построению — загрузчик пропускает её тем же кодом, что и онлайновый
+    путь. Проверка непрерывности остаётся: дыры в архиве возможны, если
+    символ не торговался.
+    """
+    interval_ms(interval)
+    columns = [
+        "open_time", "open", "high", "low", "close", "volume_base",
+        "quote_volume", "trades", "taker_buy_base", "taker_buy_quote",
+    ]
+    if not records:
+        empty = pd.DataFrame({c: pd.Series(dtype="float64") for c in columns})
+        return Series(symbol.upper(), interval, empty, 0, 0, 0)
+
+    df = pd.DataFrame(list(records), columns=columns)
+    df["open_time"] = df["open_time"].astype("int64")
+    df["trades"] = df["trades"].fillna(0).astype("int64")
+    df["close_time"] = df["open_time"] + interval_ms(interval) - 1
+    for column in ("open", "high", "low", "close", "volume_base",
+                   "quote_volume", "taker_buy_base", "taker_buy_quote"):
+        df[column] = pd.to_numeric(df[column], errors="coerce").astype("float64")
+    df = df.sort_values("open_time").drop_duplicates("open_time").reset_index(drop=True)
+
+    return Series(
+        symbol=symbol.upper(),
+        interval=interval,
+        df=df,
+        closed_through_ms=int(df["close_time"].iloc[-1]),
+        dropped_unclosed=0,
+        missing=count_missing(df, interval),
+    )
+
+
 def build_series(
     raw: Sequence[Sequence[Any]],
     symbol: str,

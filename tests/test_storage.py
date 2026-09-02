@@ -201,3 +201,149 @@ class TestOhlcv:
         rows = {(r["symbol"], r["tf"]): r for r in storage.ohlcv_coverage(con)}
         assert rows[("CAKEUSDT", "1d")]["candles"] == 2
         assert rows[("UAIUSDT", "1d")]["source"] == "futures"
+
+
+class FakeView:
+    """Минимальное представление, какого хватает журналу скана."""
+
+    def __init__(self, interval="4h", closed_through_ms=1000, index=0.42):
+        self.interval = interval
+        self.squeeze_index = index
+        self.components = {"volatility": 0.5, "range": 0.1}
+        self.excluded = []
+        self.price = 100.0
+        self.range_low, self.range_high = 95.0, 105.0
+        self.range_width = 0.1
+        self.narrow_bars = 3
+        self.atr_pct = 2.0
+        self.rsi_value = 55.0
+        self.ema_state, self.structure = "above", "HH/HL"
+        self.bbw = type("M", (), {"pct_rank": 12.0})()
+        self.volume = type("V", (), {"ratio": 1.2, "taker_buy_mean": 0.51})()
+        self.meta = {"closed_through_ms": closed_through_ms}
+
+
+class TestScanLog:
+    def test_row_written_with_components(self, con):
+        scan_id = storage.record_scan(con, "CAKEUSDT", "spot", FakeView(),
+                                      formula_version="v2")
+        assert scan_id > 0
+        row = con.execute("SELECT * FROM scan_log").fetchone()
+        assert row["symbol"] == "CAKEUSDT"
+        assert row["formula_version"] == "v2"
+        assert '"volatility"' in row["components"]
+        assert row["narrow_bars"] == 3
+
+    def test_same_candle_written_once(self, con):
+        """Сканер ходит раз в час, свеча 4h закрывается раз в четыре."""
+        view = FakeView(closed_through_ms=5000)
+        first = storage.record_scan(con, "CAKEUSDT", "spot", view, formula_version="v2")
+        second = storage.record_scan(con, "CAKEUSDT", "spot", view, formula_version="v2")
+        assert first > 0
+        assert second == 0
+        assert con.execute("SELECT COUNT(*) c FROM scan_log").fetchone()["c"] == 1
+
+    def test_next_candle_is_a_new_row(self, con):
+        storage.record_scan(con, "CAKEUSDT", "spot", FakeView(closed_through_ms=5000),
+                            formula_version="v2")
+        storage.record_scan(con, "CAKEUSDT", "spot", FakeView(closed_through_ms=9000),
+                            formula_version="v2")
+        assert con.execute("SELECT COUNT(*) c FROM scan_log").fetchone()["c"] == 2
+
+    def test_timeframes_are_separate_rows(self, con):
+        for tf in ("4h", "1d"):
+            storage.record_scan(con, "CAKEUSDT", "spot",
+                                FakeView(interval=tf, closed_through_ms=5000),
+                                formula_version="v2")
+        assert con.execute("SELECT COUNT(*) c FROM scan_log").fetchone()["c"] == 2
+
+
+class TestOutcomeQueries:
+    def scan(self, con, ts_ms, price=100.0):
+        return storage.record_scan(
+            con, "CAKEUSDT", "spot",
+            FakeView(closed_through_ms=ts_ms), formula_version="v2", ts_ms=ts_ms,
+        )
+
+    def test_only_matured_rows_are_pending(self, con):
+        now = 10_000_000
+        fresh = self.scan(con, now - 1000)
+        old = self.scan(con, now - 5_000_000)
+        pending = storage.pending_outcomes(con, "24h", 3_600_000, now)
+        ids = {row["id"] for row in pending}
+        assert old in ids
+        assert fresh not in ids
+
+    def test_already_settled_is_not_pending_again(self, con):
+        now = 10_000_000
+        scan_id = self.scan(con, now - 5_000_000)
+        storage.record_outcome(con, scan_id, "24h", {
+            "max_price": 110.0, "min_price": 90.0, "max_pct": 10.0,
+            "min_pct": -10.0, "close_pct": 1.0, "candles": 24,
+        })
+        assert storage.pending_outcomes(con, "24h", 3_600_000, now) == []
+
+    def test_horizons_are_independent(self, con):
+        now = 10_000_000
+        scan_id = self.scan(con, now - 5_000_000)
+        storage.record_outcome(con, scan_id, "24h", {
+            "max_price": 1.0, "min_price": 1.0, "max_pct": 0.0,
+            "min_pct": 0.0, "close_pct": 0.0, "candles": 1,
+        })
+        assert len(storage.pending_outcomes(con, "72h", 3_600_000, now)) == 1
+
+    def test_outcome_is_overwritten_not_duplicated(self, con):
+        scan_id = self.scan(con, 1000)
+        values = {"max_price": 1.0, "min_price": 1.0, "max_pct": 0.0,
+                  "min_pct": 0.0, "close_pct": 0.0, "candles": 1}
+        storage.record_outcome(con, scan_id, "24h", values)
+        storage.record_outcome(con, scan_id, "24h", {**values, "max_pct": 5.0})
+        rows = con.execute("SELECT max_pct FROM outcomes").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["max_pct"] == 5.0
+
+
+class TestArchiveQueries:
+    def candle(self, ts, high, low, close=100.0):
+        return (ts, close, high, low, close, 1.0, 1.0, 1, 1.0, 1.0)
+
+    def test_candles_come_back_in_time_order(self, con):
+        storage.upsert_ohlcv(con, "CAKEUSDT", "1h", "spot", [
+            self.candle(3000, 1, 1), self.candle(1000, 1, 1), self.candle(2000, 1, 1),
+        ])
+        assert [row[0] for row in storage.load_candles(con, "CAKEUSDT", "1h")] == [
+            1000, 2000, 3000
+        ]
+
+    def test_finest_timeframe_wins(self, con):
+        for tf in ("1d", "4h", "1h"):
+            storage.upsert_ohlcv(con, "CAKEUSDT", tf, "spot", [self.candle(1000, 1, 1)])
+        assert storage.finest_tf(con, "CAKEUSDT") == "1h"
+
+    def test_finest_of_what_exists(self, con):
+        storage.upsert_ohlcv(con, "XUSDT", "1d", "spot", [self.candle(1000, 1, 1)])
+        assert storage.finest_tf(con, "XUSDT") == "1d"
+        assert storage.finest_tf(con, "НЕТУUSDT") is None
+
+    def test_extremes_use_high_and_low(self, con):
+        """Цель, задетую и откатившуюся, по закрытию было бы не видно."""
+        storage.upsert_ohlcv(con, "CAKEUSDT", "1h", "spot", [
+            self.candle(2000, high=120.0, low=99.0, close=100.0),
+            self.candle(3000, high=101.0, low=80.0, close=95.0),
+        ])
+        window = storage.price_extremes(con, "CAKEUSDT", "1h", 1000, 3000)
+        assert window["high"] == 120.0
+        assert window["low"] == 80.0
+        assert window["close"] == 95.0
+        assert window["candles"] == 2
+
+    def test_window_excludes_the_scan_candle_itself(self, con):
+        storage.upsert_ohlcv(con, "CAKEUSDT", "1h", "spot", [
+            self.candle(1000, high=999.0, low=1.0),
+            self.candle(2000, high=110.0, low=90.0),
+        ])
+        window = storage.price_extremes(con, "CAKEUSDT", "1h", 1000, 2000)
+        assert window["high"] == 110.0
+
+    def test_empty_window_is_none(self, con):
+        assert storage.price_extremes(con, "CAKEUSDT", "1h", 0, 100) is None
