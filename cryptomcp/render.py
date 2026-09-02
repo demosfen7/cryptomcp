@@ -643,6 +643,7 @@ def render_absorption(data: Absorption | None, *, skipped: str | None = None) ->
         f"максимум {data.taker_max:.2f} · "
         f"выше {TAKER_PRESSURE:.2f}: {data.taker_above} свечей",
         f"   серия выше 0.50  {streak}",
+        f"   объём/цена       {data.lead_state}",
         f"   объём последней  {data.volume_ratio:.2f}x"
         + ("~ слабая база" if data.weak_basis else ""),
         "   считается на младшем ряду: дневное разрешение стирает поглощение "

@@ -234,3 +234,81 @@ class TestAbsorption:
 
         series, atr_values = self.series([0.5] * 30)
         assert absorption(series, atr_values).interval == "1h"
+
+
+class TestVolumeLeadsPrice:
+    """Признак, отличающий набор позиции от реакции на событие.
+
+    Замерено на живых данных: ASTER 19.08 даёт +8 свечей (объём пришёл
+    заранее), UAI 29–30.08 даёт −2 (объём догонял цену). Без требования
+    «свеча всплеска тихая» оба давали положительное число, и признак не
+    различал случаи вовсе — 8 против 2.
+    """
+
+    def series(self, bars):
+        """bars: список (объём, тело в долях ATR). ATR фиксирован."""
+        import numpy as np
+
+        from cryptomcp.series import INTERVAL_MS, build_series
+
+        step = INTERVAL_MS["1h"]
+        atr_value, raw = 1.0, []
+        for i, (volume, body) in enumerate(bars):
+            close = 100.0 + body * atr_value
+            raw.append([
+                i * step, "100.0", f"{max(100.0, close) + 0.5}",
+                f"{min(100.0, close) - 0.5}", f"{close}", "10.0",
+                (i + 1) * step - 1, f"{volume}", 10, "5.0", f"{volume / 2}", "0",
+            ])
+        series = build_series(raw, "TESTUSDT", "1h", len(bars) * step + 10_000,
+                              grace_ms=0)
+        return series, np.full(len(bars), atr_value)
+
+    def test_quiet_spike_before_move_is_accumulation(self):
+        from cryptomcp.volume import volume_leads_price
+
+        bars = [(1000.0, 0.0)] * 45 + [(5000.0, 0.1)] + [(1000.0, 0.0)] * 5
+        bars += [(1200.0, 2.0)] + [(1000.0, 0.0)] * 3
+        series, atr_values = self.series(bars)
+
+        lead, state = volume_leads_price(series, atr_values)
+        assert lead == 6
+        assert "опередил" in state
+
+    def test_loud_spike_is_not_accumulation(self):
+        """Всплеск объёма СВОИМ телом — это реакция, а не набор. Кейс UAI."""
+        from cryptomcp.volume import volume_leads_price
+
+        bars = [(1000.0, 0.0)] * 45 + [(5000.0, 2.5)] + [(1000.0, 0.0)] * 9
+        series, atr_values = self.series(bars)
+
+        lead, state = volume_leads_price(series, atr_values)
+        assert lead is None
+        assert "был движением цены" in state
+
+    def test_spike_without_resolution_reports_waiting(self):
+        """Самое интересное состояние: набор был, развязки ещё нет."""
+        from cryptomcp.volume import volume_leads_price
+
+        bars = [(1000.0, 0.0)] * 45 + [(5000.0, 0.1)] + [(1000.0, 0.0)] * 9
+        series, atr_values = self.series(bars)
+
+        lead, state = volume_leads_price(series, atr_values)
+        assert lead == 9
+        assert "движения ещё не было" in state
+
+    def test_nothing_happened(self):
+        from cryptomcp.volume import volume_leads_price
+
+        series, atr_values = self.series([(1000.0, 0.0)] * 55)
+        lead, state = volume_leads_price(series, atr_values)
+        assert lead is None
+        assert "ни всплеска" in state
+
+    def test_plural_forms_are_readable(self):
+        from cryptomcp.volume import _candles
+
+        assert _candles(1) == "1 свечу"
+        assert _candles(3) == "3 свечи"
+        assert _candles(8) == "8 свечей"
+        assert _candles(11) == "11 свечей"

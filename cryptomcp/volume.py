@@ -244,6 +244,18 @@ TAKER_PRESSURE = 0.55
 ABSORPTION_WINDOW = 30
 
 
+#: Во сколько раз объём должен превысить базу, чтобы считаться всплеском.
+LEAD_VOLUME_MULTIPLE = 3.0
+
+#: Насколько тело свечи должно превысить ATR, чтобы считаться движением цены.
+LEAD_MOVE_ATR = 1.5
+
+#: Всплеск объёма засчитывается за набор, только если сама свеча тихая — тот же
+#: порог, что у баров набора. Замерено: без этого условия признак не различает
+#: два кейса, ради которых заведён (ASTER +8 свечей против UAI +2, знак один).
+QUIET_BAR_ATR = 0.5
+
+
 @dataclass(frozen=True)
 class Absorption:
     """Признаки поглощения на МЛАДШЕМ таймфрейме.
@@ -271,6 +283,11 @@ class Absorption:
     taker_streak: int
     volume_ratio: float
     weak_basis: bool
+    #: На сколько свечей всплеск объёма опередил движение цены; None — когда
+    #: одного из двух событий в окне не было. Словесное состояние обязательно:
+    #: голое число не отличает «ещё не разрешилось» от «объём пришёл позже».
+    lead_bars: int | None = None
+    lead_state: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -282,6 +299,8 @@ class Absorption:
             "taker_above_pressure": self.taker_above,
             "taker_longest_streak": self.taker_streak,
             "volume_ratio": round(self.volume_ratio, 3),
+            "volume_lead_bars": self.lead_bars,
+            "volume_lead_state": self.lead_state,
         }
 
 
@@ -302,6 +321,7 @@ def absorption(
 ) -> Absorption:
     """Поглощение по младшему ряду: бары набора и разрешение по тейкерам."""
     taker = series.taker_buy_ratio[-window:]
+    lead_bars, lead_state = volume_leads_price(series, atr_values, window=window)
     volumes = series.quote_volume
     baseline, _, samples = seasonal_baseline(series)
     ratio = (
@@ -318,4 +338,87 @@ def absorption(
         taker_streak=longest_streak(taker, TAKER_NEUTRAL),
         volume_ratio=ratio,
         weak_basis=samples < MIN_SAMPLES_PER_SLOT,
+        lead_bars=lead_bars,
+        lead_state=lead_state,
     )
+
+
+def _candles(count: int) -> str:
+    """«1 свечу», «2 свечи», «5 свечей» — иначе выдача читается как машинная."""
+    tail = abs(count) % 10
+    hundred = abs(count) % 100
+    if tail == 1 and hundred != 11:
+        return f"{count} свечу"
+    if tail in (2, 3, 4) and hundred not in (12, 13, 14):
+        return f"{count} свечи"
+    return f"{count} свечей"
+
+
+def volume_leads_price(
+    series: Series,
+    atr_values: np.ndarray,
+    *,
+    window: int = ABSORPTION_WINDOW,
+    volume_multiple: float = LEAD_VOLUME_MULTIPLE,
+    move_atr: float = LEAD_MOVE_ATR,
+) -> tuple[int | None, str]:
+    """На сколько свечей всплеск объёма опередил движение цены.
+
+    Признак, отличающий набор позиции от реакции на событие. Замерено на двух
+    случаях с противоположным исходом:
+
+    - ASTER 19.08: пик объёма 7.15x в 06:00 при теле +0.03%, первое движение
+      цены только к вечеру — объём пришёл ЗАРАНЕЕ, и это был набор.
+    - UAI 29.08: объём 3.44x пришёл той же свечой, что и тело +2.75%, а пик
+      10.60x — уже после того, как цена прошла своё. Объём шёл ЗА ценой.
+
+    Оба выглядят как «всплеск объёма», и без этой разницы они неразличимы.
+
+    Возвращается пара «сколько свечей» и словесное состояние. Состояний пять,
+    и четыре из них — не число:
+
+    - всплеска объёма в окне не было;
+    - всплеск был, движения ещё не было — самое интересное для сканера
+      состояние, потому что развязка впереди; число тогда означает, сколько
+      свечей прошло с всплеска, и это нижняя граница, а не итог;
+    - движение было, всплеска перед ним не было;
+    - оба были: знак разницы и есть ответ.
+
+    База объёма — скользящая средняя двадцати свечей, та же, что у баров
+    набора. Сезонная база (§4.10) точнее, но тогда два числа в одном блоке
+    считались бы от разных величин, и сравнивать их стало бы нельзя.
+    """
+    volumes = series.quote_volume
+    if len(volumes) < window + 20:
+        return None, "n/a (истории меньше окна)"
+
+    rolling = pd.Series(volumes).rolling(20).mean().to_numpy()
+    opens, closes = series.col("open"), series.close
+    start = len(volumes) - window
+
+    first_volume: int | None = None
+    first_move: int | None = None
+    for i in range(start, len(volumes)):
+        mean, atr_value = rolling[i], atr_values[i] if i < len(atr_values) else np.nan
+        if np.isnan(mean) or np.isnan(atr_value) or mean <= 0 or atr_value <= 0:
+            continue
+        quiet = abs(closes[i] - opens[i]) < QUIET_BAR_ATR * atr_value
+        if first_volume is None and quiet and volumes[i] >= volume_multiple * mean:
+            first_volume = i
+        if first_move is None and abs(closes[i] - opens[i]) >= move_atr * atr_value:
+            first_move = i
+
+    if first_volume is None and first_move is None:
+        return None, "ни всплеска объёма, ни движения цены"
+    if first_volume is None:
+        return None, "всплеск объёма был движением цены, а не набором"
+    if first_move is None:
+        waited = len(volumes) - 1 - first_volume
+        return waited, f"всплеск объёма {_candles(waited)} назад, движения ещё не было"
+
+    lead = first_move - first_volume
+    if lead > 0:
+        return lead, f"объём опередил цену на {_candles(lead)}"
+    if lead == 0:
+        return 0, "объём и движение одной свечой"
+    return lead, f"объём пришёл на {_candles(-lead)} ПОЗЖЕ движения"

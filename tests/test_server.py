@@ -108,3 +108,23 @@ class TestPartialSnapshot:
 
         assert list(views) == ["1d", "4h"]
         assert skipped == {}
+
+
+class TestRawKlineCap:
+    """Потолок сырых свечей зависит от таймфрейма, а не задан одним числом."""
+
+    def test_intraday_allows_two_hundred(self):
+        """50 часовых свечей — двое суток, меньше, чем длится фаза поглощения."""
+        from cryptomcp.server import max_raw_klines
+
+        assert max_raw_klines("1h") == 200
+        assert max_raw_klines("15m") == 200
+        assert max_raw_klines("5m") == 200
+
+    def test_higher_timeframes_keep_fifty(self):
+        """50 дневных — два месяца; читать по ним форму бессмысленно."""
+        from cryptomcp.server import max_raw_klines
+
+        assert max_raw_klines("4h") == 50
+        assert max_raw_klines("1d") == 50
+        assert max_raw_klines("1w") == 50

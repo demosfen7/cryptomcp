@@ -57,7 +57,17 @@ from .volume import absorption
 
 #: Максимум сырых свечей на запрос: третий уровень предназначен для чтения
 #: формы, а не для выгрузки истории (PLAN §5).
+#:
+#: На младших ТФ потолок выше, и это не послабление, а следствие того же
+#: правила. Пятьдесят часовых свечей — двое суток, то есть меньше, чем длится
+#: фаза поглощения; разбор ASTER 19.08 потребовал четырёх вызовов с ручным
+#: пересчётом as_of_ms. Пятьдесят дневных — это уже два месяца, и читать по ним
+#: форму бессмысленно, поэтому там потолок остаётся прежним.
 MAX_RAW_KLINES = 50
+MAX_RAW_KLINES_INTRADAY = 200
+
+#: Граница «младшего»: до 1h включительно.
+RAW_INTRADAY_CEILING = "1h"
 
 #: Таймфреймы, на которых пагинация не окупается: 60 суток требуют 58 страниц.
 NO_PAGINATION = {"1m"}
@@ -140,6 +150,15 @@ def _validate_timeframes(values: list[str] | None) -> tuple[str, ...]:
             unknown=unknown,
         )
     return timeframes
+
+
+def max_raw_klines(interval: str) -> int:
+    """Потолок сырых свечей для этого таймфрейма."""
+    return (
+        MAX_RAW_KLINES_INTRADAY
+        if INTERVAL_MS[interval] <= INTERVAL_MS[RAW_INTRADAY_CEILING]
+        else MAX_RAW_KLINES
+    )
 
 
 def _target_span(interval: str) -> float | None:
@@ -292,7 +311,8 @@ async def get_squeeze_metrics(
 
 @server.tool(
     description=(
-        "Уровень 3. Сырые ЗАКРЫТЫЕ свечи (не более 50) с производными по "
+        "Уровень 3. Сырые ЗАКРЫТЫЕ свечи (до 200 на 1h и мельче, до 50 на "
+        "старших ТФ) с производными по "
         "каждой: тело, фитили, объём к базе (та же, что в снапшоте: уровень "
         "20 предыдущих свечей с поправкой на слот суток — от limit не зависит), "
         "доля тейкер-покупок. Нужен, "
@@ -313,9 +333,10 @@ async def get_klines(
         _, fetcher, registry, _, mkt = await _ctx(market)
         info = await registry.get(symbol)
         interval = _validate_timeframes([timeframe])[0]
-        if not 1 <= limit <= MAX_RAW_KLINES:
+        cap = max_raw_klines(interval)
+        if not 1 <= limit <= cap:
             raise bad_params(
-                f"limit={limit} вне диапазона 1..{MAX_RAW_KLINES}", limit=limit
+                f"limit={limit} вне диапазона 1..{cap} для {interval}", limit=limit
             )
 
         # 500 свечей, а не запрошенные limit: база объёма должна быть той же,
