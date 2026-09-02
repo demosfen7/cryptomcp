@@ -54,6 +54,16 @@ services:
       # Именованный том, а не папка проекта: деплой синхронизирует /opt/cryptomcp
       # с --delete, и база в рабочей папке стиралась бы при каждом выкате.
       - cryptomcp_data:/app/data
+    # Свой healthcheck вместо унаследованного серверного: сборщик не слушает
+    # порт, зато у него есть осмысленный признак живости — свежая запись в
+    # collector_runs. Молчащий сборщик снаружи неотличим от работающего, и
+    # проверка «был ли прогон за последние два интервала» закрывает ровно это.
+    healthcheck:
+      test: ["CMD", "python", "-m", "cryptomcp.collector", "health"]
+      interval: 5m
+      timeout: 10s
+      start_period: 30m
+      retries: 2
     networks:
       - briefgenerator_internal
     logging:

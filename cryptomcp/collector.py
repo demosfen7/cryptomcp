@@ -325,10 +325,33 @@ async def loop(con: sqlite3.Connection) -> None:
         await asyncio.sleep(INTERVAL_S)
 
 
+def health(con: sqlite3.Connection, *, interval_s: int = INTERVAL_S) -> tuple[bool, str]:
+    """Был ли успешный прогон за последние два интервала.
+
+    Признак живости именно такой, а не «процесс запущен»: процесс может быть
+    жив и час за часом ловить отказ биржи, а снаружи это выглядит нормальной
+    работой. Здесь спрашивается результат, а не наличие.
+    """
+    row = con.execute(
+        "SELECT ts_ms, kind, rows, error FROM collector_runs "
+        "WHERE kind IN ('incremental', 'backfill') ORDER BY ts_ms DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return False, "прогонов ещё не было"
+    age_s = dt.datetime.now(dt.UTC).timestamp() - row["ts_ms"] / 1000
+    when = dt.datetime.fromtimestamp(row["ts_ms"] / 1000, dt.UTC).isoformat(" ", "seconds")
+    if age_s > 2 * interval_s:
+        return False, f"последний прогон {when} UTC — {age_s / 3600:.1f} ч назад"
+    return True, f"последний прогон {when} UTC, точек {row['rows']}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Сборщик рыночных данных")
     parser.add_argument(
-        "command", choices=("once", "backfill", "loop"), nargs="?", default="loop"
+        "command",
+        choices=("once", "backfill", "loop", "health"),
+        nargs="?",
+        default="loop",
     )
     parser.add_argument("--days", type=float, default=HISTORY_DAYS)
     parser.add_argument("--db", default=storage.DEFAULT_PATH)
@@ -342,6 +365,10 @@ def main() -> None:
 
     con = storage.connect(args.db)
     try:
+        if args.command == "health":
+            alive, message = health(con)
+            log.info("%s", message)
+            raise SystemExit(0 if alive else 1)
         if args.command == "loop":
             asyncio.run(loop(con))
         else:

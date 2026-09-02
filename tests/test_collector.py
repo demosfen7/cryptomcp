@@ -173,3 +173,41 @@ class TestIncremental:
         written, failed = await collect(client, con, ["BTCUSDT", "BADUSDT"], days=None)
         assert written > 0
         assert storage.coverage(con, "BTCUSDT")["points"] > 0
+
+
+class TestHealth:
+    """Живость меряется результатом прогона, а не наличием процесса."""
+
+    def test_no_runs_is_not_healthy(self, con):
+        from cryptomcp.collector import health
+
+        alive, message = health(con)
+        assert not alive
+        assert "не было" in message
+
+    def test_fresh_run_is_healthy(self, con):
+        from cryptomcp.collector import health
+
+        storage.record_run(con, "incremental", symbols=52, rows=440, seconds=9.0)
+        alive, message = health(con)
+        assert alive
+        assert "440" in message
+
+    def test_stale_run_is_not_healthy(self, con):
+        import datetime as dt
+
+        from cryptomcp.collector import health
+
+        storage.record_run(con, "incremental", symbols=52, rows=440, seconds=9.0)
+        stale = int((dt.datetime.now(dt.UTC).timestamp() - 5 * 3600) * 1000)
+        con.execute("UPDATE collector_runs SET ts_ms = ?", (stale,))
+        alive, message = health(con, interval_s=3600)
+        assert not alive
+        assert "назад" in message
+
+    def test_universe_run_alone_is_not_enough(self, con):
+        """Снимок универсума прошёл, а деривативы — нет: это не здоровье."""
+        from cryptomcp.collector import health
+
+        storage.record_run(con, "universe", symbols=52, rows=52, seconds=1.0)
+        assert not health(con)[0]
