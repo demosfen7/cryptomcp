@@ -135,6 +135,31 @@ CREATE TABLE IF NOT EXISTS outcomes (
     PRIMARY KEY (scan_id, horizon)
 ) WITHOUT ROWID;
 
+-- Эпизод наблюдения: одна строка на «вошла — вышла», а не одна на пару.
+-- Монета попадает в список не раз в жизни, и затирать прошлый эпизод новым
+-- значило бы стирать ровно ту историю, ради которой список и ведётся.
+CREATE TABLE IF NOT EXISTS watchlist (
+    id                 INTEGER PRIMARY KEY,
+    symbol             TEXT    NOT NULL,
+    tf                 TEXT    NOT NULL,
+    status             TEXT    NOT NULL,
+    entered_at         INTEGER NOT NULL,
+    entered_by         TEXT    NOT NULL,
+    squeeze_index      REAL,
+    accumulation_score REAL,
+    price_at_entry     REAL,
+    range_low          REAL,
+    range_high         REAL,
+    last_rank          INTEGER,
+    last_index         REAL,
+    exited_at          INTEGER,
+    exit_reason        TEXT
+);
+
+-- Открытый эпизод на пару может быть только один; закрытых — сколько угодно.
+CREATE UNIQUE INDEX IF NOT EXISTS watchlist_open
+    ON watchlist (symbol, tf) WHERE exited_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS collector_runs (
     ts_ms   INTEGER PRIMARY KEY,
     kind    TEXT NOT NULL,
@@ -382,6 +407,86 @@ def record_outcome(
             values["max_pct"], values["min_pct"], values["close_pct"],
             values["candles"], int(dt.datetime.now(dt.UTC).timestamp() * 1000),
         ),
+    )
+
+
+def latest_scan(con: sqlite3.Connection, tf: str) -> list[dict[str, Any]]:
+    """Последняя запись скана по каждому символу этого таймфрейма."""
+    rows = con.execute(
+        "SELECT s.* FROM scan_log s JOIN ("
+        "  SELECT symbol, MAX(ts_ms) AS ts FROM scan_log WHERE tf = ? GROUP BY symbol"
+        ") last ON last.symbol = s.symbol AND last.ts = s.ts_ms "
+        "WHERE s.tf = ? AND s.squeeze_index IS NOT NULL "
+        "ORDER BY s.squeeze_index DESC",
+        (tf, tf),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def open_episodes(con: sqlite3.Connection, tf: str | None = None) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM watchlist WHERE exited_at IS NULL"
+    params: tuple[Any, ...] = ()
+    if tf is not None:
+        sql += " AND tf = ?"
+        params = (tf,)
+    return [dict(row) for row in con.execute(sql + " ORDER BY id", params)]
+
+
+def open_episode(
+    con: sqlite3.Connection,
+    symbol: str,
+    tf: str,
+    *,
+    entered_at: int,
+    entered_by: str,
+    scan: dict[str, Any] | None = None,
+    rank: int | None = None,
+) -> int:
+    """Завести эпизод наблюдения.
+
+    Границы диапазона запоминаются на входе и потом не пересчитываются: пробой
+    определяется относительно того, что было в момент попадания в список, а не
+    относительно уехавшего вместе с ценой диапазона.
+    """
+    scan = scan or {}
+    cursor = con.execute(
+        "INSERT OR IGNORE INTO watchlist (symbol, tf, status, entered_at, entered_by, "
+        "squeeze_index, price_at_entry, range_low, range_high, last_rank, last_index) "
+        "VALUES (?, ?, 'candidate', ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            symbol, tf, entered_at, entered_by,
+            scan.get("squeeze_index"), scan.get("price"),
+            scan.get("range_low"), scan.get("range_high"),
+            rank, scan.get("squeeze_index"),
+        ),
+    )
+    return int(cursor.lastrowid or 0) if cursor.rowcount else 0
+
+
+def close_episode(
+    con: sqlite3.Connection, episode_id: int, *, status: str, reason: str, ts_ms: int
+) -> None:
+    con.execute(
+        "UPDATE watchlist SET status = ?, exit_reason = ?, exited_at = ? "
+        "WHERE id = ? AND exited_at IS NULL",
+        (status, reason, ts_ms, episode_id),
+    )
+
+
+def touch_episode(
+    con: sqlite3.Connection,
+    episode_id: int,
+    *,
+    rank: int | None,
+    index: float | None,
+    promote: bool = False,
+) -> None:
+    """Обновить положение эпизода; при promote — перевести кандидата в active."""
+    con.execute(
+        "UPDATE watchlist SET last_rank = ?, last_index = ?, status = "
+        "CASE WHEN ? = 1 AND status = 'candidate' THEN 'active' ELSE status END "
+        "WHERE id = ?",
+        (rank, index, 1 if promote else 0, episode_id),
     )
 
 

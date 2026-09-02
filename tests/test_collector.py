@@ -455,3 +455,156 @@ class TestScanAndOutcomes:
 
         assert first > 0
         assert second == 0
+
+
+class TestWatchlist:
+    """Отбор рангом с гистерезисом: порога, который можно было бы взять, нет."""
+
+    NOW = 1_788_000_000_000
+    STEP = 4 * 3_600_000
+
+    def scan(self, con, symbol, index, ts, price=100.0, low=95.0, high=105.0):
+        con.execute(
+            "INSERT OR REPLACE INTO scan_log (ts_ms, symbol, source, tf, "
+            "formula_version, squeeze_index, price, range_low, range_high, "
+            "closed_through_ms) VALUES (?, ?, 'spot', '4h', 'v2', ?, ?, ?, ?, ?)",
+            (ts, symbol, index, price, low, high, ts),
+        )
+
+    def market(self, con, ts, count=50, overrides=None, price=100.0):
+        overrides = overrides or {}
+        for i in range(count):
+            symbol = f"C{i:02d}USDT"
+            self.scan(con, symbol, overrides.get(symbol, 0.60 - i * 0.01), ts,
+                      price=price if symbol not in overrides else overrides.get(
+                          f"{symbol}_price", price))
+        con.commit()
+
+    def test_top_by_rank_enters_as_candidate(self, con):
+        from cryptomcp.collector import WATCH_ENTER_RANK, update_watchlist
+
+        self.market(con, self.NOW)
+        changes = update_watchlist(con, self.NOW)
+
+        assert len(changes["entered"]) == WATCH_ENTER_RANK
+        assert {e["status"] for e in storage.open_episodes(con)} == {"candidate"}
+
+    def test_second_scan_promotes_to_active(self, con):
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW)
+        update_watchlist(con, self.NOW)
+        self.market(con, self.NOW + self.STEP)
+        changes = update_watchlist(con, self.NOW + self.STEP)
+
+        assert len(changes["promoted"]) == 15
+        assert len(changes["entered"]) == 0
+        assert {e["status"] for e in storage.open_episodes(con)} == {"active"}
+
+    def test_hysteresis_keeps_a_slipping_coin(self, con):
+        """Выпала из топ-15, но держится выше 40-го — остаётся."""
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW)
+        update_watchlist(con, self.NOW)
+        self.market(con, self.NOW + self.STEP, overrides={"C00USDT": 0.40})
+        update_watchlist(con, self.NOW + self.STEP)
+
+        assert "C00USDT" in {e["symbol"] for e in storage.open_episodes(con)}
+
+    def test_falling_below_exit_rank_closes_episode(self, con):
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW)
+        update_watchlist(con, self.NOW)
+        self.market(con, self.NOW + self.STEP, overrides={"C00USDT": 0.001})
+        changes = update_watchlist(con, self.NOW + self.STEP)
+
+        assert ("C00USDT", "4h", "выпала по рангу") in changes["exited"]
+        assert "C00USDT" not in {e["symbol"] for e in storage.open_episodes(con)}
+
+    def test_breakout_wins_over_rank(self, con):
+        """Выстрелила и вылетела из топа — это сработавший сигнал, не выбывший."""
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW)
+        update_watchlist(con, self.NOW)
+        self.market(con, self.NOW + self.STEP)
+        self.scan(con, "C00USDT", 0.001, self.NOW + self.STEP, price=200.0)
+        con.commit()
+        changes = update_watchlist(con, self.NOW + self.STEP)
+
+        assert ("C00USDT", "4h", "пробой") in changes["exited"]
+        row = con.execute(
+            "SELECT status FROM watchlist WHERE symbol = 'C00USDT'"
+        ).fetchone()
+        assert row["status"] == "broken_out"
+
+    def test_expiry_after_the_deadline(self, con):
+        from cryptomcp.collector import WATCH_MAX_DAYS, update_watchlist
+
+        self.market(con, self.NOW)
+        update_watchlist(con, self.NOW)
+        later = self.NOW + (WATCH_MAX_DAYS + 1) * 86_400_000
+        self.market(con, later)
+        changes = update_watchlist(con, later)
+
+        assert ("C00USDT", "4h", "истёк срок") in changes["exited"]
+
+    def test_manual_entry_survives_low_rank(self, con):
+        """Сканер видит только то, что умеет измерять."""
+        from cryptomcp.collector import add_to_watchlist, update_watchlist
+
+        self.market(con, self.NOW)
+        add_to_watchlist(con, "C49USDT", "4h", self.NOW)
+        update_watchlist(con, self.NOW + self.STEP)
+
+        row = con.execute(
+            "SELECT entered_by, exited_at FROM watchlist WHERE symbol = 'C49USDT'"
+        ).fetchone()
+        assert row["entered_by"] == "manual"
+        assert row["exited_at"] is None
+
+    def test_manual_entry_still_closes_on_breakout(self, con):
+        from cryptomcp.collector import add_to_watchlist, update_watchlist
+
+        self.market(con, self.NOW)
+        add_to_watchlist(con, "C49USDT", "4h", self.NOW)
+        self.market(con, self.NOW + self.STEP)
+        self.scan(con, "C49USDT", 0.11, self.NOW + self.STEP, price=200.0)
+        con.commit()
+        update_watchlist(con, self.NOW + self.STEP)
+
+        row = con.execute(
+            "SELECT status FROM watchlist WHERE symbol = 'C49USDT'"
+        ).fetchone()
+        assert row["status"] == "broken_out"
+
+    def test_history_of_episodes_is_kept(self, con):
+        """Монета попадает в список не раз в жизни — прошлый эпизод не затирать."""
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW)
+        update_watchlist(con, self.NOW)
+        self.market(con, self.NOW + self.STEP, overrides={"C00USDT": 0.001})
+        update_watchlist(con, self.NOW + self.STEP)
+        self.market(con, self.NOW + 2 * self.STEP)
+        update_watchlist(con, self.NOW + 2 * self.STEP)
+
+        episodes = con.execute(
+            "SELECT COUNT(*) c FROM watchlist WHERE symbol = 'C00USDT'"
+        ).fetchone()["c"]
+        assert episodes == 2, "новый вход — новая строка, а не перезапись"
+
+    def test_only_one_open_episode_per_pair(self, con):
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW)
+        update_watchlist(con, self.NOW)
+        update_watchlist(con, self.NOW + 1000)
+
+        opened = con.execute(
+            "SELECT COUNT(*) c FROM watchlist "
+            "WHERE symbol = 'C00USDT' AND exited_at IS NULL"
+        ).fetchone()["c"]
+        assert opened == 1

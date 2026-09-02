@@ -128,6 +128,14 @@ ARCHIVE_MIN_VOLUME = _env_float("COLLECTOR_ARCHIVE_MIN_VOLUME", 10_000_000)
 
 INTERVAL_S = _env_int("COLLECTOR_INTERVAL_S", 3600)
 
+#: Границы ранга для списка наблюдения. Вход выше выхода — гистерезис: при
+#: одинаковых порогах монеты у границы входили бы и выходили каждый прогон.
+WATCH_ENTER_RANK = _env_int("WATCH_ENTER_RANK", 15)
+WATCH_EXIT_RANK = _env_int("WATCH_EXIT_RANK", 40)
+
+#: Сколько эпизод живёт без развязки, суток.
+WATCH_MAX_DAYS = _env_int("WATCH_MAX_DAYS", 30)
+
 
 async def _page(
     client: BinanceClient, source: str, symbol: str, end_ms: int
@@ -421,6 +429,122 @@ def settle_outcomes(con: sqlite3.Connection, now_ms: int | None = None) -> int:
     return settled
 
 
+def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict[str, list]:
+    """Пересчитать состав списка наблюдения и вернуть дельту к прошлому прогону.
+
+    **Отбор рангом, а не порогом.** Измерено на 58 ликвидных монетах: порог
+    индекса 0.5 не пропускал никого, 0.4 — четверых, 0.3 — треть рынка.
+    Естественной границы между ними нет, а взять её сейчас неоткуда — исходы
+    ещё не накоплены. Любое число было бы угадыванием, и через месяц
+    выяснилось бы, что сканер месяц молчал или месяц шумел. Ранг
+    самонормируется: при общем сжатии рынка список не переполняется, при
+    расширении не пустеет. Когда outcomes покажут, при каких значениях индекс
+    что-то предсказывал, ранг заменится на измеренный порог.
+
+    **Гистерезис по рангу.** Вход в топ-15, выход из топ-40. Одинаковые пороги
+    заставляли бы монеты у границы входить и выходить на каждом прогоне.
+
+    **Длительность сжатия — не ворота, а колонка.** Из 58 монет `узк > 0`
+    было у двух, и это BTC с BNB — самые ликвидные и наименее интересные для
+    игры на сжатии. Требование «все три условия сразу» отобрало бы их одних.
+
+    Порядок проверок при закрытии важен: пробой раньше ранга. Монета, которая
+    выстрелила и на этом вылетела из топа, должна попасть в статистику как
+    сработавшая, а не как «выпала по рангу».
+    """
+    now_ms = now_ms or int(dt.datetime.now(dt.UTC).timestamp() * 1000)
+    changes: dict[str, list] = {"entered": [], "exited": [], "promoted": []}
+
+    for tf in SCAN_TIMEFRAMES:
+        rows = storage.latest_scan(con, tf)
+        rank = {row["symbol"]: i + 1 for i, row in enumerate(rows)}
+        by_symbol = {row["symbol"]: row for row in rows}
+
+        for episode in storage.open_episodes(con, tf):
+            symbol = episode["symbol"]
+            scan = by_symbol.get(symbol)
+            position = rank.get(symbol)
+            manual = episode["entered_by"] == "manual"
+
+            if scan and _broke_out(episode, scan):
+                storage.close_episode(
+                    con, episode["id"], status="broken_out",
+                    reason="пробой диапазона входа", ts_ms=now_ms,
+                )
+                changes["exited"].append((symbol, tf, "пробой"))
+                continue
+
+            if now_ms - episode["entered_at"] > WATCH_MAX_DAYS * 86_400_000:
+                storage.close_episode(
+                    con, episode["id"], status="expired",
+                    reason=f"{WATCH_MAX_DAYS} суток без развязки", ts_ms=now_ms,
+                )
+                changes["exited"].append((symbol, tf, "истёк срок"))
+                continue
+
+            if not manual and (position is None or position > WATCH_EXIT_RANK):
+                storage.close_episode(
+                    con, episode["id"], status="expired",
+                    reason=(
+                        f"ранг {position} ниже {WATCH_EXIT_RANK}" if position
+                        else "выпала из универсума"
+                    ),
+                    ts_ms=now_ms,
+                )
+                changes["exited"].append((symbol, tf, "выпала по рангу"))
+                continue
+
+            promote = (
+                episode["status"] == "candidate"
+                and position is not None
+                and position <= WATCH_EXIT_RANK
+            )
+            storage.touch_episode(
+                con, episode["id"], rank=position,
+                index=scan["squeeze_index"] if scan else None, promote=promote,
+            )
+            if promote:
+                changes["promoted"].append((symbol, tf, position))
+
+        for position, row in enumerate(rows[:WATCH_ENTER_RANK], start=1):
+            episode_id = storage.open_episode(
+                con, row["symbol"], tf, entered_at=now_ms,
+                entered_by="scanner", scan=row, rank=position,
+            )
+            if episode_id:
+                changes["entered"].append((row["symbol"], tf, position))
+
+    con.commit()
+    return changes
+
+
+def _broke_out(episode: dict[str, Any], scan: dict[str, Any]) -> bool:
+    """Вышла ли цена за диапазон, зафиксированный на входе."""
+    price = scan.get("price")
+    low, high = episode.get("range_low"), episode.get("range_high")
+    if price is None or low is None or high is None:
+        return False
+    return bool(price > high or price < low)
+
+
+def add_to_watchlist(
+    con: sqlite3.Connection, symbol: str, tf: str = "4h", now_ms: int | None = None
+) -> int:
+    """Ручное добавление.
+
+    Обязательная часть: сканер видит только то, что умеет измерять. Ручные
+    записи не выбывают по рангу — только по пробою, сроку или вручную.
+    """
+    now_ms = now_ms or int(dt.datetime.now(dt.UTC).timestamp() * 1000)
+    rows = {row["symbol"]: row for row in storage.latest_scan(con, tf)}
+    episode_id = storage.open_episode(
+        con, symbol.upper(), tf, entered_at=now_ms, entered_by="manual",
+        scan=rows.get(symbol.upper(), {}),
+    )
+    con.commit()
+    return episode_id
+
+
 async def universe_rows(client: BinanceClient) -> list[dict[str, Any]]:
     """Все торгуемые перпетуалы к USDT, по убыванию оборота за сутки."""
     from .symbols import SymbolRegistry
@@ -552,12 +676,21 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
         started = time.monotonic()
         scanned = run_scan(con)
         settled = settle_outcomes(con)
+        changes = update_watchlist(con)
         storage.record_run(
             con, "scan", symbols=scanned, rows=scanned + settled,
             seconds=time.monotonic() - started,
         )
         con.commit()
         log.info("скан: новых записей %d, посчитано исходов %d", scanned, settled)
+        log.info(
+            "watchlist: вошло %d, вышло %d, подтверждено %d",
+            len(changes["entered"]), len(changes["exited"]), len(changes["promoted"]),
+        )
+        for symbol, tf, extra in changes["entered"]:
+            log.info("  + %s %s (ранг %s)", symbol, tf, extra)
+        for symbol, tf, reason in changes["exited"]:
+            log.info("  - %s %s (%s)", symbol, tf, reason)
     finally:
         await client.aclose()
         await spot.aclose()
@@ -579,6 +712,41 @@ async def loop(con: sqlite3.Connection) -> None:
             )
             con.commit()
         await asyncio.sleep(INTERVAL_S)
+
+
+def render_watchlist(con: sqlite3.Connection) -> str:
+    """Открытые эпизоды столбиком.
+
+    Ширина диапазона и длительность сжатия печатаются отдельными колонками, а
+    не сворачиваются в индекс: ранг сам по себе пропускает и широкие диапазоны
+    (BULLA с 40% попала в топ на первой же выдаче), и решать, что с этим
+    делать, должен человек.
+    """
+    episodes = storage.open_episodes(con)
+    if not episodes:
+        return "список наблюдения пуст"
+
+    lines = [
+        f"открытых эпизодов: {len(episodes)}",
+        f"{'символ':<14}{'ТФ':>4}{'статус':>11}{'ранг':>6}{'индекс':>8}"
+        f"{'вход':>10}{'сейчас':>9}{'дней':>6}  кем",
+    ]
+    now_ms = int(dt.datetime.now(dt.UTC).timestamp() * 1000)
+    for episode in sorted(episodes, key=lambda e: (e["tf"], e["last_rank"] or 999)):
+        scan = {row["symbol"]: row for row in storage.latest_scan(con, episode["tf"])}
+        price = (scan.get(episode["symbol"]) or {}).get("price")
+        move = (
+            f"{(price / episode['price_at_entry'] - 1) * 100:+.1f}%"
+            if price and episode["price_at_entry"] else "n/a"
+        )
+        lines.append(
+            f"{episode['symbol']:<14}{episode['tf']:>4}{episode['status']:>11}"
+            f"{episode['last_rank'] or 0:>6}{episode['last_index'] or 0:>8.2f}"
+            f"{episode['price_at_entry'] or 0:>10.4g}{move:>9}"
+            f"{(now_ms - episode['entered_at']) / 86_400_000:>6.1f}  "
+            f"{episode['entered_by']}"
+        )
+    return "\n".join(lines)
 
 
 def health(con: sqlite3.Connection, *, interval_s: int = INTERVAL_S) -> tuple[bool, str]:
@@ -605,10 +773,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Сборщик рыночных данных")
     parser.add_argument(
         "command",
-        choices=("once", "backfill", "loop", "health"),
+        choices=("once", "backfill", "loop", "health", "watch", "add"),
         nargs="?",
         default="loop",
     )
+    parser.add_argument("symbol", nargs="?", help="символ для команды add")
+    parser.add_argument("--tf", default="4h")
     parser.add_argument("--days", type=float, default=HISTORY_DAYS)
     parser.add_argument("--db", default=storage.DEFAULT_PATH)
     args = parser.parse_args()
@@ -625,6 +795,18 @@ def main() -> None:
             alive, message = health(con)
             log.info("%s", message)
             raise SystemExit(0 if alive else 1)
+        if args.command == "watch":
+            print(render_watchlist(con))
+            return
+        if args.command == "add":
+            if not args.symbol:
+                raise SystemExit("нужен символ: add CAKEUSDT [--tf 4h]")
+            added = add_to_watchlist(con, args.symbol, args.tf)
+            print(
+                f"{args.symbol.upper()} {args.tf}: "
+                + ("добавлена вручную" if added else "уже в списке")
+            )
+            return
         if args.command == "loop":
             asyncio.run(loop(con))
         else:
