@@ -39,6 +39,21 @@ OI_SPAN_EXEMPTION = "история OI ограничена биржей 30 су
 #: Порог значимости изменения OI для классификации, доля.
 DEFAULT_OI_THRESHOLD = 0.01
 
+#: Полоса, внутри которой фандинг не говорит о стороне ничего. Замерено по 115
+#: ликвидным перпетуалам 02.09.2026: медиана рынка +8.5% годовых, четверть
+#: монет между -0.7% и +11.0%, и полоса ±20% накрывает 77% рынка. Дальше она
+#: почти не растёт — до ±50% добавляется всего шесть монет, — то есть граница
+#: стоит там, где кончается «скучная середина», а не выбрана круглым числом.
+FUNDING_NEUTRAL_ANNUAL = 20.0
+
+#: Медиана ниже этого — фандинг у монеты отрицателен СТРУКТУРНО, и глубокая
+#: ставка сегодня не событие, а норма. Замерено: таких 5 монет из 115
+#: (ONG -465%, HOME -292%, T -255%, ACE -201%, BICO -121%).
+STRUCTURAL_FUNDING_ANNUAL = -50.0
+
+#: Окно, по которому берётся медиана для этого флага.
+STRUCTURAL_WINDOW_DAYS = 30
+
 #: Сколько точек ряда отдавать в выдачу. Три дельты показывают итог окна, ряд
 #: показывает, КОГДА поток развернулся. Данные для него уже загружены ради
 #: дельт, поэтому ряд не стоит ни одного дополнительного запроса.
@@ -73,6 +88,17 @@ class Funding:
     #: Откуда взяты числа: "биржа" или "архив". В ретроспективе это не
     #: украшение — за пределами хранимого биржей окна источник только один.
     source: str = "биржа"
+    #: Медиана годовой ставки за 30 суток. Нужна, чтобы отличить разовый
+    #: перекос от нормы монеты: у HOME 25-й перцентиль за 74 суток означает,
+    #: что бывало и глубже.
+    median_annual_pct: float | None = None
+
+    @property
+    def structurally_negative(self) -> bool:
+        return (
+            self.median_annual_pct is not None
+            and self.median_annual_pct < STRUCTURAL_FUNDING_ANNUAL
+        )
 
     @property
     def annualized_pct(self) -> float:
@@ -284,6 +310,7 @@ def build_funding(
     """
     percentile: Metric | None = None
     current = rate
+    median_annual: float | None = None
     if settlements:
         values = np.array([value for _, value in settlements])
         if current is None:
@@ -293,6 +320,15 @@ def build_funding(
             "funding", current, values[:-1], span_days,
             unit="", threshold=90, threshold_side="above",
         )
+        # Медиана берётся по времени, а не по числу начислений: интервал у
+        # разных монет 1, 4 или 8 часов, и «последние 90 начислений» означали
+        # бы у них от четырёх суток до месяца.
+        edge = settlements[-1][0] - STRUCTURAL_WINDOW_DAYS * 86_400_000
+        recent = [value for ts, value in settlements if ts >= edge]
+        if recent:
+            median_annual = float(
+                np.median(recent) * (HOURS_PER_YEAR / interval_hours) * 100.0
+            )
     return Funding(
         symbol=symbol,
         rate=current or 0.0,
@@ -303,6 +339,7 @@ def build_funding(
         percentile=percentile,
         history=tuple(settlements[-FUNDING_HISTORY_POINTS:]),
         source=source,
+        median_annual_pct=median_annual,
     )
 
 
@@ -518,3 +555,26 @@ def _window_minutes(window: str) -> int:
     if unit == "d":
         return amount * 1440
     raise ValueError(f"Неразборчивое окно: {window!r}")
+
+
+def side_of_flow(quadrant: Quadrant, funding_annual_pct: float | None) -> str:
+    """Дополнить квадрант стороной там, где по цене её не видно.
+
+    Реальный случай, на котором это поймано. HOMEUSDT 02.09.2026: OI +7.05% за
+    сутки при цене +0.47%, классификатор пишет «набор позиций без движения
+    цены» — читается как накопление. Но фандинг -303% годовых и базис -0.54%:
+    набиралась КОРОТКАЯ сторона, то есть ровно противоположное тому, что ищут.
+    Сигнал без стороны читается наоборот, и попасться на этом легко.
+
+    Сторона подписывается, но вывод не делается. Глубоко отрицательный фандинг
+    при сжатом диапазоне столь же часто оказывается топливом для сквиза,
+    сколько и медвежьим признаком: толпа шортов в узком диапазоне — классическая
+    заготовка движения вверх. Что из этого перед вами, решает не код (ТЗ §1.1).
+    """
+    if quadrant != "набор позиций без движения цены":
+        return quadrant
+    if funding_annual_pct is None or abs(funding_annual_pct) < FUNDING_NEUTRAL_ANNUAL:
+        return "набор без явной стороны (фандинг нейтрален)"
+    if funding_annual_pct > 0:
+        return "набор ЛОНГОВ без движения цены"
+    return "набор ШОРТОВ без движения цены"

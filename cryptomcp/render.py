@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from .analysis import TimeframeView
-from .derivatives import Funding, OpenInterest
+from .derivatives import Funding, OpenInterest, side_of_flow
 from .errors import ErrorKind, ToolError
 from .indicators import Metric
 from .levels import Level, Pivots
@@ -296,6 +296,13 @@ def render_derivatives(
             f"= {funding.annualized_pct:+.2f}% годовых"
             f"{_metric_context(funding.percentile)}{basis}"
         )
+        if funding.structurally_negative:
+            # Иначе глубокая ставка читается как событие, хотя это норма монеты.
+            lines.append(
+                f"  СТРУКТУРНО отрицательный: медиана за 30 сут. "
+                f"{funding.median_annual_pct:+.0f}% годовых — для этой монеты "
+                f"это норма, а не разовый перекос"
+            )
         if history and funding.history:
             since = utc(funding.history[0][0])[:16]
             rates = " ".join(f"{rate * 100:+.4f}" for _, rate in funding.history)
@@ -308,11 +315,13 @@ def render_derivatives(
         lines.append(
             f"OI {scale} USDT{_metric_context(open_interest.percentile)}:"
         )
+        annual = funding.annualized_pct if funding else None
         for window in open_interest.change:
+            reading = side_of_flow(open_interest.quadrant(window), annual)
             lines.append(
                 f"  {window:>4}: OI {open_interest.change[window] * 100:+6.2f}% · "
                 f"цена {open_interest.price_change[window] * 100:+6.2f}% "
-                f"→ {open_interest.quadrant(window)}"
+                f"→ {reading}"
             )
         if history and open_interest.history:
             base_ms, base_oi, base_price = open_interest.history[0]
@@ -471,6 +480,13 @@ INDEX_GROUPS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _cell(value: Any, spec: str = "") -> str:
+    """Число или прочерк. Пусто значит «не измерено», а не «ноль»."""
+    if value is None:
+        return "—"
+    return f"{value:{spec}}" if spec else f"{value}"
+
+
 def _price(value: Any) -> str:
     """Цена без потери разряда и без выдуманной точности.
 
@@ -585,7 +601,8 @@ def render_scan_history(
     lines = [
         f"{symbol} · {tf} · формула {version} · записей {len(rows)}, свежие сверху",
         f"{'закрыта':<17}{'индекс':>7}{header}{'BBW':>6}{'диап':>8}{'узк':>5}"
-        f"{'объём':>8}{'цена':>13}",
+        f"{'объём':>8}{'погл':>6}{'tkМакс':>8}{'лид':>6}{'фанд%':>9}"
+        f"{'цена':>13}",
     ]
 
     for row in rows:
@@ -611,11 +628,22 @@ def render_scan_history(
             f"{f'{width:.2f}%' if width is not None else 'n/a':>8}"
             f"{row.get('narrow_bars') if row.get('narrow_bars') is not None else '—':>5}"
             f"{f'{volume:.2f}x' if volume is not None else 'n/a':>8}"
+            f"{_cell(row.get('absorption_bars')):>6}"
+            f"{_cell(row.get('taker_max'), '.2f'):>8}"
+            f"{_cell(row.get('volume_lead'), '+d'):>6}"
+            f"{_cell(row.get('funding_annual'), '+.0f'):>9}"
             f"{_price(row.get('price')):>13}"
         )
 
+    reading = next(
+        (row["oi_reading"] for row in rows if row.get("oi_reading")), None
+    )
+    if reading:
+        lines.append(f"\nпоток по OI за сутки (последняя запись): {reading}")
     lines += [
         "",
+        "погл — бары набора на младшем ряду · tkМакс — максимум доли "
+        "тейкер-покупок · лид — на сколько свечей объём опередил цену",
         "группы — вклад в индекс до взвешивания; «—» значит базы не хватило "
         "и группа исключена из формулы с перенормировкой весов",
         "запись одна на закрытую свечу, поэтому шаг строк равен таймфрейму",

@@ -222,3 +222,77 @@ class TestRetrospective:
         # Базиса в прошлом нет: маркировочная и индексная цены только «сейчас».
         assert funding.mark_price == 0.0
         assert funding.basis_pct != funding.basis_pct  # NaN
+
+
+class TestSideOfFlow:
+    """Сторона набора: без неё сигнал читается ровно наоборот.
+
+    Случай HOMEUSDT 02.09.2026: OI +7.05% за сутки при цене +0.47%, то есть
+    «набор позиций без движения цены». Но фандинг -303% годовых — набиралась
+    короткая сторона.
+    """
+
+    def test_negative_funding_means_shorts(self):
+        from cryptomcp.derivatives import side_of_flow
+
+        assert side_of_flow("набор позиций без движения цены", -303.0) == (
+            "набор ШОРТОВ без движения цены"
+        )
+
+    def test_positive_funding_means_longs(self):
+        from cryptomcp.derivatives import side_of_flow
+
+        assert side_of_flow("набор позиций без движения цены", +120.0) == (
+            "набор ЛОНГОВ без движения цены"
+        )
+
+    def test_neutral_band_admits_it_knows_nothing(self):
+        """Полоса ±20% накрывает 77% рынка: там фандинг о стороне молчит."""
+        from cryptomcp.derivatives import side_of_flow
+
+        for rate in (8.5, -0.7, 11.0, None):
+            assert "без явной стороны" in side_of_flow(
+                "набор позиций без движения цены", rate
+            )
+
+    def test_other_quadrants_untouched(self):
+        """Где сторона видна по цене, подписывать её заново незачем."""
+        from cryptomcp.derivatives import side_of_flow
+
+        for quadrant in ("приток новых денег", "закрытие шортов",
+                         "движение без притока (ротация)",
+                         "разгрузка позиций без движения цены"):
+            assert side_of_flow(quadrant, -303.0) == quadrant
+
+
+class TestStructuralFunding:
+    NOW = 1_788_400_000_000
+    STEP = 4 * 3_600_000
+
+    def settlements(self, rate, count=200):
+        return [(self.NOW - (count - 1 - i) * self.STEP, rate) for i in range(count)]
+
+    def test_deep_negative_is_flagged_as_normal_for_the_coin(self):
+        from cryptomcp.derivatives import build_funding
+
+        # Ставка хранится долей: -0.001333 это -0.1333% за период.
+        funding = build_funding("HOMEUSDT", self.settlements(-0.001333), 4)
+        assert funding.structurally_negative
+        assert funding.median_annual_pct == pytest.approx(-291.9, abs=1.0)
+
+    def test_ordinary_funding_is_not_flagged(self):
+        from cryptomcp.derivatives import build_funding
+
+        funding = build_funding("BTCUSDT", self.settlements(0.0001), 8)
+        assert not funding.structurally_negative
+
+    def test_median_window_is_time_not_count(self):
+        """Интервал начисления разный: «последние 90 начислений» — не 30 суток."""
+        from cryptomcp.derivatives import build_funding
+
+        old = [(self.NOW - 200 * 86_400_000 + i * self.STEP, -0.5)
+               for i in range(100)]
+        recent = self.settlements(0.0001, count=180)
+        funding = build_funding("AAAUSDT", old + recent, 4)
+
+        assert not funding.structurally_negative

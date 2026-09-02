@@ -749,3 +749,66 @@ class TestFundingCollection:
         assert (written, failed) == (0, [])
         rows = con.execute("SELECT COUNT(*) AS n FROM funding").fetchone()["n"]
         assert rows == 30 * 3 + 1
+
+
+class TestAccumulationLogging:
+    """Признаки накопления пишутся в scan_log с первого дня.
+
+    Через два месяца вопрос будет не «работает ли накопление», а «какой из
+    признаков работает», и ответить можно только по журналу.
+    """
+
+    NOW = 1_788_400_000_000
+    H1 = 3_600_000
+
+    def fill_hourly(self, con, symbol, count=1800):
+        rows = []
+        for i in range(count):
+            ts = self.NOW - (count - i) * self.H1
+            volume = 5000.0 if i == count - 20 else 1000.0
+            rows.append((ts, 100.0, 100.5, 99.5, 100.0, 10.0, volume, 10,
+                         5.0, volume * 0.6))
+        storage.upsert_ohlcv(con, symbol, "1h", "futures", rows)
+        con.commit()
+
+    def test_context_reads_only_the_archive(self, con):
+        from cryptomcp.collector import accumulation_context
+
+        self.fill_hourly(con, "AAAUSDT")
+        context = accumulation_context(con, "AAAUSDT", self.NOW)
+
+        assert context["absorption_tf"] == "1h"
+        assert "taker_streak" in context and "lead_state" in context
+        # Деривативов и фандинга в базе нет — колонки просто отсутствуют.
+        assert "oi_reading" not in context
+        assert "funding_annual" not in context
+
+    def test_funding_interval_derived_from_data(self, con):
+        """Интервал начисления берётся из промежутков, а не спрашивается у биржи."""
+        from cryptomcp.collector import funding_annual
+
+        step = 8 * 3_600_000
+        settlements = [(self.NOW - (20 - i) * step, 0.0001) for i in range(20)]
+        assert funding_annual(settlements) == pytest.approx(10.95, abs=0.01)
+
+        step = 4 * 3_600_000
+        settlements = [(self.NOW - (20 - i) * step, 0.0001) for i in range(20)]
+        assert funding_annual(settlements) == pytest.approx(21.9, abs=0.01)
+
+    def test_too_short_history_gives_nothing(self, con):
+        from cryptomcp.collector import funding_annual
+
+        assert funding_annual([(self.NOW, 0.0001)]) is None
+
+    def test_hourly_rows_get_no_accumulation(self, con):
+        """У записей 1h младшего ряда в архиве нет: колонки остаются пустыми."""
+        from cryptomcp.collector import run_scan
+
+        self.fill_hourly(con, "AAAUSDT")
+        run_scan(con)
+
+        rows = con.execute(
+            "SELECT tf, absorption_tf FROM scan_log ORDER BY tf"
+        ).fetchall()
+        by_tf = {row["tf"]: row["absorption_tf"] for row in rows}
+        assert by_tf.get("1h") is None

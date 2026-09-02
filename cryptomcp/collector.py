@@ -26,6 +26,7 @@ import datetime as dt
 import logging
 import os
 import sqlite3
+import statistics
 import time
 from typing import Any
 
@@ -33,10 +34,13 @@ from . import SQUEEZE_FORMULA_VERSION, render, storage
 from .analysis import MIN_CANDLES, analyse_timeframe, required_candles
 from .client import BinanceClient
 from .config import Config
+from .derivatives import build_open_interest, side_of_flow
 from .errors import ToolError
+from .indicators import atr
 from .markets import FUTURES, SPOT
 from .reader import WARMUP
 from .series import build_series, series_from_records
+from .volume import absorption
 
 log = logging.getLogger("cryptomcp.collector")
 
@@ -116,6 +120,9 @@ MID_LADDER: tuple[tuple[str, int], ...] = (
 #: 1h-индекс размах лучше старших ТФ. До тех пор 1h НЕ открывает эпизодов —
 #: см. WATCH_TIMEFRAMES.
 SCAN_TIMEFRAMES = ("4h", "1d", "1h")
+
+#: Ряд, по которому считаются признаки накопления, независимо от ТФ записи.
+ACCUMULATION_TF = "1h"
 
 #: На каких таймфреймах вести список наблюдения.
 #:
@@ -481,6 +488,76 @@ async def archive_plan(
     return plan
 
 
+def funding_annual(settlements: list[tuple[int, float]]) -> float | None:
+    """Годовая ставка по архивным начислениям.
+
+    Интервал начисления берётся из САМИХ данных — по медианному промежутку
+    между начислениями. Он различается у монет (1, 4 или 8 часов), а спросить
+    его у биржи значило бы сделать запрос там, где скан их не делает вовсе.
+    """
+    if len(settlements) < 3:
+        return None
+    stamps = [ts for ts, _ in settlements[-30:]]
+    gaps = [b - a for a, b in zip(stamps, stamps[1:], strict=False) if b > a]
+    if not gaps:
+        return None
+    interval_h = statistics.median(gaps) / 3_600_000
+    if interval_h <= 0:
+        return None
+    return settlements[-1][1] * (24 * 365 / interval_h) * 100.0
+
+
+def accumulation_context(
+    con: sqlite3.Connection, symbol: str, now_ms: int
+) -> dict[str, Any]:
+    """Признаки накопления по символу — всё из архива, ни одного запроса.
+
+    Пишутся с первого дня по той же причине, по которой с первого дня пишется
+    разложение индекса: через два месяца вопрос будет не «работает ли
+    накопление», а «какой из его признаков работает», и ответить на него можно
+    только по журналу. Вес ни одному из них пока не назначен.
+
+    Считается на 1h независимо от таймфрейма записи: дневное разрешение стирает
+    поглощение внутри свечи целиком (§4.19). Для записей самого 1h признаки не
+    пишутся — там младшего ряда в архиве нет, а считать поглощение по своему же
+    ряду значило бы повторить объёмную группу.
+    """
+    context: dict[str, Any] = {}
+
+    records = storage.load_candles(
+        con, symbol, ACCUMULATION_TF, required_candles(ACCUMULATION_TF) + WARMUP
+    )
+    series = series_from_records(records, symbol, ACCUMULATION_TF)
+    if len(series) >= MIN_CANDLES:
+        atr_values = atr(series.high, series.low, series.close, 14)
+        data = absorption(series, atr_values)
+        context.update(
+            absorption_tf=data.interval,
+            absorption_bars=data.bars,
+            taker_max=round(data.taker_max, 4),
+            taker_above=data.taker_above,
+            taker_streak=data.taker_streak,
+            volume_lead=data.lead_bars,
+            lead_state=data.lead_state,
+        )
+
+    settlements = storage.funding_window(con, symbol, now_ms, limit=60)
+    annual = funding_annual(settlements)
+    if annual is not None:
+        context["funding_annual"] = round(annual, 2)
+
+    rows = storage.derivatives_window(con, symbol, now_ms - 2 * 86_400_000, now_ms)
+    if len(rows) > 1:
+        view = build_open_interest(
+            symbol, rows, PERIOD_MS // 60_000, rows, PERIOD_MS // 60_000,
+            windows=("24h",), source="архив",
+        )
+        if "24h" in view.change:
+            context["oi_change_24h"] = round(view.change["24h"] * 100, 4)
+            context["oi_reading"] = side_of_flow(view.quadrant("24h"), annual)
+    return context
+
+
 def run_scan(con: sqlite3.Connection) -> int:
     """Посчитать индекс по всему архиву и записать в scan_log.
 
@@ -493,6 +570,8 @@ def run_scan(con: sqlite3.Connection) -> int:
     четыре раза и перевешивало бы дневное.
     """
     written = 0
+    now_ms = int(dt.datetime.now(dt.UTC).timestamp() * 1000)
+    accumulation: dict[str, dict[str, Any]] = {}
     for tf in SCAN_TIMEFRAMES:
         for symbol, source in storage.archived_symbols(con, tf):
             # То же каноническое окно, что у сервера: иначе один и тот же
@@ -505,9 +584,15 @@ def run_scan(con: sqlite3.Connection) -> int:
             if len(series) < MIN_CANDLES:
                 continue
             view = analyse_timeframe(series, config)
+            # Контекст накопления один на символ: он не зависит от таймфрейма
+            # записи, а пересчитывать его на каждый ТФ значило бы читать один и
+            # тот же ряд трижды.
+            if tf != ACCUMULATION_TF and symbol not in accumulation:
+                accumulation[symbol] = accumulation_context(con, symbol, now_ms)
             if storage.record_scan(
                 con, symbol, source, view,
                 formula_version=SQUEEZE_FORMULA_VERSION,
+                accumulation=accumulation.get(symbol) if tf != ACCUMULATION_TF else None,
             ):
                 written += 1
     con.commit()

@@ -111,7 +111,20 @@ CREATE TABLE IF NOT EXISTS scan_log (
     taker_buy_mean    REAL,
     ema_state         TEXT,
     structure         TEXT,
-    closed_through_ms INTEGER
+    closed_through_ms INTEGER,
+    -- Признаки накопления. Считаются на МЛАДШЕМ ряду (§4.19) и пишутся с
+    -- первого дня: через два месяца вопрос будет «работает ли накопление», и
+    -- ответить на него можно только по журналу.
+    absorption_tf     TEXT,
+    absorption_bars   INTEGER,
+    taker_max         REAL,
+    taker_above       INTEGER,
+    taker_streak      INTEGER,
+    volume_lead       INTEGER,
+    lead_state        TEXT,
+    oi_change_24h     REAL,
+    oi_reading        TEXT,
+    funding_annual    REAL
 );
 
 -- Одна строка на закрытую свечу И версию формулы. Сканер ходит раз в час, а
@@ -176,6 +189,14 @@ CREATE TABLE IF NOT EXISTS collector_runs (
 );
 """
 
+#: Колонки признаков накопления в scan_log. Список закрытый: опечатка в имени
+#: молча писала бы в никуда, а обнаружилось бы это через месяц пустой статистики.
+ACCUMULATION_COLUMNS = frozenset({
+    "absorption_tf", "absorption_bars", "taker_max", "taker_above",
+    "taker_streak", "volume_lead", "lead_state", "oi_change_24h",
+    "oi_reading", "funding_annual",
+})
+
 #: Колонки derivatives, кроме ключа. Порядок фиксирован: по нему строится upsert.
 DERIVATIVE_COLUMNS = (
     "open_interest",
@@ -213,6 +234,16 @@ def connect(path: str = DEFAULT_PATH, *, read_only: bool = False) -> sqlite3.Con
 #: таблицу нельзя: в ней лежат эпизоды, ради истории которых она и заведена.
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("watchlist", "rank_at_entry", "INTEGER"),
+    ("scan_log", "absorption_tf", "TEXT"),
+    ("scan_log", "absorption_bars", "INTEGER"),
+    ("scan_log", "taker_max", "REAL"),
+    ("scan_log", "taker_above", "INTEGER"),
+    ("scan_log", "taker_streak", "INTEGER"),
+    ("scan_log", "volume_lead", "INTEGER"),
+    ("scan_log", "lead_state", "TEXT"),
+    ("scan_log", "oi_change_24h", "REAL"),
+    ("scan_log", "oi_reading", "TEXT"),
+    ("scan_log", "funding_annual", "REAL"),
 )
 
 
@@ -370,6 +401,7 @@ def record_scan(
     *,
     formula_version: str,
     ts_ms: int | None = None,
+    accumulation: dict[str, Any] | None = None,
 ) -> int:
     """Строка журнала сканирования.
 
@@ -402,13 +434,26 @@ def record_scan(
         view.structure,
         view.meta.get("closed_through_ms"),
     )
+    columns = [
+        "ts_ms", "symbol", "source", "tf", "formula_version", "squeeze_index",
+        "components", "excluded", "price", "range_low", "range_high",
+        "range_width_pct", "narrow_bars", "atr_pct", "rsi", "bbw_pct_rank",
+        "volume_ratio", "taker_buy_mean", "ema_state", "structure",
+        "closed_through_ms",
+    ]
+    values = list(payload)
+    # Признаки накопления приходят готовыми словарём: они считаются по ДРУГОМУ
+    # ряду, и собирать их из view было бы неверно — там свой таймфрейм.
+    for column, value in (accumulation or {}).items():
+        if column not in ACCUMULATION_COLUMNS:
+            raise ValueError(f"Неизвестная колонка накопления: {column!r}")
+        columns.append(column)
+        values.append(value)
+
     cursor = con.execute(
-        "INSERT OR IGNORE INTO scan_log (ts_ms, symbol, source, tf, formula_version, "
-        "squeeze_index, components, excluded, price, range_low, range_high, "
-        "range_width_pct, narrow_bars, atr_pct, rsi, bbw_pct_rank, volume_ratio, "
-        "taker_buy_mean, ema_state, structure, closed_through_ms) "
-        "VALUES (" + ", ".join("?" * 21) + ")",
-        payload,
+        f"INSERT OR IGNORE INTO scan_log ({', '.join(columns)}) "
+        f"VALUES ({', '.join('?' * len(columns))})",
+        values,
     )
     # rowcount == 0 означает, что свеча уже записана предыдущим прогоном.
     return int(cursor.lastrowid or 0) if cursor.rowcount else 0
