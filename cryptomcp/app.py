@@ -28,6 +28,23 @@ logger = logging.getLogger(__name__)
 #: Пути, доступные без токена. Health нужен деплою и мониторингу.
 PUBLIC_PATHS = frozenset({"/health"})
 
+#: Запасной заголовок для токена.
+#:
+#: В форме custom connector на claude.ai имя `Authorization` зарезервировано под
+#: OAuth и недоступно для ручного ввода, а полноценный OAuth здесь не
+#: реализован. Поэтому токен принимается и обычным путём, и через этот
+#: заголовок — без префикса `Bearer`, одним значением.
+API_KEY_HEADER = "x-api-key"
+
+
+def extract_token(request: Request) -> str | None:
+    """Токен из Authorization: Bearer или из запасного заголовка."""
+    authorization = request.headers.get("authorization", "")
+    scheme, _, value = authorization.partition(" ")
+    if scheme.lower() == "bearer" and value:
+        return value
+    return request.headers.get(API_KEY_HEADER) or None
+
 
 async def health(_: Request) -> Response:
     return JSONResponse({"status": "ok", "service": "cryptomcp"})
@@ -48,10 +65,12 @@ def bearer_auth_middleware(token: str):
         if request.url.path in PUBLIC_PATHS:
             return await call_next(request)
 
-        header = request.headers.get("authorization", "")
-        scheme, _, provided = header.partition(" ")
-        if scheme.lower() != "bearer" or not provided:
-            return _unauthorized("Требуется заголовок Authorization: Bearer <токен>.")
+        provided = extract_token(request)
+        if not provided:
+            return _unauthorized(
+                "Требуется токен: заголовок Authorization: Bearer <токен> "
+                f"либо {API_KEY_HEADER}: <токен>."
+            )
         # Сравнение с постоянным временем: обычное == позволяет подобрать
         # токен по времени ответа.
         if not hmac.compare_digest(provided, token):
