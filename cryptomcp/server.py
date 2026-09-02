@@ -16,11 +16,10 @@ import json
 import logging
 import os
 import sys
-from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from .analysis import MIN_CANDLES, analyse_timeframe, weekly_pivots_from
+from .analysis import MIN_CANDLES, TimeframeView, analyse_timeframe, weekly_pivots_from
 from .client import BinanceFuturesClient
 from .config import Config
 from .derivatives import DerivativesReader
@@ -108,24 +107,45 @@ async def _views(
     as_of_ms: int | None,
     *,
     paginate: bool = True,
-) -> dict[str, Any]:
+) -> tuple[dict[str, TimeframeView], dict[str, ToolError]]:
+    """Разбор по таймфреймам, устойчивый к нехватке истории на отдельном ТФ.
+
+    Свежий листинг — не краевой случай, а целевая категория: высокая
+    волатильность, тонкая ликвидность, именно там сканер и интересен. Ронять
+    весь снапшот из-за того, что недельных свечей набралось 43 из 60, значит
+    не работать ровно там, где инструмент нужнее всего.
+
+    Поэтому недоступный ТФ помечается строкой, а остальные считаются — та же
+    логика, по которой метрика без достаточной базы печатает причину, а не
+    отменяет всю выдачу (PLAN §4.2). Ошибка возвращается целиком только когда
+    не посчитан ни один ТФ: тогда возвращать действительно нечего.
+    """
     weekly = await fetcher.get(symbol, "1w", limit=10, as_of_ms=as_of_ms)
     pivots = weekly_pivots_from(weekly)
 
-    views: dict[str, Any] = {}
+    views: dict[str, TimeframeView] = {}
+    skipped: dict[str, ToolError] = {}
     for interval in timeframes:
-        series = await fetcher.get(
-            symbol,
-            interval,
-            limit=500,
-            as_of_ms=as_of_ms,
-            min_candles=MIN_CANDLES,
-            target_span_days=_target_span(interval) if paginate else None,
-        )
-        view = analyse_timeframe(series, config, weekly_pivots=pivots)
+        try:
+            series = await fetcher.get(
+                symbol,
+                interval,
+                limit=500,
+                as_of_ms=as_of_ms,
+                min_candles=MIN_CANDLES,
+                target_span_days=_target_span(interval) if paginate else None,
+            )
+            view = analyse_timeframe(series, config, weekly_pivots=pivots)
+        except ToolError as error:
+            skipped[interval] = error
+            continue
         journal.record(symbol, view, as_of_ms=as_of_ms)
         views[interval] = view
-    return views
+
+    if not views:
+        # Единственный запрошенный ТФ не посчитался — это и есть ответ.
+        raise next(iter(skipped.values()))
+    return views, skipped
 
 
 @server.tool(
@@ -147,7 +167,7 @@ async def get_market_snapshot(
         info = await registry.get(symbol)
         intervals = _validate_timeframes(timeframes)
 
-        views = await _views(fetcher, info.symbol, intervals, as_of_ms)
+        views, skipped = await _views(fetcher, info.symbol, intervals, as_of_ms)
         ticker = await client.ticker_24hr(info.symbol)
 
         funding = oi = None
@@ -171,6 +191,8 @@ async def get_market_snapshot(
             funding=funding,
             open_interest=oi,
             as_of_ms=as_of_ms,
+            skipped=skipped,
+            order=intervals,
         )
     except ToolError as error:
         return _fail(error)
@@ -195,7 +217,7 @@ async def get_squeeze_metrics(
         info = await registry.get(symbol)
         interval = _validate_timeframes([timeframe])[0]
 
-        views = await _views(fetcher, info.symbol, (interval,), as_of_ms)
+        views, _ = await _views(fetcher, info.symbol, (interval,), as_of_ms)
         view = views[interval]
         return render_squeeze_metrics(view, config.range_threshold(interval))
     except ToolError as error:
@@ -256,7 +278,7 @@ async def get_key_levels(
         info = await registry.get(symbol)
         interval = _validate_timeframes([timeframe])[0]
 
-        views = await _views(fetcher, info.symbol, (interval,), as_of_ms)
+        views, _ = await _views(fetcher, info.symbol, (interval,), as_of_ms)
         view = views[interval]
         precision = info.price_precision
 
@@ -353,11 +375,16 @@ async def scan_pairs(symbols: list[str], timeframe: str = "4h") -> str:
             f"{interval} · сортировка по squeeze_index",
             f"{'символ':<14}{'индекс':>6}{'BBW':>7}{'диап':>9}"
             f"{'узк':>6}{'объём':>9}  EMA/структура",
-            "узк — свечей подряд с шириной диапазона(20) ниже порога ТФ",
         ]
         lines += [text for _, text in rows]
+        lines += [
+            "",
+            "узк — свечей подряд с шириной диапазона(20) ниже порога ТФ",
+            "объём — к сезонной базе, но история здесь мельче снапшотной "
+            "(пагинация отключена ради веса), поэтому число приблизительное",
+        ]
         if problems:
-            lines += ["", "пропущены:"] + [f"  {p}" for p in problems]
+            lines += ["", "пропущены — остальные посчитаны:"] + [f"  {p}" for p in problems]
         return "\n".join(lines)
     except ToolError as error:
         return _fail(error)

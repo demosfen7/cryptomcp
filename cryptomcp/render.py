@@ -17,6 +17,7 @@ import datetime as dt
 
 from .analysis import TimeframeView
 from .derivatives import Funding, OpenInterest
+from .errors import ErrorKind, ToolError
 from .indicators import Metric
 from .levels import Level, Pivots
 from .series import Series
@@ -47,6 +48,13 @@ def closed_through(view: TimeframeView, *, short: bool = False) -> str:
         return "n/a"
     stamp = utc(int(ms) + 1)
     return stamp[5:16] if short else stamp[:16]
+
+
+def skip_label(error: ToolError) -> str:
+    """Короткая причина, по которой строка таймфрейма не посчиталась."""
+    if error.kind is ErrorKind.INSUFFICIENT_HISTORY and "have" in error.details:
+        return f"недостаточно истории ({error.details['have']}/{error.details['need']})"
+    return error.message
 
 
 def render_metric(metric: Metric, *, precision: int = 4) -> str:
@@ -115,8 +123,15 @@ def render_snapshot(
     funding: Funding | None = None,
     open_interest: OpenInterest | None = None,
     as_of_ms: int | None = None,
+    skipped: dict[str, ToolError] | None = None,
+    order: tuple[str, ...] | None = None,
 ) -> str:
-    """Уровень L1: общая картина, 20–25 строк."""
+    """Уровень L1: общая картина, 20–25 строк.
+
+    ``skipped`` — таймфреймы, которые не удалось посчитать. Они печатаются
+    строкой с причиной, а не исчезают из лестницы: пропавшая без объяснения
+    строка читается как «на 1w сжатия нет», хотя означает «не считали».
+    """
     precision = info.price_precision
     lines: list[str] = []
 
@@ -136,7 +151,14 @@ def render_snapshot(
         f"{'объём':>8}{'takerB':>8}  сжатие"
     )
 
-    for interval, view in views.items():
+    skipped = skipped or {}
+    ladder = order or tuple(views) + tuple(k for k in skipped if k not in views)
+    for interval in ladder:
+        view = views.get(interval)
+        if view is None:
+            error = skipped.get(interval)
+            lines.append(f"{interval:<5}— {skip_label(error) if error else 'не считался'}")
+            continue
         if view.bbw.has_context:
             squeeze = f"BBW {view.bbw.pct_rank:.0f} pct"
             if view.bbw.flagged:
@@ -155,6 +177,10 @@ def render_snapshot(
         )
 
     lines.append("")
+    if skipped:
+        lines.append("недоступные ТФ — остальные посчитаны:")
+        lines += [f"  {tf}: {error.message}" for tf, error in skipped.items()]
+        lines.append("")
     lines.append("закрыты по (UTC): " + " · ".join(
         f"{tf} {closed_through(v, short=True)}" for tf, v in views.items()
     ))

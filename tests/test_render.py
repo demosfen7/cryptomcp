@@ -184,3 +184,47 @@ class TestDerivativesRendering:
         assert "начисления" not in short
         assert "по часам" in full
         assert "+2.00" in full  # ΔOI% относительно начала окна
+
+
+class TestSkippedTimeframes:
+    """Недоступный ТФ печатается строкой, а не исчезает из лестницы.
+
+    Пропавшая без объяснения строка читается как «на 1w сжатия нет», хотя
+    означает «не считали»; молчание здесь хуже пометки.
+    """
+
+    def snapshot(self):
+        from cryptomcp.errors import insufficient_history
+
+        return render_snapshot(
+            INFO, {"4h": view()},
+            live_price=100.5, change_24h=1.0, quote_volume_24h=1e9, now_ms=4 * H4,
+            skipped={"1w": insufficient_history("UAIUSDT", "1w", 43, 60)},
+            order=("1w", "4h"),
+        )
+
+    def test_row_states_the_shortfall(self):
+        assert "1w   — недостаточно истории (43/60)" in self.snapshot()
+
+    def test_row_keeps_its_place_in_the_ladder(self):
+        rows = [
+            line for line in self.snapshot().splitlines()
+            if line.startswith(("1w", "4h"))
+        ]
+        assert rows[0].startswith("1w")
+        assert rows[1].startswith("4h")
+
+    def test_full_reason_printed_below(self):
+        text = self.snapshot()
+        assert "недоступные ТФ — остальные посчитаны:" in text
+        assert "свежий листинг — это не сбой" in text
+
+    def test_closed_through_lists_only_computed(self):
+        assert "закрыты по (UTC): 4h 01-01 16:00" in self.snapshot()
+
+    def test_no_block_when_nothing_skipped(self):
+        text = render_snapshot(
+            INFO, {"4h": view()},
+            live_price=100.5, change_24h=1.0, quote_volume_24h=1e9, now_ms=4 * H4,
+        )
+        assert "недоступные ТФ" not in text
