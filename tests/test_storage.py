@@ -154,3 +154,50 @@ class TestRunLog:
             con, "incremental", symbols=1, rows=0, seconds=0.1, error="таймаут"
         )
         assert con.execute("SELECT error FROM collector_runs").fetchone()[0] == "таймаут"
+
+
+class TestOhlcv:
+    def candle(self, ts, close=100.0):
+        return (ts, close, close + 1, close - 1, close, 10.0, 1000.0, 42, 5.0, 500.0)
+
+    def test_write_and_read_back(self, con):
+        assert storage.upsert_ohlcv(con, "CAKEUSDT", "1d", "spot",
+                                    [self.candle(1000)]) == 1
+        row = con.execute("SELECT * FROM ohlcv").fetchone()
+        assert (row["symbol"], row["tf"], row["source"]) == ("CAKEUSDT", "1d", "spot")
+        assert row["trades"] == 42
+
+    def test_same_candle_is_overwritten(self, con):
+        """Биржа доправляет последнюю свечу — сохранить надо исправленную."""
+        storage.upsert_ohlcv(con, "CAKEUSDT", "1d", "spot", [self.candle(1000, 100.0)])
+        storage.upsert_ohlcv(con, "CAKEUSDT", "1d", "spot", [self.candle(1000, 105.0)])
+        rows = con.execute("SELECT c FROM ohlcv").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["c"] == 105.0
+
+    def test_timeframes_do_not_collide(self, con):
+        storage.upsert_ohlcv(con, "CAKEUSDT", "1d", "spot", [self.candle(1000)])
+        storage.upsert_ohlcv(con, "CAKEUSDT", "4h", "spot", [self.candle(1000)])
+        assert con.execute("SELECT COUNT(*) c FROM ohlcv").fetchone()["c"] == 2
+
+    def test_last_ts_per_timeframe(self, con):
+        storage.upsert_ohlcv(con, "CAKEUSDT", "1d", "spot",
+                             [self.candle(1000), self.candle(9000)])
+        storage.upsert_ohlcv(con, "CAKEUSDT", "4h", "spot", [self.candle(2000)])
+        assert storage.last_ohlcv_ts(con, "CAKEUSDT", "1d") == 9000
+        assert storage.last_ohlcv_ts(con, "CAKEUSDT", "4h") == 2000
+        assert storage.last_ohlcv_ts(con, "CAKEUSDT", "1h") is None
+
+    def test_source_is_remembered_from_the_data(self, con):
+        """Отдельного реестра источников нет — он рассинхронизировался бы."""
+        assert storage.archive_source(con, "CAKEUSDT") is None
+        storage.upsert_ohlcv(con, "CAKEUSDT", "1d", "spot", [self.candle(1000)])
+        assert storage.archive_source(con, "CAKEUSDT") == "spot"
+
+    def test_coverage_groups_by_timeframe(self, con):
+        storage.upsert_ohlcv(con, "CAKEUSDT", "1d", "spot",
+                             [self.candle(1000), self.candle(2000)])
+        storage.upsert_ohlcv(con, "UAIUSDT", "1d", "futures", [self.candle(3000)])
+        rows = {(r["symbol"], r["tf"]): r for r in storage.ohlcv_coverage(con)}
+        assert rows[("CAKEUSDT", "1d")]["candles"] == 2
+        assert rows[("UAIUSDT", "1d")]["source"] == "futures"

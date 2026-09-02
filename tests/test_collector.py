@@ -211,3 +211,129 @@ class TestHealth:
 
         storage.record_run(con, "universe", symbols=52, rows=52, seconds=1.0)
         assert not health(con)[0]
+
+
+class FakeKlineClient:
+    """Биржа, отдающая свечи ВПЕРЁД от startTime — как настоящий /klines."""
+
+    def __init__(self, first_ts: int, last_ts: int, step_ms: int, page: int = 1000):
+        self.first_ts, self.last_ts, self.step, self.page = first_ts, last_ts, step_ms, page
+        self.market = type("M", (), {"max_limit": page})()
+        self.starts: list[int] = []
+
+    async def now_ms(self):
+        # С запасом: свеча считается закрытой не в момент close_time, а через
+        # CLOSE_GRACE_MS после — биржа успевает её доправить.
+        return self.last_ts + self.step + 10_000
+
+    async def klines(self, symbol, interval, *, limit=500, start_time=None,
+                     end_time=None, cache_ttl_s=0.0):
+        self.starts.append(start_time)
+        begin = max(start_time or self.first_ts, self.first_ts)
+        # Выравнивание на сетку, как у биржи.
+        offset = (begin - self.first_ts) % self.step
+        if offset:
+            begin += self.step - offset
+        out = []
+        ts = begin
+        while ts <= self.last_ts and len(out) < limit:
+            out.append([ts, "1.0", "2.0", "0.5", "1.5", "10.0", ts + self.step - 1,
+                        "1000.0", 7, "5.0", "500.0", "0"])
+            ts += self.step
+        return out
+
+
+class TestCandleLoader:
+    @pytest.mark.asyncio
+    async def test_forward_paging_covers_the_window(self, con):
+        from cryptomcp.collector import load_candles
+
+        step = 3_600_000
+        client = FakeKlineClient(NOW - 2500 * step, NOW, step, page=1000)
+        written = await load_candles(client, con, "CAKEUSDT", "1h", 200, "spot")
+
+        assert written == 2501
+        assert len(client.starts) == 3, "две полные страницы и последняя неполная"
+        assert client.starts == sorted(client.starts), "курсор обязан идти вперёд"
+
+    @pytest.mark.asyncio
+    async def test_depth_limits_first_load(self, con):
+        """Глубина лестницы, а не вся история символа."""
+        from cryptomcp.collector import load_candles
+
+        step = 86_400_000
+        client = FakeKlineClient(NOW - 3000 * step, NOW, step)
+        written = await load_candles(client, con, "CAKEUSDT", "1d", 100, "spot")
+        # Точное число зависит от выравнивания на сетку: startTime внутри свечи
+        # отдаёт следующую. Важно, что взята глубина лестницы, а не вся история
+        # символа — у него её три тысячи суток.
+        assert 99 <= written <= 101
+
+    @pytest.mark.asyncio
+    async def test_second_run_refetches_the_last_candle(self, con):
+        """Курсор ставится НА последнюю сохранённую свечу: биржа её правит."""
+        from cryptomcp.collector import load_candles
+
+        step = 3_600_000
+        client = FakeKlineClient(NOW - 50 * step, NOW, step)
+        await load_candles(client, con, "CAKEUSDT", "1h", 10, "spot")
+        saved = storage.last_ohlcv_ts(con, "CAKEUSDT", "1h")
+
+        client.starts.clear()
+        client.last_ts = NOW + 3 * step
+        written = await load_candles(client, con, "CAKEUSDT", "1h", 10, "spot")
+
+        assert client.starts[0] == saved, "начинать надо с сохранённой, а не после неё"
+        assert written == 4, "перезаписанная последняя плюс три новых"
+
+    @pytest.mark.asyncio
+    async def test_unclosed_candle_is_not_stored(self, con):
+        """Последняя свеча ещё идёт: её объём неполон, в архиве это навсегда."""
+        from cryptomcp.collector import load_candles
+
+        step = 3_600_000
+        client = FakeKlineClient(NOW - 10 * step, NOW, step)
+
+        async def now_ms():
+            return NOW  # последняя свеча ещё не закрыта
+
+        client.now_ms = now_ms
+        await load_candles(client, con, "CAKEUSDT", "1h", 10, "spot")
+        # Отброшены две: идущая сейчас и закрывшаяся мгновение назад — вторая
+        # попадает в пятисекундный запас, за который биржа её ещё правит.
+        assert storage.last_ohlcv_ts(con, "CAKEUSDT", "1h") == NOW - 2 * step
+
+
+class TestArchivePlan:
+    @pytest.mark.asyncio
+    async def test_spot_preferred_when_available(self, con):
+        from cryptomcp.collector import LADDER, archive_plan
+
+        plan = await archive_plan(con, ["CAKEUSDT"], [], {"CAKEUSDT"})
+        assert plan == [("CAKEUSDT", "spot", LADDER)]
+
+    @pytest.mark.asyncio
+    async def test_futures_when_no_spot_pair(self, con):
+        """Четверть ликвидных перпетуалов спота не имеет — HYPE, UAI и другие."""
+        from cryptomcp.collector import archive_plan
+
+        plan = await archive_plan(con, ["UAIUSDT"], [], set())
+        assert plan[0][1] == "futures"
+
+    @pytest.mark.asyncio
+    async def test_existing_source_wins_over_new_spot_listing(self, con):
+        """Появился спот позже — источник не меняем, иначе склеим два рынка."""
+        from cryptomcp.collector import archive_plan
+
+        storage.upsert_ohlcv(con, "UAIUSDT", "1d", "futures",
+                             [(1000, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1, 1.0, 1.0)])
+        plan = await archive_plan(con, ["UAIUSDT"], [], {"UAIUSDT"})
+        assert plan[0][1] == "futures"
+
+    @pytest.mark.asyncio
+    async def test_mid_layer_gets_shorter_ladder(self, con):
+        from cryptomcp.collector import MID_LADDER, archive_plan
+
+        plan = await archive_plan(con, [], ["BTCUSDT"], {"BTCUSDT"})
+        assert plan[0][2] == MID_LADDER
+        assert [tf for tf, _ in plan[0][2]] == ["1d", "4h"]

@@ -30,6 +30,23 @@ from typing import Any
 DEFAULT_PATH = os.environ.get("CRYPTOMCP_DB", "data/market.sqlite")
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS ohlcv (
+    symbol          TEXT    NOT NULL,
+    tf              TEXT    NOT NULL,
+    ts              INTEGER NOT NULL,
+    o               REAL    NOT NULL,
+    h               REAL    NOT NULL,
+    l               REAL    NOT NULL,
+    c               REAL    NOT NULL,
+    volume          REAL,
+    quote_volume    REAL,
+    trades          INTEGER,
+    taker_buy_base  REAL,
+    taker_buy_quote REAL,
+    source          TEXT    NOT NULL,
+    PRIMARY KEY (symbol, tf, ts)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS derivatives (
     symbol              TEXT    NOT NULL,
     ts                  INTEGER NOT NULL,
@@ -103,6 +120,69 @@ def connect(path: str = DEFAULT_PATH, *, read_only: bool = False) -> sqlite3.Con
         con.executescript(SCHEMA)
         con.commit()
     return con
+
+
+#: Колонки свечи, кроме ключа и источника.
+OHLCV_COLUMNS = (
+    "o", "h", "l", "c", "volume", "quote_volume",
+    "trades", "taker_buy_base", "taker_buy_quote",
+)
+
+
+def upsert_ohlcv(
+    con: sqlite3.Connection,
+    symbol: str,
+    tf: str,
+    source: str,
+    rows: Sequence[Sequence[Any]],
+) -> int:
+    """Записать свечи, перезаписывая совпадающие по времени.
+
+    Перезапись, а не пропуск: биржа доправляет последнюю свечу в первые
+    мгновения после закрытия, и инкрементальная догрузка обязана начинаться
+    с уже сохранённой границы, а не после неё.
+    """
+    if not rows:
+        return 0
+    assignments = ", ".join(f"{c} = excluded.{c}" for c in OHLCV_COLUMNS)
+    sql = (
+        f"INSERT INTO ohlcv (symbol, tf, ts, {', '.join(OHLCV_COLUMNS)}, source) "
+        f"VALUES (?, ?, ?, {', '.join('?' * len(OHLCV_COLUMNS))}, ?) "
+        f"ON CONFLICT (symbol, tf, ts) DO UPDATE SET {assignments}"
+    )
+    con.executemany(sql, [(symbol, tf, *row, source) for row in rows])
+    return len(rows)
+
+
+def last_ohlcv_ts(con: sqlite3.Connection, symbol: str, tf: str) -> int | None:
+    row = con.execute(
+        "SELECT MAX(ts) AS ts FROM ohlcv WHERE symbol = ? AND tf = ?", (symbol, tf)
+    ).fetchone()
+    return row["ts"] if row and row["ts"] is not None else None
+
+
+def archive_source(con: sqlite3.Connection, symbol: str) -> str | None:
+    """С какого рынка уже собрана история символа.
+
+    Источник выбирается один раз и дальше не меняется: если монета получит
+    спотовую пару позже, переключение задним числом склеило бы в одном ряду
+    два разных рынка с разными ценами и объёмами. Реестром служат сами данные —
+    отдельная таблица источников рассинхронизировалась бы с ними.
+    """
+    row = con.execute(
+        "SELECT source FROM ohlcv WHERE symbol = ? LIMIT 1", (symbol,)
+    ).fetchone()
+    return row["source"] if row else None
+
+
+def ohlcv_coverage(con: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Что накоплено по свечам — на символ и таймфрейм."""
+    rows = con.execute(
+        "SELECT symbol, tf, source, COUNT(*) AS candles, "
+        "MIN(ts) AS first_ts, MAX(ts) AS last_ts "
+        "FROM ohlcv GROUP BY symbol, tf ORDER BY symbol, tf"
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def upsert_derivatives(

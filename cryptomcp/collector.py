@@ -33,6 +33,7 @@ from . import storage
 from .client import BinanceClient
 from .errors import ToolError
 from .markets import FUTURES, SPOT
+from .series import build_series
 
 log = logging.getLogger("cryptomcp.collector")
 
@@ -65,6 +66,24 @@ SOURCES: tuple[tuple[str, str, str], ...] = (
 #: бюджет веса; здесь ограничение нужно, чтобы не плодить тысячи задач разом.
 SYMBOL_CONCURRENCY = 3
 
+#: Лестница архива свечей: таймфрейм и глубина в сутках.
+#:
+#: 15m и мельче не хранятся сознательно. Год пятнадцатиминуток — 35 040 свечей
+#: на монету, это больше, чем вся остальная лестница вместе (26 175), то есть
+#: архив ровно удваивается. При этом свечи, в отличие от открытого интереса,
+#: биржа отдаёт за годы: докачать 15m за любой период — три минуты и один
+#: проход. Асимметрия и решает: у деривативов «потом» означает «никогда», у
+#: свечей — «когда понадобится».
+LADDER: tuple[tuple[str, int], ...] = (
+    ("1w", 5 * 365),
+    ("1d", 5 * 365),
+    ("4h", 3 * 365),
+    ("1h", 2 * 365),
+)
+
+#: Средний слой: монеты вне ядра архивируются только по старшим ТФ.
+MID_LADDER: tuple[tuple[str, int], ...] = (("1d", 5 * 365), ("4h", 3 * 365))
+
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -85,6 +104,12 @@ def _env_int(name: str, default: int) -> int:
 #: на медиану за неделю, ради которой снимки и пишутся.
 CORE_MIN_VOLUME = _env_float("COLLECTOR_CORE_MIN_VOLUME", 50_000_000)
 CORE_MAX_SYMBOLS = _env_int("COLLECTOR_MAX_SYMBOLS", 60)
+
+#: Порог попадания в архив свечей и в суточный снимок универсума. Ниже ядра:
+#: интересные сжатия чаще встречаются в диапазоне 10–50M, а хранение свечей
+#: по старшим ТФ стоит копейки — 0.9 МБ на монету за пять лет.
+ARCHIVE_MIN_VOLUME = _env_float("COLLECTOR_ARCHIVE_MIN_VOLUME", 10_000_000)
+
 INTERVAL_S = _env_int("COLLECTOR_INTERVAL_S", 3600)
 
 
@@ -214,8 +239,104 @@ async def collect(
     return total, failed
 
 
-async def core_universe(client: BinanceClient) -> list[dict[str, Any]]:
-    """Ядро: перпетуалы к USDT, отсортированные по обороту за сутки."""
+async def load_candles(
+    client: BinanceClient,
+    con: sqlite3.Connection,
+    symbol: str,
+    tf: str,
+    depth_days: int,
+    source: str,
+) -> int:
+    """Догрузить свечи одного символа и таймфрейма.
+
+    Листается ВПЕРЁД по startTime — в отличие от раздела /futures/data/,
+    обычный /klines честно отдаёт окно от заданного момента, страницы стыкуются
+    без разрывов (проверено на обоих рынках). Курсор ставится на последнюю
+    СОХРАНЁННУЮ свечу, а не после неё: биржа доправляет её в первые мгновения
+    после закрытия, и перезаписать дешевле, чем сохранить смещённую.
+    """
+    now_ms = await client.now_ms()
+    saved = storage.last_ohlcv_ts(con, symbol, tf)
+    cursor = saved if saved is not None else now_ms - depth_days * 86_400_000
+    page = client.market.max_limit
+    written = 0
+
+    while True:
+        raw = await client.klines(symbol, tf, limit=page, start_time=cursor)
+        if not raw:
+            break
+        # Незакрытая свеча отсекается тем же кодом, что и в онлайновом пути:
+        # её объём и диапазон неполны, а в архиве это осталось бы навсегда.
+        series = build_series(raw, symbol, tf, now_ms)
+        if len(series):
+            frame = series.df
+            # tolist(), а не itertuples: sqlite3 не умеет привязывать numpy.int64
+            # (float64 проходит как подкласс float, а целые — нет).
+            columns = (
+                "open_time", "open", "high", "low", "close", "volume_base",
+                "quote_volume", "trades", "taker_buy_base", "taker_buy_quote",
+            )
+            rows = list(zip(*(frame[c].tolist() for c in columns), strict=True))
+            written += storage.upsert_ohlcv(con, symbol, tf, source, rows)
+            con.commit()
+        last_open = int(raw[-1][0])
+        if len(raw) < page or last_open <= cursor:
+            break
+        cursor = last_open + 1
+    return written
+
+
+async def collect_candles(
+    clients: dict[str, BinanceClient],
+    con: sqlite3.Connection,
+    plan: list[tuple[str, str, tuple[tuple[str, int], ...]]],
+) -> tuple[int, list[str]]:
+    """Пройти по плану «символ, источник, лестница» и догрузить свечи."""
+    total = 0
+    failed: list[str] = []
+    guard = asyncio.Semaphore(SYMBOL_CONCURRENCY)
+
+    async def one(symbol: str, source: str, ladder: tuple[tuple[str, int], ...]) -> None:
+        nonlocal total
+        async with guard:
+            client = clients[source]
+            for tf, depth in ladder:
+                try:
+                    total += await load_candles(client, con, symbol, tf, depth, source)
+                except ToolError as error:
+                    log.warning("%s %s (%s): %s", symbol, tf, source, error.message)
+                    failed.append(f"{symbol} {tf}")
+
+    await asyncio.gather(*(one(*item) for item in plan))
+    return total, failed
+
+
+async def archive_plan(
+    con: sqlite3.Connection,
+    core: list[str],
+    mid: list[str],
+    spot_symbols: set[str],
+) -> list[tuple[str, str, tuple[tuple[str, int], ...]]]:
+    """Кому какой источник и какая лестница.
+
+    Источник выбирается один раз и потом берётся из уже накопленных данных.
+    Спот предпочтительнее: перпетуал ценово производен от него, а история
+    глубже (у CAKE спот с 2021 года против фьючерса с 2023). Но четверть
+    ликвидных перпетуалов спотовой пары не имеет вовсе — для них источником
+    остаётся фьючерс, и колонка source не даёт их потом перепутать.
+    """
+    plan = []
+    for symbols, ladder in ((core, LADDER), (mid, MID_LADDER)):
+        for symbol in symbols:
+            source = storage.archive_source(con, symbol)
+            if source is None:
+                source = SPOT.name if symbol in spot_symbols else FUTURES.name
+            plan.append((symbol, source, ladder))
+    return plan
+
+
+async def universe_rows(client: BinanceClient) -> list[dict[str, Any]]:
+    """Все торгуемые перпетуалы к USDT, по убыванию оборота за сутки."""
     from .symbols import SymbolRegistry
 
     registry = SymbolRegistry(client)
@@ -231,14 +352,29 @@ async def core_universe(client: BinanceClient) -> list[dict[str, Any]]:
         if row["symbol"] in tradable
     ]
     rows.sort(key=lambda row: -row["quote_volume_24h"])
-    return [row for row in rows if row["quote_volume_24h"] >= CORE_MIN_VOLUME][
-        :CORE_MAX_SYMBOLS
-    ]
+    return rows
+
+
+def core_symbols(rows: list[dict[str, Any]]) -> list[str]:
+    """Ядро: полная лестница свечей плюс деривативы."""
+    return [
+        row["symbol"]
+        for row in rows
+        if row["quote_volume_24h"] >= CORE_MIN_VOLUME
+    ][:CORE_MAX_SYMBOLS]
+
+
+def archived_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Всё, что вообще попадает в архив и в суточный снимок универсума."""
+    return [row for row in rows if row["quote_volume_24h"] >= ARCHIVE_MIN_VOLUME]
 
 
 async def snapshot_universe(
-    client: BinanceClient, spot: BinanceClient, con: sqlite3.Connection
-) -> int:
+    client: BinanceClient,
+    spot: BinanceClient,
+    con: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+) -> tuple[int, set[str]]:
     """Суточный снимок универсума.
 
     Пишется с первого дня, даже пока сканера нет: отбор по устойчивому обороту
@@ -248,7 +384,6 @@ async def snapshot_universe(
     """
     from .symbols import SymbolRegistry
 
-    rows = await core_universe(client)
     spot_symbols = {info.symbol for info in await SymbolRegistry(spot).tradable()}
     known = storage.known_symbols(con, FUTURES.name)
 
@@ -271,23 +406,30 @@ async def snapshot_universe(
     today = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d")
     written = storage.upsert_universe(con, today, rows)
     con.commit()
-    return written
+    return written, spot_symbols
 
 
 async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> None:
-    """Один проход: деривативы, затем снимок универсума."""
+    """Один проход: деривативы, снимок универсума, свечи.
+
+    Порядок не случаен. Деривативы первыми, потому что только они пропадают
+    безвозвратно; свечи последними, потому что их можно догрузить и завтра, и
+    через месяц. Если прогон оборвётся на середине, потеряно будет самое
+    дешёвое.
+    """
     client = BinanceClient(FUTURES)
     spot = BinanceClient(SPOT)
     try:
-        started = time.monotonic()
-        universe = await core_universe(client)
-        symbols = [row["symbol"] for row in universe]
+        rows = await universe_rows(client)
+        core = core_symbols(rows)
+        archived = archived_rows(rows)
         kind = "backfill" if backfill_days else "incremental"
-        log.info("%s: %d символов", kind, len(symbols))
+        log.info("%s: ядро %d, архив %d символов", kind, len(core), len(archived))
 
-        written, failed = await collect(client, con, symbols, days=backfill_days)
+        started = time.monotonic()
+        written, failed = await collect(client, con, core, days=backfill_days)
         storage.record_run(
-            con, kind, symbols=len(symbols), rows=written,
+            con, kind, symbols=len(core), rows=written,
             seconds=time.monotonic() - started,
             error=("не собраны: " + ", ".join(failed)) if failed else None,
         )
@@ -295,13 +437,29 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
         log.info("%s: записано точек %d, не собрано символов %d", kind, written, len(failed))
 
         started = time.monotonic()
-        count = await snapshot_universe(client, spot, con)
+        count, spot_symbols = await snapshot_universe(client, spot, con, archived)
         storage.record_run(
             con, "universe", symbols=count, rows=count,
             seconds=time.monotonic() - started,
         )
         con.commit()
         log.info("universe_daily: %d строк", count)
+
+        started = time.monotonic()
+        core_set = set(core)
+        mid = [row["symbol"] for row in archived if row["symbol"] not in core_set]
+        plan = await archive_plan(con, core, mid, spot_symbols)
+        candles, candle_failures = await collect_candles(
+            {SPOT.name: spot, FUTURES.name: client}, con, plan
+        )
+        storage.record_run(
+            con, "ohlcv", symbols=len(plan), rows=candles,
+            seconds=time.monotonic() - started,
+            error=("не собраны: " + ", ".join(candle_failures[:20]))
+            if candle_failures else None,
+        )
+        con.commit()
+        log.info("свечи: записано %d, не собрано рядов %d", candles, len(candle_failures))
     finally:
         await client.aclose()
         await spot.aclose()
