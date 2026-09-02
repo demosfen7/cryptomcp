@@ -332,11 +332,19 @@ class TestArchivePlan:
 
     @pytest.mark.asyncio
     async def test_mid_layer_gets_shorter_ladder(self, con):
-        from cryptomcp.collector import MID_LADDER, archive_plan
+        """Мид-слой мельче ядра, но 1h ему нужен: по нему идёт скан."""
+        from cryptomcp.collector import LADDER, MID_LADDER, SCAN_TIMEFRAMES, archive_plan
 
         plan = await archive_plan(con, [], ["BTCUSDT"], {"BTCUSDT"})
         assert plan[0][2] == MID_LADDER
-        assert [tf for tf, _ in plan[0][2]] == ["1d", "4h"]
+
+        mid = {tf for tf, _ in MID_LADDER}
+        core = {tf for tf, _ in LADDER}
+        assert mid < core, "мид-слой обязан быть подмножеством ядра"
+        assert "1w" not in mid, "недельные свечи мид-слою не нужны"
+        # Иначе скан по 1h видел бы только ядро — половину универсума,
+        # отобранную по обороту, то есть ровно не ту.
+        assert set(SCAN_TIMEFRAMES) <= mid
 
 
 class TestScanAndOutcomes:
@@ -611,3 +619,41 @@ class TestWatchlist:
             "WHERE symbol = 'C00USDT' AND exited_at IS NULL"
         ).fetchone()["c"]
         assert opened == 1
+
+
+class TestScanWithoutWatch:
+    """1h считается и логируется, но эпизодов не открывает.
+
+    Третий ТФ в списке поднял бы потолок с 80 эпизодов до 120 (топ-40 на
+    выход × число ТФ), а список и без того длинный. Гипотеза о 1h проверяется
+    журналом и исходами, а не тем, что он занимает место в списке.
+    """
+
+    NOW = 1_756_000_000_000
+
+    def test_watch_narrower_than_scan(self):
+        from cryptomcp.collector import SCAN_TIMEFRAMES, WATCH_TIMEFRAMES
+
+        assert set(WATCH_TIMEFRAMES) < set(SCAN_TIMEFRAMES)
+        assert "1h" in SCAN_TIMEFRAMES
+        assert "1h" not in WATCH_TIMEFRAMES
+
+    def test_hourly_scan_opens_no_episodes(self, con):
+        from cryptomcp import SQUEEZE_FORMULA_VERSION
+        from cryptomcp.collector import update_watchlist
+
+        for i in range(30):
+            con.execute(
+                "INSERT OR REPLACE INTO scan_log (ts_ms, symbol, source, tf, "
+                "formula_version, squeeze_index, price, range_low, range_high, "
+                "closed_through_ms) VALUES (?, ?, 'futures', '1h', ?, ?, "
+                "100.0, 90.0, 110.0, ?)",
+                (self.NOW, f"H{i:02d}USDT", SQUEEZE_FORMULA_VERSION,
+                 0.90 - i * 0.01, self.NOW),
+            )
+        con.commit()
+
+        changes = update_watchlist(con, self.NOW)
+
+        assert changes["entered"] == []
+        assert storage.open_episodes(con) == []

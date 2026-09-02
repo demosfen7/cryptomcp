@@ -68,6 +68,34 @@ def required_candles(interval: str) -> int:
     return max(PERCENTILE_WINDOW + 1, by_span + 1)
 
 
+def percentile_base(values: np.ndarray, interval: str) -> tuple[np.ndarray, float]:
+    """База для перцентиля и её КАЛЕНДАРНЫЙ охват.
+
+    Обрезка по времени, а не по числу свечей. Константа в 360 значений
+    означает у разных таймфреймов разное: на дневке это 360 суток, на
+    четырёхчасовке 60, а на часовке — пятнадцать. Требование §4.2 «не менее
+    60 суток охвата» на часовке при этом проходило, потому что проверялось по
+    охвату всего загруженного ряда (1691 свеча, 70 суток), а не обрезанной
+    базы. Правило, которое должно ловить короткие базы, на 1h не срабатывало,
+    и в выдаче стоял охват 70 суток вместо честных 15.
+
+    Длина берётся из required_candles — того же места, откуда берётся длина
+    самого ряда. Иначе ряд грузится под одно окно, а перцентиль считается по
+    другому: данные уже лежат в памяти и просто выбрасываются.
+
+    Охват считается по числу удержанных наблюдений: ряд регулярный, свеча
+    закрывается строго по расписанию, и произведение на шаг таймфрейма — это
+    и есть календарный охват базы.
+    """
+    from .series import interval_ms
+
+    clean = values[~np.isnan(values)]
+    keep = required_candles(interval) - 1
+    history = clean[-(keep + 1):-1]
+    span_days = len(history) * interval_ms(interval) / 86_400_000
+    return history, span_days
+
+
 @dataclass
 class TimeframeView:
     """Полная картина по одному таймфрейму."""
@@ -317,26 +345,26 @@ def analyse_timeframe(
     atr_pct = atr_value / price * 100.0 if price else float("nan")
 
     bbw_values = bollinger_width(close, 20, 2.0)
-    bbw_history = bbw_values[~np.isnan(bbw_values)][-(PERCENTILE_WINDOW + 1):-1]
+    bbw_history, bbw_span = percentile_base(bbw_values, series.interval)
     bbw_metric = with_percentile(
-        "BBW(20,2)", float(bbw_values[-1]), bbw_history, series.span_days,
+        "BBW(20,2)", float(bbw_values[-1]), bbw_history, bbw_span,
         threshold=config.bbw_percentile, threshold_side="below",
     )
 
     atr_pct_series = np.divide(
         atr_values, close, out=np.full_like(atr_values, np.nan), where=close > 0
     ) * 100.0
-    atr_history = atr_pct_series[~np.isnan(atr_pct_series)][-(PERCENTILE_WINDOW + 1):-1]
+    atr_history, atr_span = percentile_base(atr_pct_series, series.interval)
     atr_metric = with_percentile(
-        "ATR%/price", atr_pct, atr_history, series.span_days,
+        "ATR%/price", atr_pct, atr_history, atr_span,
         unit="%", threshold=config.bbw_percentile, threshold_side="below",
     )
 
     width_series = donchian_width(high, low, 20, close)
-    width_history = width_series[~np.isnan(width_series)][-(PERCENTILE_WINDOW + 1):-1]
+    width_history, width_span = percentile_base(width_series, series.interval)
     range_metric = with_percentile(
         "диапазон(20)", float(width_series[-1]) * 100, width_history * 100,
-        series.span_days, unit="%",
+        width_span, unit="%",
         threshold=config.range_percentile, threshold_side="below",
     )
     # Порог — не число из конфига, а та ширина, которая у ЭТОЙ монеты

@@ -215,3 +215,59 @@ class TestConfig:
         config = Config()
         assert config.bbw_percentile == 20.0
         assert config.atr_decline_bars == 10
+
+
+class TestPercentileBase:
+    """База перцентиля обрезается по времени, а не по числу свечей.
+
+    Константа в 360 значений означает у разных ТФ разное: на дневке это 360
+    суток, на часовке — пятнадцать. Требование §4.2 о 60 сутках охвата на 1h
+    при этом проходило, потому что проверялось по охвату всего загруженного
+    ряда, а не обрезанной базы.
+    """
+
+    def values(self, count: int):
+        import numpy as np
+
+        return np.arange(float(count))
+
+    def test_daily_base_unchanged(self):
+        """На 1d/4h/1w правка ничего не двигает: там и было 360 значений."""
+        from cryptomcp.analysis import percentile_base
+
+        history, span = percentile_base(self.values(700), "1d")
+        assert len(history) == 360
+        assert span == 360.0
+
+    def test_four_hour_base_is_sixty_days(self):
+        from cryptomcp.analysis import percentile_base
+
+        history, span = percentile_base(self.values(700), "4h")
+        assert len(history) == 360
+        assert span == 60.0
+
+    def test_hourly_base_grows_to_sixty_days(self):
+        """Было 360 значений = 15 суток, стало 1440 = 60 суток."""
+        from cryptomcp.analysis import percentile_base
+
+        history, span = percentile_base(self.values(2000), "1h")
+        assert len(history) == 1440
+        assert span == 60.0
+
+    def test_short_series_reports_its_real_span(self):
+        """Свежий листинг обязан получить честный отказ, а не охват всего ряда."""
+        from cryptomcp.analysis import percentile_base
+
+        history, span = percentile_base(self.values(200), "1h")
+        assert len(history) == 199
+        assert span < 60.0
+
+    def test_nan_warmup_does_not_count_as_history(self):
+        import numpy as np
+
+        from cryptomcp.analysis import percentile_base
+
+        values = np.concatenate([np.full(250, np.nan), np.arange(500.0)])
+        history, span = percentile_base(values, "4h")
+        assert len(history) == 360
+        assert not np.isnan(history).any()
