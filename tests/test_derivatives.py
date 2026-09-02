@@ -82,6 +82,21 @@ class TestQuadrantClassification:
         assert classify_price_oi(-0.008, 0.034) == "набор позиций без движения цены"
         assert classify_price_oi(0.0001, 0.05) == "набор позиций без движения цены"
 
+    def test_oi_falls_while_price_stands_is_unwinding(self):
+        """Знак изменения OI обязан различаться.
+
+        Регрессия по боевой выдаче SUIUSDT: OI −1.56% при цене +0.53%
+        подписывалось как «набор позиций», хотя падение открытого интереса —
+        это закрытие позиций, ровно обратное по смыслу.
+        """
+        assert classify_price_oi(0.0053, -0.0156) == "разгрузка позиций без движения цены"
+        assert classify_price_oi(-0.0001, -0.05) == "разгрузка позиций без движения цены"
+
+    def test_accumulation_and_unwinding_are_distinct(self):
+        rising = classify_price_oi(0.001, 0.05)
+        falling = classify_price_oi(0.001, -0.05)
+        assert rising != falling
+
     def test_price_moves_without_oi_is_rotation(self):
         assert classify_price_oi(0.05, 0.0001) == "движение без притока (ротация)"
 
