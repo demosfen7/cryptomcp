@@ -26,18 +26,18 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "divergence": 0.10,
 }
 
-#: Порог ширины диапазона по таймфреймам, доля от цены.
-#: ТЗ §4.2 даёт «менее 6–8%, настраивается по таймфреймам»; одно значение для
-#: недели и для минутки заведомо не подходит.
-DEFAULT_RANGE_THRESHOLDS: dict[str, float] = {
-    "1w": 0.15,
-    "1d": 0.10,
-    "4h": 0.06,
-    "1h": 0.04,
-    "15m": 0.025,
-    "5m": 0.015,
-    "1m": 0.008,
-}
+#: Перцентиль ширины диапазона, ниже которого он считается узким.
+#:
+#: Раньше здесь стояли абсолютные пороги из ТЗ §4.2 («менее 6–8%») по
+#: таймфреймам. Измерение 02.09.2026 показало, что они не работают: медианный
+#: дневной диапазон рынка 65% при пороге 10%, и группа «диапазон» с весом 0.25
+#: давала ровно ноль всем ста двадцати монетам, кроме золотых токенов. Четверть
+#: формулы работала как премия за то, что инструмент не криптовалюта.
+#:
+#: Абсолютный порог и не мог сработать: единый для BTC и для свежего листинга
+#: он бессмыслен так же, как единый множитель объёма. Теперь узость меряется
+#: перцентилем по собственной истории монеты — тем же способом, что BBW.
+DEFAULT_RANGE_PERCENTILE = 20.0
 
 #: Перцентиль BBW, ниже которого признак сжатия считается сработавшим (ТЗ §4.2).
 DEFAULT_BBW_PERCENTILE = 20.0
@@ -50,9 +50,7 @@ DEFAULT_ATR_DECLINE_BARS = 10
 class Config:
     timeframes: tuple[str, ...] = DEFAULT_TIMEFRAMES
     weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
-    range_thresholds: dict[str, float] = field(
-        default_factory=lambda: dict(DEFAULT_RANGE_THRESHOLDS)
-    )
+    range_percentile: float = DEFAULT_RANGE_PERCENTILE
     bbw_percentile: float = DEFAULT_BBW_PERCENTILE
     atr_decline_bars: int = DEFAULT_ATR_DECLINE_BARS
     #: Порог значимости изменения OI для классификации (PLAN §4.12).
@@ -63,9 +61,6 @@ class Config:
     divergence_window: int = 40
     #: Куда писать журнал расчётов (PLAN §4.11).
     journal_path: str = "journal/squeeze.jsonl"
-
-    def range_threshold(self, interval: str) -> float:
-        return self.range_thresholds.get(interval, DEFAULT_RANGE_THRESHOLDS["4h"])
 
     @classmethod
     def load(cls, path: str | None = None) -> Config:
@@ -82,8 +77,8 @@ class Config:
         # Веса и пороги сливаются, а не заменяются: частичное переопределение
         # не должно молча обнулять остальные ключи.
         config.weights.update(data.get("weights", {}))
-        config.range_thresholds.update(data.get("range_thresholds", {}))
-        for key in ("bbw_percentile", "atr_decline_bars", "oi_change_threshold",
+        for key in ("bbw_percentile", "range_percentile", "atr_decline_bars",
+                    "oi_change_threshold",
                     "volume_profile_window", "divergence_window", "journal_path"):
             if key in data:
                 setattr(config, key, data[key])

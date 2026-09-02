@@ -255,7 +255,7 @@ async def get_squeeze_metrics(
         view = views[interval]
         return (
             f"{info.symbol}{mkt.suffix} ({mkt.label})\n\n"
-            + render_squeeze_metrics(view, config.range_threshold(interval))
+            + render_squeeze_metrics(view)
         )
     except ToolError as error:
         return _fail(error)
@@ -428,7 +428,8 @@ async def scan_pairs(
         lines += [text for _, text in rows]
         lines += [
             "",
-            "узк — свечей подряд с шириной диапазона(20) ниже порога ТФ",
+            "узк — свечей подряд с шириной диапазона(20) ниже 20-го перцентиля "
+            "своей истории",
             "объём — к сезонной базе, но история здесь мельче снапшотной "
             "(пагинация отключена ради веса), поэтому число приблизительное",
         ]

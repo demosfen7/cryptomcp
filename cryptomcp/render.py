@@ -201,7 +201,10 @@ def render_snapshot(
         lines.append("пропуски в истории: " + " · ".join(gaps) + " — метрики на них смещены")
     lines.append("объём — к уровню последних свечей с поправкой на слот суток; ~ слабая база")
     lines.append("EMA — цена против EMA50/EMA200; структ — два последних swing-экстремума")
-    lines.append("узк N — свечей подряд с шириной диапазона(20) ниже порога ТФ")
+    lines.append(
+        "узк N — свечей подряд с шириной диапазона(20) ниже 20-го перцентиля "
+        "СВОЕЙ истории"
+    )
 
     anchor = views.get("4h") or next(iter(views.values()))
     lines.append("")
@@ -209,7 +212,12 @@ def render_snapshot(
         f"диапазон {anchor.interval} (20 св.): {format_price(anchor.range_low, precision)} – "
         f"{format_price(anchor.range_high, precision)} · "
         f"{anchor.range_width * 100:.2f}% = {anchor.range_width_atr:.1f} ATR · "
-        f"узким (<{anchor.range_threshold * 100:.1f}%) был {anchor.narrow_bars} св. подряд"
+        + (
+            f"{anchor.range_metric.pct_rank:.0f}-й перцентиль своей истории, "
+            f"узким был {anchor.narrow_bars} св. подряд"
+            if anchor.range_metric.has_context
+            else (anchor.range_metric.base_note or "перцентиль n/a")
+        )
     )
     lines.extend(render_levels(anchor.levels, live_price, anchor.atr_value, precision))
     if anchor.pivots_weekly:
@@ -319,7 +327,7 @@ def render_derivatives(
     return "\n".join(lines)
 
 
-def render_squeeze_metrics(view: TimeframeView, threshold_pct: float) -> str:
+def render_squeeze_metrics(view: TimeframeView) -> str:
     """Уровень L2: пять групп признаков ТЗ §4.2 с базой сравнения."""
     volume = view.volume
     lines = [
@@ -342,11 +350,15 @@ def render_squeeze_metrics(view: TimeframeView, threshold_pct: float) -> str:
         f"   taker buy доля   {volume.taker_buy_mean:.2f} средняя за 30 (нейтраль 0.50)",
         "",
         "3. Диапазон",
-        f"   ширина(20)       {view.range_width * 100:.2f}% = {view.range_width_atr:.1f} ATR"
-        f"  → порог {threshold_pct * 100:.1f}%"
-        + ("  ⚑" if view.range_width < threshold_pct else ""),
+        f"   ширина(20)       {view.range_width * 100:.2f}% = "
+        f"{view.range_width_atr:.1f} ATR",
+        f"   перцентиль       {render_metric(view.range_metric, precision=2)}",
         f"   ниже порога      {view.narrow_bars} свечей подряд"
-        + ("" if view.narrow_bars else "  (диапазон шире порога — длительность сжатия нулевая)"),
+        + (
+            f"  (порог {view.range_threshold * 100:.1f}% — 20-й перцентиль "
+            f"своей истории)"
+            if view.range_threshold == view.range_threshold else ""
+        ),
         "",
     ]
 

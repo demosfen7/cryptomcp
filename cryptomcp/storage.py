@@ -27,6 +27,8 @@ import sqlite3
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+from . import SQUEEZE_FORMULA_VERSION
+
 #: Где лежит база. В контейнере — том, переживающий пересборку образа.
 DEFAULT_PATH = os.environ.get("CRYPTOMCP_DB", "data/market.sqlite")
 
@@ -112,13 +114,16 @@ CREATE TABLE IF NOT EXISTS scan_log (
     closed_through_ms INTEGER
 );
 
--- Одна строка на закрытую свечу, а не на прогон. Сканер ходит раз в час, а
--- четырёхчасовая свеча закрывается раз в четыре: без этого ограничения одно и
--- то же наблюдение попадало бы в статистику четырежды и перевешивало бы
--- остальные. Ограничение объявлено в схеме, а не в коде, чтобы его нельзя было
--- обойти по невнимательности.
-CREATE UNIQUE INDEX IF NOT EXISTS scan_log_candle
-    ON scan_log (symbol, tf, closed_through_ms);
+-- Одна строка на закрытую свечу И версию формулы. Сканер ходит раз в час, а
+-- четырёхчасовая свеча закрывается раз в четыре: без ограничения одно и то же
+-- наблюдение попадало бы в статистику четырежды и перевешивало бы остальные.
+-- Версия в ключе нужна для перехода между формулами: иначе после её смены
+-- текущая свеча осталась бы посчитанной по старой, и несколько часов ранги
+-- считались бы по смеси двух версий. Ограничение объявлено в схеме, а не в
+-- коде, чтобы его нельзя было обойти по невнимательности.
+DROP INDEX IF EXISTS scan_log_candle;
+CREATE UNIQUE INDEX IF NOT EXISTS scan_log_candle_version
+    ON scan_log (symbol, tf, closed_through_ms, formula_version);
 CREATE INDEX IF NOT EXISTS scan_log_symbol_tf_ts ON scan_log (symbol, tf, ts_ms);
 CREATE INDEX IF NOT EXISTS scan_log_ts ON scan_log (ts_ms);
 
@@ -410,15 +415,23 @@ def record_outcome(
     )
 
 
-def latest_scan(con: sqlite3.Connection, tf: str) -> list[dict[str, Any]]:
-    """Последняя запись скана по каждому символу этого таймфрейма."""
+def latest_scan(
+    con: sqlite3.Connection, tf: str, formula_version: str | None = None
+) -> list[dict[str, Any]]:
+    """Последняя запись скана по каждому символу этого таймфрейма.
+
+    Версия формулы обязательна к учёту: индексы, посчитанные по разным
+    формулам, между собой не сравниваются, а ранг — это именно сравнение.
+    """
+    version = formula_version or SQUEEZE_FORMULA_VERSION
     rows = con.execute(
         "SELECT s.* FROM scan_log s JOIN ("
-        "  SELECT symbol, MAX(ts_ms) AS ts FROM scan_log WHERE tf = ? GROUP BY symbol"
+        "  SELECT symbol, MAX(ts_ms) AS ts FROM scan_log "
+        "  WHERE tf = ? AND formula_version = ? GROUP BY symbol"
         ") last ON last.symbol = s.symbol AND last.ts = s.ts_ms "
-        "WHERE s.tf = ? AND s.squeeze_index IS NOT NULL "
+        "WHERE s.tf = ? AND s.formula_version = ? AND s.squeeze_index IS NOT NULL "
         "ORDER BY s.squeeze_index DESC",
-        (tf, tf),
+        (tf, version, tf, version),
     ).fetchall()
     return [dict(row) for row in rows]
 

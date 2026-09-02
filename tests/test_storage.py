@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from cryptomcp import storage
@@ -347,3 +349,37 @@ class TestArchiveQueries:
 
     def test_empty_window_is_none(self, con):
         assert storage.price_extremes(con, "CAKEUSDT", "1h", 0, 100) is None
+
+
+class TestFormulaVersionIsolation:
+    """Индексы разных формул между собой не сравниваются, а ранг — сравнение."""
+
+    def row(self, con, symbol, version, index, ts=1000):
+        con.execute(
+            "INSERT INTO scan_log (ts_ms, symbol, source, tf, formula_version, "
+            "squeeze_index, closed_through_ms) VALUES (?, ?, 'spot', '4h', ?, ?, ?)",
+            (ts, symbol, version, index, ts),
+        )
+        con.commit()
+
+    def test_ranking_sees_only_the_current_formula(self, con):
+        self.row(con, "СТАРАЯUSDT", "v1", 0.99)
+        self.row(con, "НОВАЯUSDT", "v2", 0.10)
+        symbols = [r["symbol"] for r in storage.latest_scan(con, "4h", "v2")]
+        assert symbols == ["НОВАЯUSDT"]
+
+    def test_same_candle_recalculated_under_new_formula(self, con):
+        """После смены формулы текущая свеча должна пересчитаться сразу."""
+        self.row(con, "CAKEUSDT", "v1", 0.30)
+        self.row(con, "CAKEUSDT", "v2", 0.55)
+        assert con.execute("SELECT COUNT(*) c FROM scan_log").fetchone()["c"] == 2
+        assert storage.latest_scan(con, "4h", "v2")[0]["squeeze_index"] == 0.55
+
+    def test_duplicate_within_one_version_still_blocked(self, con):
+        self.row(con, "CAKEUSDT", "v2", 0.30)
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute(
+                "INSERT INTO scan_log (ts_ms, symbol, source, tf, formula_version, "
+                "squeeze_index, closed_through_ms) "
+                "VALUES (1000, 'CAKEUSDT', 'spot', '4h', 'v2', 0.9, 1000)"
+            )

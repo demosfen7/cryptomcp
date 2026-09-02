@@ -65,7 +65,9 @@ def view(**overrides) -> TimeframeView:
         atr_metric=Metric("ATR", 2.0, pct_rank=10.0, n_obs=360, span_days=90),
         atr_declining_bars=10,
         range_low=95.0, range_high=105.0, range_width=0.10, range_width_atr=5.0,
-        range_threshold=0.06, narrow_bars=0,
+        range_threshold=0.06,
+        range_metric=Metric("диапазон(20)", 10.0, unit="%", pct_rank=15.0,
+                            n_obs=360, span_days=90), narrow_bars=0,
         volume=VolumeContext(0.7, "медиана слота", 250, 0.6, 3, 0.55),
         profile=VolumeProfile(100.0, 95.0, 105.0, 1e6, 60),
         divergence=None,
@@ -132,13 +134,25 @@ class TestClosedThrough:
 class TestNarrowBarsWording:
     """Ноль у широкого диапазона — верное значение, а не сломанный счётчик."""
 
-    def test_range_line_names_the_threshold(self):
+    def test_range_line_names_the_percentile(self):
+        """Ширина сама по себе ничего не значит — значим её перцентиль."""
         text = render_snapshot(
             INFO, {"4h": view()},
             live_price=100.5, change_24h=1.0, quote_volume_24h=1e9, now_ms=4 * H4,
         )
-        assert "узким (<6.0%) был 0 св. подряд" in text
+        assert "15-й перцентиль своей истории, узким был 0 св. подряд" in text
         assert "держится 0 св." not in text
+
+    def test_range_line_explains_a_missing_base(self):
+        from cryptomcp.indicators import Metric
+
+        weak = Metric("диапазон(20)", 10.0, unit="%", pct_rank=None, n_obs=5,
+                      span_days=1, base_note="n/a (наблюдений 5, нужно 60)")
+        text = render_snapshot(
+            INFO, {"4h": view(range_metric=weak)},
+            live_price=100.5, change_24h=1.0, quote_volume_24h=1e9, now_ms=4 * H4,
+        )
+        assert "наблюдений 5" in text
 
     def test_squeeze_column_separates_two_criteria(self):
         text = render_snapshot(

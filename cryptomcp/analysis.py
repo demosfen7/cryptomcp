@@ -70,8 +70,10 @@ class TimeframeView:
     range_high: float
     range_width: float
     range_width_atr: float
-    #: Порог ширины диапазона для этого ТФ, доля от цены.
+    #: Ширина, соответствующая заданному перцентилю истории ЭТОЙ монеты.
     range_threshold: float
+    #: Ширина диапазона с перцентилем по собственной истории.
+    range_metric: Metric
     #: Сколько последних свечей ПОДРЯД ширина диапазона(20) держалась ниже
     #: порога. Это длительность СЖАТИЯ, а не возраст текущего диапазона:
     #: у широкого диапазона здесь ноль, и это верное значение, а не сбой.
@@ -106,7 +108,11 @@ class TimeframeView:
                 "high": self.range_high,
                 "width_pct": round(self.range_width * 100, 2),
                 "width_atr": round(self.range_width_atr, 2),
-                "threshold_pct": round(self.range_threshold * 100, 2),
+                "threshold_pct": (
+                    round(self.range_threshold * 100, 2)
+                    if self.range_threshold == self.range_threshold else None
+                ),
+                "width_percentile": self.range_metric.to_dict(),
                 "bars_below_threshold": self.narrow_bars,
             },
             "volume": self.volume.to_dict(),
@@ -202,11 +208,20 @@ def score_volatility(view: TimeframeView, config: Config) -> float | None:
 
 
 def score_range(view: TimeframeView, config: Config) -> float | None:
-    """Группа 3. Узкий диапазон и его длительность."""
-    threshold = config.range_threshold(view.interval)
-    if np.isnan(view.range_width) or threshold <= 0:
+    """Группа 3. Узкий диапазон и его длительность.
+
+    Узость меряется перцентилем по собственной истории монеты, а не абсолютным
+    порогом: у BULLA дневной диапазон 40% — это её обычное состояние, у PAXG
+    8.6% — необычно широко. Один и тот же процент означает у них
+    противоположное, и группа с абсолютным порогом давала ноль всем, кроме
+    золота.
+
+    Группа исключается из индекса, если базы для перцентиля не хватило, — как
+    и все остальные (см. compute_squeeze_index).
+    """
+    if not view.range_metric.has_context:
         return None
-    tightness = _clamp((threshold - view.range_width) / threshold)
+    tightness = 1.0 - view.range_metric.pct_rank / 100.0
     duration = _clamp(view.narrow_bars / 20.0)
     return _clamp(0.6 * tightness + 0.4 * duration)
 
@@ -299,7 +314,18 @@ def analyse_timeframe(
     )
 
     width_series = donchian_width(high, low, 20, close)
-    threshold = config.range_threshold(series.interval)
+    width_history = width_series[~np.isnan(width_series)][-(PERCENTILE_WINDOW + 1):-1]
+    range_metric = with_percentile(
+        "диапазон(20)", float(width_series[-1]) * 100, width_history * 100,
+        series.span_days, unit="%",
+        threshold=config.range_percentile, threshold_side="below",
+    )
+    # Порог — не число из конфига, а та ширина, которая у ЭТОЙ монеты
+    # соответствует заданному перцентилю её собственной истории.
+    threshold = (
+        float(np.percentile(width_history, config.range_percentile))
+        if len(width_history) else float("nan")
+    )
     window_high = float(high[-20:].max()) if len(high) >= 20 else float("nan")
     window_low = float(low[-20:].min()) if len(low) >= 20 else float("nan")
     range_width = float(width_series[-1])
@@ -329,7 +355,11 @@ def analyse_timeframe(
         range_width=range_width,
         range_width_atr=(range_width * price / atr_value) if atr_value else float("nan"),
         range_threshold=threshold,
-        narrow_bars=consecutive_below(width_series, threshold),
+        range_metric=range_metric,
+        narrow_bars=(
+            consecutive_below(width_series, threshold)
+            if threshold == threshold else 0
+        ),
         volume=volume_context(series, atr_values),
         profile=profile,
         divergence=rsi_divergence(series, rsi_values, config.divergence_window),

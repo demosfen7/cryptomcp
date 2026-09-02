@@ -30,6 +30,8 @@ def view(**overrides) -> TimeframeView:
         atr_declining_bars=10,
         range_low=95.0, range_high=105.0, range_width=0.03, range_width_atr=1.5,
         range_threshold=0.06,
+        range_metric=Metric("диапазон(20)", 10.0, unit="%", pct_rank=15.0,
+                            n_obs=360, span_days=90),
         narrow_bars=20,
         volume=VolumeContext(0.7, "медиана слота", 250, 0.6, 3, 0.55),
         profile=VolumeProfile(100.0, 95.0, 105.0, 1e6, 60),
@@ -98,12 +100,33 @@ class TestComponentScores:
         v = view(bbw=Metric("BBW", 0.04, pct_rank=None, n_obs=5, span_days=1))
         assert score_volatility(v, Config()) is None
 
-    def test_range_score_falls_as_width_grows(self):
+    def test_range_score_follows_own_percentile(self):
+        """Узость меряется по истории самой монеты, а не абсолютным числом."""
         config = Config()
-        narrow = score_range(view(range_width=0.01), config)
-        wide = score_range(view(range_width=0.20), config)
-        assert narrow > wide
-        assert wide == pytest.approx(0.4, abs=0.01)  # остаётся вклад длительности
+        metric = lambda rank: Metric(  # noqa: E731
+            "диапазон(20)", 10.0, unit="%", pct_rank=rank, n_obs=360, span_days=90
+        )
+        tight = score_range(view(range_metric=metric(5.0)), config)
+        wide = score_range(view(range_metric=metric(95.0)), config)
+        assert tight > wide
+        assert wide == pytest.approx(0.43, abs=0.01)  # остаётся вклад длительности
+
+    def test_same_width_scores_differently_for_different_coins(self):
+        """40% дневного диапазона у BULLA обычны, у PAXG были бы аномалией."""
+        config = Config()
+        usual = score_range(view(range_width=0.40, range_metric=Metric(
+            "диапазон(20)", 40.0, unit="%", pct_rank=60.0, n_obs=360, span_days=90
+        )), config)
+        unusual = score_range(view(range_width=0.40, range_metric=Metric(
+            "диапазон(20)", 40.0, unit="%", pct_rank=5.0, n_obs=360, span_days=90
+        )), config)
+        assert unusual > usual
+
+    def test_range_excluded_without_percentile_base(self):
+        config = Config()
+        weak = Metric("диапазон(20)", 10.0, unit="%", pct_rank=None, n_obs=5,
+                      span_days=1)
+        assert score_range(view(range_metric=weak), config) is None
 
     def test_value_area_zero_when_price_outside(self):
         v = view(price=200.0, profile=VolumeProfile(100.0, 95.0, 105.0, 1e6, 60))
@@ -161,6 +184,7 @@ class TestSqueezeIndex:
         v = view(
             bbw=Metric("BBW", 0.04, pct_rank=None),
             range_width=float("nan"),
+            range_metric=Metric("диапазон(20)", float("nan"), pct_rank=None),
             volume=VolumeContext(float("nan"), "нет", 0, float("nan"), 0, float("nan")),
             profile=None,
             divergence=None,
@@ -180,16 +204,14 @@ class TestSqueezeIndex:
 
 
 class TestConfig:
-    def test_range_threshold_per_timeframe(self):
+    def test_range_is_measured_by_percentile_not_by_absolute_width(self):
+        """Абсолютных порогов ширины в конфиге больше нет — они не работали."""
         config = Config()
-        assert config.range_threshold("1w") > config.range_threshold("4h")
-        assert config.range_threshold("4h") > config.range_threshold("15m")
-
-    def test_unknown_timeframe_falls_back(self):
-        assert Config().range_threshold("3h") == Config().range_threshold("4h")
+        assert config.range_percentile == 20.0
+        assert not hasattr(config, "range_thresholds")
+        assert not hasattr(config, "range_threshold")
 
     def test_defaults_match_tz(self):
         config = Config()
-        assert config.range_threshold("4h") == pytest.approx(0.06)  # ТЗ §4.2
         assert config.bbw_percentile == 20.0
         assert config.atr_decline_bars == 10
