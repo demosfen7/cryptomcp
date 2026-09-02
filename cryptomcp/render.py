@@ -677,3 +677,81 @@ def render_absorption(data: Absorption | None, *, skipped: str | None = None) ->
         "   считается на младшем ряду: дневное разрешение стирает поглощение "
         "внутри свечи",
     ])
+
+
+def render_screen(
+    tf: str,
+    rows: Sequence[dict[str, Any]],
+    *,
+    version: str,
+    sort_by: str,
+    filtered: int,
+    logged: int,
+    matched: int,
+) -> str:
+    """Отбор по журналу: строка на монету, с признаками накопления.
+
+    Печатается «закрыта по», потому что строки берутся из журнала, а он
+    пишется на закрытие свечи: без штампа выдача выглядела бы живой, а
+    отставать может почти на целый таймфрейм.
+    """
+    head = [
+        f"{tf} · формула {version} · сортировка: {sort_by}",
+        f"фильтр универсума пропустил {filtered} монет · "
+        f"в журнале по {tf}: {logged} · совпало: {matched} · показано: {len(rows)}",
+    ]
+    if not rows:
+        # Причины у пустой выдачи разные, и подсказка обязана их различать:
+        # «журнала нет» лечится не тем же, чем «фильтры отсеяли всех».
+        reason = (
+            f"по таймфрейму {tf} записей скана нет вовсе. Сканер ведёт журнал "
+            "только по 4h, 1d и 1h и только по монетам архива; для остальных "
+            "передайте symbols явно — они будут посчитаны по бирже."
+            if logged == 0 else
+            "записи в журнале есть, но ни одна не прошла фильтры. Ослабьте "
+            "min_narrow_bars, границы оборота или max_abs_change_24h."
+        )
+        return "\n".join(head + ["", reason])
+
+    head.append(
+        f"{'символ':<14}{'индекс':>7}{'BBW':>6}{'диап':>8}{'узк':>5}{'объём':>8}"
+        f"{'погл':>6}{'tkМакс':>8}{'лид':>6}{'фанд%':>9}  поток по OI за сутки"
+    )
+    lines = list(head)
+    for row in rows:
+        index = row.get("squeeze_index")
+        bbw = row.get("bbw_pct_rank")
+        width = row.get("range_width_pct")
+        volume = row.get("volume_ratio")
+        lines.append(
+            f"{row['symbol']:<14}"
+            f"{index if index is not None else 0:>7.2f}"
+            f"{f'{bbw:.0f}' if bbw is not None else 'n/a':>6}"
+            f"{f'{width:.2f}%' if width is not None else 'n/a':>8}"
+            f"{_cell(row.get('narrow_bars')):>5}"
+            f"{f'{volume:.2f}x' if volume is not None else 'n/a':>8}"
+            f"{_cell(row.get('absorption_bars')):>6}"
+            f"{_cell(row.get('taker_max'), '.2f'):>8}"
+            f"{_cell(row.get('volume_lead'), '+d'):>6}"
+            f"{_cell(row.get('funding_annual'), '+.0f'):>9}"
+            f"  {row.get('oi_reading') or '—'}"
+        )
+
+    stamps = {row.get("closed_through_ms") for row in rows if row.get("closed_through_ms")}
+    if stamps:
+        lines.append("")
+        lines.append("закрыты по (UTC): " + " · ".join(
+            sorted({utc(int(ms) + 1)[:16] for ms in stamps})
+        ))
+    lines += [
+        "погл — бары набора на младшем ряду · tkМакс — максимум доли "
+        "тейкер-покупок · лид — на сколько свечей объём опередил цену",
+        "выдача из журнала сканера, а не пересчёт: строка пишется на закрытие "
+        "свечи, поэтому она может отставать почти на таймфрейм",
+    ]
+    if sort_by == "accumulation":
+        lines.append(
+            "сортировка «накопление» — порядок по составляющим (бары набора, "
+            "затем тейкеры, затем лид), а не по сводному числу: сводного пока нет"
+        )
+    return "\n".join(lines)

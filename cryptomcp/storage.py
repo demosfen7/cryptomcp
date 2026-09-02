@@ -535,6 +535,67 @@ def scan_history(
     return [dict(row) for row in rows]
 
 
+#: Чем можно сортировать выдачу отбора. Порядок «накопление» — это порядок по
+#: составляющим, а не по сводному числу: сводного пока не существует, и делать
+#: вид, что оно есть, значило бы выдать произвольную свёртку за измеренную.
+SCAN_SORTS = ("squeeze", "duration", "accumulation")
+
+
+def listing_dates(con: sqlite3.Connection, market: str = "futures") -> dict[str, int]:
+    """Дата первой свечи по символам — возраст листинга без запроса к бирже."""
+    rows = con.execute(
+        "SELECT symbol, first_kline_ms FROM symbols "
+        "WHERE market = ? AND first_kline_ms IS NOT NULL",
+        (market,),
+    ).fetchall()
+    return {row["symbol"]: int(row["first_kline_ms"]) for row in rows}
+
+
+def screen_scan(
+    con: sqlite3.Connection,
+    tf: str,
+    *,
+    allowed: set[str] | None = None,
+    exclude: set[str] | None = None,
+    min_narrow_bars: int | None = None,
+    sort_by: str = "squeeze",
+    formula_version: str | None = None,
+) -> list[dict[str, Any]]:
+    """Отбор по журналу сканирования, а не пересчётом.
+
+    Сканер уже прошёл весь универсум и посчитал индекс с разложением и
+    признаками накопления. Пересчитывать это на запрос значило бы, во-первых,
+    повторить работу, во-вторых — заплатить запросом к бирже за свежий хвост по
+    КАЖДОМУ символу: чтение архива идёт с догрузкой хвоста (§4.15), и на сотне
+    монет это сотня запросов. Отбор из журнала не стоит ни одного.
+
+    Цена решения — отставание до одной свечи таймфрейма: строка пишется на
+    закрытие. Поэтому в выдаче печатается, по какую свечу она закрыта.
+
+    Возвращается ВЕСЬ отобранный список, а не первые N: вызывающему нужно
+    знать, сколько монет прошло фильтр, иначе «показано 5» неотличимо от
+    «пятеро и есть весь рынок».
+    """
+    rows = latest_scan(con, tf, formula_version)
+    if allowed is not None:
+        rows = [row for row in rows if row["symbol"] in allowed]
+    if exclude:
+        rows = [row for row in rows if row["symbol"] not in exclude]
+    if min_narrow_bars is not None:
+        rows = [row for row in rows if (row["narrow_bars"] or 0) >= min_narrow_bars]
+
+    if sort_by == "duration":
+        rows.sort(key=lambda r: (-(r["narrow_bars"] or 0), -(r["squeeze_index"] or 0)))
+    elif sort_by == "accumulation":
+        rows.sort(key=lambda r: (
+            -(r["absorption_bars"] or 0),
+            -(r["taker_above"] or 0),
+            -(r["volume_lead"] or 0),
+            -(r["squeeze_index"] or 0),
+        ))
+    return rows
+
+
 def open_episodes(con: sqlite3.Connection, tf: str | None = None) -> list[dict[str, Any]]:
     sql = "SELECT * FROM watchlist WHERE exited_at IS NULL"
     params: tuple[Any, ...] = ()

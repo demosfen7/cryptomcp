@@ -46,6 +46,7 @@ from .render import (
     render_levels,
     render_pivots,
     render_scan_history,
+    render_screen,
     render_snapshot,
     render_squeeze_metrics,
     skip_label,
@@ -447,24 +448,73 @@ async def get_derivatives(symbol: str, as_of_ms: int | None = None) -> str:
 
 @server.tool(
     description=(
-        "Пакетное сканирование списка пар по squeeze_index на одном "
-        "таймфрейме, по строке на монету. Пагинация истории отключена ради "
-        "веса запросов, поэтому на младших таймфреймах часть перцентилей будет "
-        "недоступна — для разбора конкретной пары вызывать get_squeeze_metrics. "
-        "Параметр market: futures (по умолчанию) или spot."
+        "Отбор монет по сжатию и накоплению. Два режима. БЕЗ symbols — отбор "
+        "по фильтру из журнала сканера: он каждый час проходит весь ликвидный "
+        "универсум, поэтому выдача не стоит ни одного запроса к бирже и "
+        "содержит признаки накопления (бары набора, тейкеры, лид объёма над "
+        "ценой, сторона набора по фандингу). Доступные ТФ в этом режиме — "
+        "4h, 1d, 1h; строка пишется на закрытие свечи, поэтому может отставать "
+        "почти на таймфрейм, и «закрыта по» печатается в выдаче. С явным "
+        "symbols — пересчёт по бирже, до 100 пар, любой ТФ: нужен для монет вне "
+        "архива или когда важна свежесть, а не охват. Фильтры: оборот, возраст "
+        "листинга, максимальное движение за сутки (монета в движении — не "
+        "кандидат на накопление), длительность сжатия, исключения. Сортировка: "
+        "squeeze, duration, accumulation. Несколько таймфреймов за вызов."
     )
 )
 async def scan_pairs(
-    symbols: list[str], timeframe: str = "4h", market: str = "futures"
+    symbols: list[str] | None = None,
+    timeframes: list[str] | None = None,
+    min_volume_usdt: float = 10_000_000,
+    max_volume_usdt: float | None = None,
+    min_age_days: int | None = None,
+    max_abs_change_24h: float | None = None,
+    exclude: list[str] | None = None,
+    min_narrow_bars: int | None = None,
+    sort_by: str = "squeeze",
+    limit: int = 20,
+    market: str = "futures",
 ) -> str:
     try:
-        _, fetcher, registry, _, mkt = await _ctx(market)
-        interval = _validate_timeframes([timeframe])[0]
-        if not symbols:
-            raise bad_params("Список symbols пуст")
-        if len(symbols) > 100:
-            raise bad_params(f"За раз не более 100 пар, передано {len(symbols)}")
+        intervals = _validate_timeframes(timeframes or ["4h"])
+        if sort_by not in storage.SCAN_SORTS:
+            raise bad_params(
+                f"Неизвестная сортировка {sort_by!r}. Доступны: "
+                + ", ".join(storage.SCAN_SORTS),
+                sort_by=sort_by,
+            )
+        if symbols:
+            return await _scan_explicit(symbols, intervals, market)
+        return await _scan_screen(
+            intervals,
+            min_volume_usdt=min_volume_usdt,
+            max_volume_usdt=max_volume_usdt,
+            min_age_days=min_age_days,
+            max_abs_change_24h=max_abs_change_24h,
+            exclude={s.upper() for s in exclude} if exclude else None,
+            min_narrow_bars=min_narrow_bars,
+            sort_by=sort_by,
+            limit=max(1, min(limit, 100)),
+            market=market,
+        )
+    except ToolError as error:
+        return _fail(error)
 
+
+async def _scan_explicit(
+    symbols: list[str], intervals: tuple[str, ...], market: str
+) -> str:
+    """Пересчёт по явному списку — как было до фильтров.
+
+    Остаётся ради монет вне архива и ради случая, когда важна свежесть: этот
+    путь считает по бирже и не отстаёт на свечу.
+    """
+    _, fetcher, registry, _, mkt = await _ctx(market)
+    if len(symbols) > 100:
+        raise bad_params(f"За раз не более 100 пар, передано {len(symbols)}")
+
+    blocks: list[str] = []
+    for interval in intervals:
         rows: list[tuple[float, str]] = []
         problems: list[str] = []
         for symbol in symbols:
@@ -476,9 +526,7 @@ async def scan_pairs(
                 view = analyse_timeframe(series, config)
                 journal.record(info.symbol, view, market=mkt.name)
                 index = view.squeeze_index if view.squeeze_index is not None else -1.0
-                bbw = (
-                    f"{view.bbw.pct_rank:>3.0f}" if view.bbw.has_context else "n/a"
-                )
+                bbw = f"{view.bbw.pct_rank:>3.0f}" if view.bbw.has_context else "n/a"
                 rows.append((
                     index,
                     f"{info.symbol:<14}{index:>6.2f}{bbw:>7}"
@@ -490,23 +538,94 @@ async def scan_pairs(
 
         rows.sort(key=lambda item: -item[0])
         lines = [
-            f"{interval} · {mkt.label} · сортировка по squeeze_index",
+            f"{interval} · {mkt.label} · пересчёт по бирже · "
+            f"сортировка по squeeze_index",
             f"{'символ':<14}{'индекс':>6}{'BBW':>7}{'диап':>9}"
             f"{'узк':>6}{'объём':>9}  EMA/структура",
         ]
         lines += [text for _, text in rows]
-        lines += [
-            "",
-            "узк — свечей подряд с шириной диапазона(20) ниже 20-го перцентиля "
-            "своей истории",
-            "объём — к сезонной базе; окно то же каноническое, что в снапшоте, "
-            "поэтому числа сопоставимы напрямую",
-        ]
         if problems:
-            lines += ["", "пропущены — остальные посчитаны:"] + [f"  {p}" for p in problems]
-        return "\n".join(lines)
-    except ToolError as error:
-        return _fail(error)
+            lines += ["", "пропущены — остальные посчитаны:"] + [
+                f"  {p}" for p in problems
+            ]
+        blocks.append("\n".join(lines))
+
+    blocks.append(
+        "узк — свечей подряд с шириной диапазона(20) ниже 20-го перцентиля "
+        "своей истории\nобъём — к сезонной базе; окно то же каноническое, что "
+        "в снапшоте, поэтому числа сопоставимы напрямую"
+    )
+    return "\n\n".join(blocks)
+
+
+async def _scan_screen(
+    intervals: tuple[str, ...],
+    *,
+    min_volume_usdt: float,
+    max_volume_usdt: float | None,
+    min_age_days: int | None,
+    max_abs_change_24h: float | None,
+    exclude: set[str] | None,
+    min_narrow_bars: int | None,
+    sort_by: str,
+    limit: int,
+    market: str,
+) -> str:
+    """Отбор по фильтру из журнала сканера.
+
+    Один запрос к бирже на весь отбор — тикер по всем символам сразу, ради
+    оборота и суточного движения. Всё остальное берётся из базы: пересчёт
+    стоил бы запроса за хвостом на КАЖДЫЙ символ (§4.15).
+    """
+    client, _, registry, _, mkt = await _ctx(market)
+    tradable = {info.symbol for info in await registry.tradable()}
+    tickers = await client.ticker_24hr()
+
+    allowed: set[str] = set()
+    for row in tickers:
+        symbol = row["symbol"]
+        if symbol not in tradable:
+            continue
+        volume = float(row["quoteVolume"])
+        if volume < min_volume_usdt:
+            continue
+        if max_volume_usdt is not None and volume > max_volume_usdt:
+            continue
+        # Монета в движении — не кандидат на накопление. Фильтр выключен по
+        # умолчанию: он же прячет монету, которая только что выстрелила.
+        if (
+            max_abs_change_24h is not None
+            and abs(float(row["priceChangePercent"])) > max_abs_change_24h
+        ):
+            continue
+        allowed.add(symbol)
+
+    con = _archive()
+    try:
+        if min_age_days is not None:
+            now_ms = await client.now_ms()
+            edge = now_ms - min_age_days * 86_400_000
+            listed = storage.listing_dates(con, mkt.name)
+            allowed = {
+                s for s in allowed
+                if s in listed and listed[s] <= edge
+            }
+        passed = len(allowed)
+        blocks = []
+        for interval in intervals:
+            matched = storage.screen_scan(
+                con, interval, allowed=allowed, exclude=exclude,
+                min_narrow_bars=min_narrow_bars, sort_by=sort_by,
+            )
+            logged = len(storage.latest_scan(con, interval))
+            blocks.append(render_screen(
+                interval, matched[:limit], version=SQUEEZE_FORMULA_VERSION,
+                sort_by=sort_by, filtered=passed, logged=logged,
+                matched=len(matched),
+            ))
+    finally:
+        con.close()
+    return "\n\n".join(blocks)
 
 
 @server.tool(

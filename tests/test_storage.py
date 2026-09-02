@@ -539,3 +539,76 @@ class TestMigration:
             assert "OLDUSDT" in watchlist_view(con)
         finally:
             con.close()
+
+
+class TestScreenScan:
+    """Отбор идёт по журналу, а не пересчётом: пересчёт стоил бы запроса
+    к бирже за свежим хвостом по каждому символу."""
+
+    NOW = 1_788_400_000_000
+
+    def scan(self, con, symbol, index, *, narrow=0, bars=None, above=None, lead=None):
+        from cryptomcp import SQUEEZE_FORMULA_VERSION
+
+        con.execute(
+            "INSERT OR REPLACE INTO scan_log (ts_ms, symbol, source, tf, "
+            "formula_version, squeeze_index, price, narrow_bars, "
+            "absorption_bars, taker_above, volume_lead, closed_through_ms) "
+            "VALUES (?, ?, 'futures', '4h', ?, ?, 100.0, ?, ?, ?, ?, ?)",
+            (self.NOW, symbol, SQUEEZE_FORMULA_VERSION, index, narrow,
+             bars, above, lead, self.NOW - 1),
+        )
+        con.commit()
+
+    def test_sorted_by_squeeze_by_default(self, con):
+        self.scan(con, "AAAUSDT", 0.30)
+        self.scan(con, "BBBUSDT", 0.70)
+
+        rows = storage.screen_scan(con, "4h")
+        assert [r["symbol"] for r in rows] == ["BBBUSDT", "AAAUSDT"]
+
+    def test_duration_sort_puts_long_squeeze_first(self, con):
+        self.scan(con, "AAAUSDT", 0.70, narrow=0)
+        self.scan(con, "BBBUSDT", 0.30, narrow=36)
+
+        rows = storage.screen_scan(con, "4h", sort_by="duration")
+        assert [r["symbol"] for r in rows] == ["BBBUSDT", "AAAUSDT"]
+
+    def test_accumulation_sort_uses_components(self, con):
+        """Сводного числа нет, поэтому порядок — по составляющим."""
+        self.scan(con, "AAAUSDT", 0.70, bars=0, above=0, lead=0)
+        self.scan(con, "BBBUSDT", 0.30, bars=3, above=7, lead=8)
+
+        rows = storage.screen_scan(con, "4h", sort_by="accumulation")
+        assert [r["symbol"] for r in rows] == ["BBBUSDT", "AAAUSDT"]
+
+    def test_allowed_and_exclude(self, con):
+        for symbol in ("AAAUSDT", "BBBUSDT", "CCCUSDT"):
+            self.scan(con, symbol, 0.5)
+
+        rows = storage.screen_scan(
+            con, "4h", allowed={"AAAUSDT", "BBBUSDT"}, exclude={"BBBUSDT"}
+        )
+        assert [r["symbol"] for r in rows] == ["AAAUSDT"]
+
+    def test_min_narrow_bars(self, con):
+        self.scan(con, "AAAUSDT", 0.70, narrow=0)
+        self.scan(con, "BBBUSDT", 0.30, narrow=5)
+
+        rows = storage.screen_scan(con, "4h", min_narrow_bars=1)
+        assert [r["symbol"] for r in rows] == ["BBBUSDT"]
+
+    def test_returns_everything_matched_not_a_page(self, con):
+        """Вызывающему нужно знать, сколько прошло: «показано 5» иначе
+        неотличимо от «пятеро и есть весь рынок»."""
+        for i in range(5):
+            self.scan(con, f"C{i}USDT", 0.10 * i)
+
+        rows = storage.screen_scan(con, "4h")
+        assert len(rows) == 5
+        assert [r["symbol"] for r in rows[:2]] == ["C4USDT", "C3USDT"]
+
+    def test_listing_dates_from_archive(self, con):
+        storage.remember_symbol(con, "AAAUSDT", "futures", 1_600_000_000_000)
+        con.commit()
+        assert storage.listing_dates(con) == {"AAAUSDT": 1_600_000_000_000}
