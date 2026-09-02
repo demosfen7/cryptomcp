@@ -9,7 +9,8 @@ ENV PYTHONUNBUFFERED=1 \
     CRYPTOMCP_HOST=0.0.0.0 \
     CRYPTOMCP_PORT=8000 \
     CRYPTOMCP_CONFIG=/app/config.yaml \
-    CRYPTOMCP_JOURNAL=/app/journal/squeeze.jsonl
+    CRYPTOMCP_JOURNAL=/app/journal/squeeze.jsonl \
+    CRYPTOMCP_DB=/app/data/market.sqlite
 
 WORKDIR /app
 
@@ -25,7 +26,7 @@ COPY config.example.yaml ./config.yaml
 # Непривилегированный пользователь: контейнер не хранит секретов, но и root
 # внутри ему не нужен.
 RUN useradd --create-home --uid 10001 cryptomcp \
-    && mkdir -p /app/journal \
+    && mkdir -p /app/journal /app/data \
     && chown -R cryptomcp:cryptomcp /app
 USER cryptomcp
 

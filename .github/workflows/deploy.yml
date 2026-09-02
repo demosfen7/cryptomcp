@@ -68,6 +68,7 @@ jobs:
           rsync -az --delete \
             -e "ssh -p ${{ secrets.SSH_PORT }} -i ~/.ssh/id_ed25519" \
             --exclude '.git' --exclude '.venv' --exclude 'journal' \
+            --exclude 'data' \
             --exclude 'deploy' --exclude '.github' \
             ./ "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/cryptomcp/"
 

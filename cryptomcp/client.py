@@ -352,17 +352,96 @@ class BinanceClient:
         period: str = "4h",
         *,
         limit: int = 500,
+        start_time: int | None = None,
+        end_time: int | None = None,
     ) -> list[dict[str, Any]]:
         """История открытого интереса.
 
         Биржа хранит только последние 30 суток — проверено отказом
         -1130 на запрос с startTime 60 суток назад (PLAN §4.12).
         """
+        return await self._futures_data(
+            "openInterestHist", symbol, period, limit, start_time, end_time
+        )
+
+    async def long_short_ratio(
+        self,
+        symbol: str,
+        kind: str = "global_account",
+        period: str = "5m",
+        *,
+        limit: int = 500,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Соотношение длинных и коротких позиций.
+
+        Три разных среза, и путать их нельзя: ``global_account`` — доля всех
+        счетов, ``top_account`` — доля крупных счетов, ``top_position`` — доля
+        их объёма. Первый показывает настроение толпы, третий — куда встали
+        деньги, и расходятся они регулярно.
+        """
+        paths = {
+            "global_account": "globalLongShortAccountRatio",
+            "top_account": "topLongShortAccountRatio",
+            "top_position": "topLongShortPositionRatio",
+        }
+        if kind not in paths:
+            raise bad_params(
+                f"Неизвестный срез long/short: {kind!r}. "
+                f"Доступны: {', '.join(paths)}",
+                kind=kind,
+            )
+        return await self._futures_data(
+            paths[kind], symbol, period, limit, start_time, end_time
+        )
+
+    async def taker_long_short_ratio(
+        self,
+        symbol: str,
+        period: str = "5m",
+        *,
+        limit: int = 500,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Доля агрессивных покупок в объёме тейкеров."""
+        return await self._futures_data(
+            "takerlongshortRatio", symbol, period, limit, start_time, end_time
+        )
+
+    async def _futures_data(
+        self,
+        endpoint: str,
+        symbol: str,
+        period: str,
+        limit: int,
+        start_time: int | None,
+        end_time: int | None,
+    ) -> list[dict[str, Any]]:
+        """Общий доступ к разделу /futures/data/.
+
+        Раздел живёт вне префикса рынка и существует только у фьючерсов.
+        Глубина у всех пяти эндпоинтов одна и та же — 30 суток, дальше -1130;
+        ``limit`` проверен до 1000 точек за запрос, то есть 83 часа с шагом 5m.
+        """
+        if not self.market.has_derivatives:
+            raise bad_params(
+                f"{endpoint} существует только на фьючерсах, "
+                f"а клиент работает с рынком {self.market.name}",
+                market=self.market.name,
+            )
         return await self._request(
-            "/futures/data/openInterestHist",
-            params={"symbol": symbol.upper(), "period": period, "limit": limit},
+            f"/futures/data/{endpoint}",
+            params={
+                "symbol": symbol.upper(),
+                "period": period,
+                "limit": limit,
+                "startTime": start_time,
+                "endTime": end_time,
+            },
             weight=1,
-            cache_ttl_s=300,
+            cache_ttl_s=0 if start_time or end_time else 300,
         )
 
     @property

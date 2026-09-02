@@ -30,8 +30,41 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Сборщик невосстановимых данных (PLAN §4.14). Отдельный контейнер, а не
+  # поток внутри сервера: у них разные режимы отказа. Сервер, промолчавший час,
+  # никому ничего не должен; сборщик, промолчавший час, теряет час открытого
+  # интереса навсегда — биржа отдаёт только последние 30 суток.
+  #
+  # Наружу не смотрит, токена не знает, портов не публикует. Единственный
+  # писатель в базу: MCP-сервер будет только читать.
+  collector:
+    build: .
+    container_name: cryptomcp-collector
+    restart: unless-stopped
+    command: ["python", "-m", "cryptomcp.collector", "loop"]
+    environment:
+      CRYPTOMCP_LOG_LEVEL: INFO
+      CRYPTOMCP_DB: /app/data/market.sqlite
+      # Ядро, по которому пишутся деривативы. Пока не накоплен universe_daily,
+      # отбор идёт по текущему обороту; когда накопится — по медиане за неделю.
+      COLLECTOR_CORE_MIN_VOLUME: "50000000"
+      COLLECTOR_MAX_SYMBOLS: "60"
+      COLLECTOR_INTERVAL_S: "3600"
+    volumes:
+      # Именованный том, а не папка проекта: деплой синхронизирует /opt/cryptomcp
+      # с --delete, и база в рабочей папке стиралась бы при каждом выкате.
+      - cryptomcp_data:/app/data
+    networks:
+      - briefgenerator_internal
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   cryptomcp_journal:
+  cryptomcp_data:
 
 networks:
   briefgenerator_internal:
