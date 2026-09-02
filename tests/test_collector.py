@@ -657,3 +657,95 @@ class TestScanWithoutWatch:
 
         assert changes["entered"] == []
         assert storage.open_episodes(con) == []
+
+
+class FakeFundingClient:
+    """Биржа, отдающая начисления ВПЕРЁД от startTime — как настоящая.
+
+    Направление здесь противоположно /futures/data/, и именно поэтому у него
+    отдельный фейк: общий скрывал бы главное различие.
+    """
+
+    def __init__(self, first_ts: int, last_ts: int, step_ms: int, page: int = 1000):
+        self.first_ts, self.last_ts, self.step_ms = first_ts, last_ts, step_ms
+        self.page = page
+        self.calls: list[int | None] = []
+
+    async def funding_rate(self, symbol, *, limit=1000, start_time=None,
+                           end_time=None):
+        self.calls.append(start_time)
+        start = max(start_time or self.first_ts, self.first_ts)
+        end = min(end_time or self.last_ts, self.last_ts)
+        stamps, ts = [], start - (start - self.first_ts) % self.step_ms
+        if ts < start:
+            ts += self.step_ms
+        while ts <= end and len(stamps) < min(limit, self.page):
+            stamps.append(ts)
+            ts += self.step_ms
+        return [
+            {"symbol": symbol, "fundingTime": t, "fundingRate": "-0.0001"}
+            for t in stamps
+        ]
+
+    async def now_ms(self):
+        return self.last_ts
+
+
+class TestFundingCollection:
+    """Фандинг нужен строкой скана, поэтому лежит в архиве, а не берётся живьём."""
+
+    STEP = 8 * 3_600_000
+
+    def client(self, days=400, page=1000):
+        return FakeFundingClient(
+            NOW - int(days * 86_400_000), NOW, self.STEP, page=page
+        )
+
+    @pytest.mark.asyncio
+    async def test_first_run_takes_a_year(self, con):
+        from cryptomcp.collector import FUNDING_BACKFILL_DAYS, collect_funding
+
+        client = self.client()
+        written, failed = await collect_funding(client, con, ["BTCUSDT"])
+
+        assert failed == []
+        # Год начислений с шагом 8 часов — три в сутки.
+        assert written == pytest.approx(FUNDING_BACKFILL_DAYS * 3, abs=2)
+
+    @pytest.mark.asyncio
+    async def test_paging_goes_forward(self, con):
+        """fundingRate листается вперёд по startTime — обратно к /futures/data/."""
+        from cryptomcp.collector import collect_funding
+
+        client = self.client(page=200)
+        await collect_funding(client, con, ["BTCUSDT"])
+
+        starts = [s for s in client.calls if s is not None]
+        assert starts == sorted(starts), "курсор обязан идти слева направо"
+        assert len(starts) > 1, "год по 200 точек за страницу — не одна страница"
+
+    @pytest.mark.asyncio
+    async def test_second_run_asks_only_for_the_tail(self, con):
+        from cryptomcp.collector import collect_funding
+
+        client = self.client()
+        await collect_funding(client, con, ["BTCUSDT"])
+        before = len(client.calls)
+
+        client.last_ts = NOW + 3 * self.STEP
+        written, _ = await collect_funding(client, con, ["BTCUSDT"])
+
+        assert written == 3, "должен догрузиться только хвост"
+        assert len(client.calls) - before == 1
+
+    @pytest.mark.asyncio
+    async def test_repeat_run_is_idempotent(self, con):
+        from cryptomcp.collector import collect_funding
+
+        client = self.client(days=30)
+        await collect_funding(client, con, ["BTCUSDT"])
+        written, failed = await collect_funding(client, con, ["BTCUSDT"])
+
+        assert (written, failed) == (0, [])
+        rows = con.execute("SELECT COUNT(*) AS n FROM funding").fetchone()["n"]
+        assert rows == 30 * 3 + 1

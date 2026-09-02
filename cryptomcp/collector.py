@@ -65,6 +65,14 @@ SOURCES: tuple[tuple[str, str, str], ...] = (
     ("taker", "buySellRatio", "taker_ratio"),
 )
 
+#: Начислений фандинга за запрос — потолок эндпоинта.
+FUNDING_PAGE = 1000
+
+#: Предохранитель от бесконечного листания, если биржа перестанет двигать
+#: курсор. Года хватает даже часовому интервалу начислений: 8760 точек — девять
+#: страниц.
+MAX_FUNDING_PAGES = 12
+
 #: Сколько символов обрабатывать параллельно. Клиент и так держит семафор и
 #: бюджет веса; здесь ограничение нужно, чтобы не плодить тысячи задач разом.
 SYMBOL_CONCURRENCY = 3
@@ -157,6 +165,11 @@ CORE_MAX_SYMBOLS = _env_int("COLLECTOR_MAX_SYMBOLS", 60)
 ARCHIVE_MIN_VOLUME = _env_float("COLLECTOR_ARCHIVE_MIN_VOLUME", 10_000_000)
 
 INTERVAL_S = _env_int("COLLECTOR_INTERVAL_S", 3600)
+
+#: Глубина истории фандинга при первом заходе. Ограничена не биржей, а смыслом:
+#: перцентилю хватает года, а строка в таблице стоит десятки байт. Обратный
+#: случай к деривативам, где глубину определяет биржа своими 30 сутками.
+FUNDING_BACKFILL_DAYS = _env_float("COLLECTOR_FUNDING_DAYS", 365.0)
 
 #: Границы ранга для списка наблюдения. Вход выше выхода — гистерезис: при
 #: одинаковых порогах монеты у границы входили бы и выходили каждый прогон.
@@ -290,6 +303,85 @@ async def collect(
                 failed.append(symbol)
 
     await asyncio.gather(*(one(symbol) for symbol in symbols))
+    return total, failed
+
+
+async def funding_window(
+    client: BinanceClient, symbol: str, start_ms: int, end_ms: int
+) -> dict[int, float]:
+    """Начисления фандинга за окно.
+
+    **Листание здесь ПРЯМОЕ — в отличие от /futures/data/.** Тот раздел не
+    использует startTime для позиции и листается назад по endTime (§4.13);
+    fundingRate честно отдаёт окно вперёд от startTime. Две противоположные
+    семантики границ живут в одном процессе, и перепутать их — значит молча
+    забрать не тот кусок истории, что уже случалось.
+    """
+    rows: dict[int, float] = {}
+    cursor = start_ms
+    for _ in range(MAX_FUNDING_PAGES):
+        page = await client.funding_rate(
+            symbol, limit=FUNDING_PAGE, start_time=cursor, end_time=end_ms
+        )
+        if not page:
+            break
+        for row in page:
+            rows[int(row["fundingTime"])] = float(row["fundingRate"])
+        last = int(page[-1]["fundingTime"])
+        # Конец окна определяется по КУРСОРУ, а не по короткой странице.
+        # «Вернулось меньше, чем просили» означает конец истории только если
+        # биржа не режет limit молча, а она режет: на klines с limit=1500
+        # молча возвращалось 1000. Здесь цена ошибки — тихо недобранный кусок
+        # истории, поэтому платим одним лишним пустым запросом на символ.
+        if last <= cursor or last >= end_ms:
+            break
+        cursor = last + 1
+    return rows
+
+
+async def collect_funding(
+    client: BinanceClient,
+    con: sqlite3.Connection,
+    symbols: list[str],
+    *,
+    days: float | None = None,
+) -> tuple[int, list[str]]:
+    """Сложить историю ставок фандинга в архив.
+
+    Зачем хранить то, что биржа отдаёт и так: знак фандинга и его перцентиль
+    нужны СТРОКОЙ СКАНА, то есть сразу по всем монетам универсума. Живым
+    запросом это по обращению на монету за прогон против одного прохода по
+    локальной базе. Без архива нельзя ни подписать сторону набора позиций, ни
+    поставить фандинг в пакетную выдачу.
+
+    Глубина ограничена не биржей, а смыслом: история фандинга отдаётся за годы
+    (проверено на 900 сутках), перцентилю хватает года, а хранение стоит
+    копейки. Это ровно обратный случай к деривативам, где решает биржа.
+    """
+    now_ms = await client.now_ms()
+    horizon = now_ms - int((days or FUNDING_BACKFILL_DAYS) * 86_400_000)
+    total = 0
+    failed: list[str] = []
+    guard = asyncio.Semaphore(SYMBOL_CONCURRENCY)
+
+    async def one(symbol: str) -> None:
+        nonlocal total
+        async with guard:
+            saved = storage.last_ts(con, "funding", symbol)
+            start = saved + 1 if saved is not None else horizon
+            if start >= now_ms:
+                return
+            try:
+                rows = await funding_window(client, symbol, start, now_ms)
+            except ToolError as error:
+                log.warning("%s: фандинг не собран: %s", symbol, error.message)
+                failed.append(symbol)
+                return
+            if rows:
+                total += storage.upsert_funding(con, symbol, sorted(rows.items()))
+
+    await asyncio.gather(*(one(symbol) for symbol in symbols))
+    con.commit()
     return total, failed
 
 
@@ -721,6 +813,24 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
         )
         con.commit()
         log.info("свечи: записано %d, не собрано рядов %d", candles, len(candle_failures))
+
+        # Фандинг после свечей и деривативов: он восстановим, как свечи, — биржа
+        # отдаёт его за годы. Если прогон оборвётся здесь, потеряно ничего.
+        started = time.monotonic()
+        rates, rate_failures = await collect_funding(
+            client, con, derivative_symbols, days=backfill_days
+        )
+        storage.record_run(
+            con, "funding", symbols=len(derivative_symbols), rows=rates,
+            seconds=time.monotonic() - started,
+            error=("не собраны: " + ", ".join(rate_failures[:20]))
+            if rate_failures else None,
+        )
+        con.commit()
+        log.info(
+            "фандинг: записано начислений %d, не собрано символов %d",
+            rates, len(rate_failures),
+        )
 
         # Скан и исходы считаются из базы, к бирже не ходят вовсе, поэтому
         # стоят копейки и идут последними — после того как архив пополнен.
