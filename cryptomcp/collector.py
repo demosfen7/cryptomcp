@@ -29,7 +29,7 @@ import sqlite3
 import time
 from typing import Any
 
-from . import SQUEEZE_FORMULA_VERSION, storage
+from . import SQUEEZE_FORMULA_VERSION, render, storage
 from .analysis import MIN_CANDLES, analyse_timeframe, required_candles
 from .client import BinanceClient
 from .config import Config
@@ -116,9 +116,11 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-#: Порог оборота для ядра, по которому пишутся деривативы. Пока не накоплен
-#: universe_daily, отбор идёт по текущему обороту; когда накопится — заменить
-#: на медиану за неделю, ради которой снимки и пишутся.
+#: Порог оборота для ядра: кому пишется полная лестница свечей (1w/1d/4h/1h).
+#: Деривативы по ядру НЕ ограничены — они собираются по всему архивному слою
+#: (см. run_once). Пока не накоплен universe_daily, отбор идёт по текущему
+#: обороту; когда накопится — заменить на медиану за неделю, ради которой
+#: снимки и пишутся.
 CORE_MIN_VOLUME = _env_float("COLLECTOR_CORE_MIN_VOLUME", 50_000_000)
 CORE_MAX_SYMBOLS = _env_int("COLLECTOR_MAX_SYMBOLS", 60)
 
@@ -572,7 +574,10 @@ async def universe_rows(client: BinanceClient) -> list[dict[str, Any]]:
 
 
 def core_symbols(rows: list[dict[str, Any]]) -> list[str]:
-    """Ядро: полная лестница свечей плюс деривативы."""
+    """Ядро: полная лестница свечей 1w/1d/4h/1h.
+
+    Деривативы сюда больше не привязаны — они пишутся по всему архивному слою.
+    """
     return [
         row["symbol"]
         for row in rows
@@ -639,13 +644,26 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
         rows = await universe_rows(client)
         core = core_symbols(rows)
         archived = archived_rows(rows)
+        # Деривативы пишутся по всему архивному слою, а не по ядру. Замерено на
+        # живой выдаче: из топ-15 по индексу восемь монет имели оборот ниже
+        # порога ядра, то есть больше половины кандидатов в список наблюдения
+        # оставались без открытого интереса — а компонент накопления считается
+        # именно по нему. Полоса 10–50M и есть самая интересная для сжатий.
+        # Цена вопроса — 0.6 ГБ в год; цена промедления — сутки истории за
+        # каждые сутки, потому что /futures/data/ отдаёт только 30 суток.
+        derivative_symbols = [row["symbol"] for row in archived]
         kind = "backfill" if backfill_days else "incremental"
-        log.info("%s: ядро %d, архив %d символов", kind, len(core), len(archived))
+        log.info(
+            "%s: деривативы %d, ядро (полная лестница) %d, архив %d символов",
+            kind, len(derivative_symbols), len(core), len(archived),
+        )
 
         started = time.monotonic()
-        written, failed = await collect(client, con, core, days=backfill_days)
+        written, failed = await collect(
+            client, con, derivative_symbols, days=backfill_days
+        )
         storage.record_run(
-            con, kind, symbols=len(core), rows=written,
+            con, kind, symbols=len(derivative_symbols), rows=written,
             seconds=time.monotonic() - started,
             error=("не собраны: " + ", ".join(failed)) if failed else None,
         )
@@ -720,39 +738,33 @@ async def loop(con: sqlite3.Connection) -> None:
         await asyncio.sleep(INTERVAL_S)
 
 
-def render_watchlist(con: sqlite3.Connection) -> str:
-    """Открытые эпизоды столбиком.
+def watchlist_view(
+    con: sqlite3.Connection,
+    *,
+    status: str | None = None,
+    tf: str | None = None,
+    limit: int = 100,
+    now_ms: int | None = None,
+) -> str:
+    """Список наблюдения текстом: один путь для CLI сборщика и MCP-сервера.
 
-    Ширина диапазона и длительность сжатия печатаются отдельными колонками, а
-    не сворачиваются в индекс: ранг сам по себе пропускает и широкие диапазоны
-    (BULLA с 40% попала в топ на первой же выдаче), и решать, что с этим
-    делать, должен человек.
+    Общий рендер здесь не про экономию строк. Две функции с одинаковым смыслом
+    в этом проекте уже трижды расходились в третьем знаке — в колонке объёма
+    get_klines, между архивом и биржей, между сервером и сканером. Список
+    наблюдения будет читаться и из терминала, и из чата, и расхождение между
+    ними обнаружилось бы не сразу.
     """
-    episodes = storage.open_episodes(con)
-    if not episodes:
-        return "список наблюдения пуст"
-
-    lines = [
-        f"открытых эпизодов: {len(episodes)}",
-        f"{'символ':<14}{'ТФ':>4}{'статус':>11}{'ранг':>6}{'индекс':>8}"
-        f"{'вход':>10}{'сейчас':>9}{'дней':>6}  кем",
-    ]
-    now_ms = int(dt.datetime.now(dt.UTC).timestamp() * 1000)
-    for episode in sorted(episodes, key=lambda e: (e["tf"], e["last_rank"] or 999)):
-        scan = {row["symbol"]: row for row in storage.latest_scan(con, episode["tf"])}
-        price = (scan.get(episode["symbol"]) or {}).get("price")
-        move = (
-            f"{(price / episode['price_at_entry'] - 1) * 100:+.1f}%"
-            if price and episode["price_at_entry"] else "n/a"
-        )
-        lines.append(
-            f"{episode['symbol']:<14}{episode['tf']:>4}{episode['status']:>11}"
-            f"{episode['last_rank'] or 0:>6}{episode['last_index'] or 0:>8.2f}"
-            f"{episode['price_at_entry'] or 0:>10.4g}{move:>9}"
-            f"{(now_ms - episode['entered_at']) / 86_400_000:>6.1f}  "
-            f"{episode['entered_by']}"
-        )
-    return "\n".join(lines)
+    rows = storage.episodes(con, status=status, tf=tf, limit=limit)
+    scans = {
+        (scan["symbol"], timeframe): scan
+        for timeframe in {row["tf"] for row in rows}
+        for scan in storage.latest_scan(con, timeframe)
+    }
+    return render.render_watchlist(
+        rows,
+        scans,
+        now_ms=now_ms or int(dt.datetime.now(dt.UTC).timestamp() * 1000),
+    )
 
 
 def health(con: sqlite3.Connection, *, interval_s: int = INTERVAL_S) -> tuple[bool, str]:
@@ -802,7 +814,7 @@ def main() -> None:
             log.info("%s", message)
             raise SystemExit(0 if alive else 1)
         if args.command == "watch":
-            print(render_watchlist(con))
+            print(watchlist_view(con))
             return
         if args.command == "add":
             if not args.symbol:

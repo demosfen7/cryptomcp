@@ -14,6 +14,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
+from collections.abc import Sequence
+from typing import Any
 
 from .analysis import TimeframeView
 from .derivatives import Funding, OpenInterest
@@ -450,4 +453,166 @@ def render_klines(
         "свечей × сезонность слота суток; ~ слабая база. От limit не зависит."
     )
     lines.append(f"база последней свечи: {baseline.basis}")
+    return "\n".join(lines)
+
+
+#: Короткие имена групп индекса для табличной выдачи. Порядок — как в формуле.
+INDEX_GROUPS: tuple[tuple[str, str], ...] = (
+    ("volatility", "vola"),
+    ("range", "rang"),
+    ("volume", "volu"),
+    ("value_area", "valu"),
+    ("divergence", "dive"),
+)
+
+
+def _price(value: Any) -> str:
+    """Цена без потери разряда и без выдуманной точности.
+
+    Восьми значащих хватает обоим краям рынка: 90123.45 не обрезается до
+    90123.4, а 0.00581042 не превращается в 0.0058. Настоящий шаг цены живёт в
+    SymbolInfo и приходит с биржи, но здесь выдача строится только из архива —
+    ходить за ним ради колонки было бы запросом на ровном месте.
+    """
+    return f"{value:.8g}" if value else "n/a"
+
+
+def _pair(entry: Any, current: Any) -> str:
+    """Значение «на входе → сейчас».
+
+    Прочерк там, где значения нет: у ручной записи ранга при входе не было, а
+    выпавшая из универсума монета потеряла текущий. Это разные вещи, и
+    показывать их одинаковым нулём нельзя.
+    """
+    left = f"{entry}" if entry else "—"
+    right = f"{current}" if current else "—"
+    return f"{left}→{right}"
+
+
+def render_watchlist(
+    episodes: Sequence[dict[str, Any]],
+    scans: dict[tuple[str, str], dict[str, Any]],
+    *,
+    now_ms: int,
+) -> str:
+    """Список наблюдения столбиком.
+
+    Ширина диапазона и длительность сжатия печатаются отдельными колонками, а
+    не сворачиваются в индекс: ранг сам по себе пропускает и широкие диапазоны
+    (BULLA с 40% попала в топ на первой же выдаче), и решать, что с этим
+    делать, должен человек.
+
+    Колонка накопления печатается всегда, даже пока метрики нет: пустое место
+    в ней — это «не измерено», а не «признака нет». Тот же принцип, по
+    которому метрика без базы печатает причину, а не ноль.
+    """
+    if not episodes:
+        return "список наблюдения пуст"
+
+    closed = any(row.get("exited_at") for row in episodes)
+    lines = [
+        f"эпизодов: {len(episodes)}",
+        f"{'символ':<14}{'ТФ':>4}{'статус':>11}{'ранг':>10}{'инд':>7}{'Δинд':>7}"
+        f"{'накопл':>8}{'узк':>5}{'вход':>13}{'сейчас':>9}{'дней':>6}  кем"
+        + ("  ·  чем кончилось" if closed else ""),
+    ]
+
+    for row in episodes:
+        scan = scans.get((row["symbol"], row["tf"])) or {}
+        index_now = row.get("last_index")
+        index_in = row.get("squeeze_index")
+        delta = (
+            f"{index_now - index_in:+.2f}"
+            if index_now is not None and index_in is not None else "—"
+        )
+        price_in = row.get("price_at_entry")
+        price_now = scan.get("price")
+        move = (
+            f"{(price_now / price_in - 1) * 100:+.1f}%"
+            if price_now and price_in else "n/a"
+        )
+        # У закрытого эпизода возраст считается до выхода, а не до сейчас:
+        # иначе закрытые вчера продолжали бы «стареть» в выдаче.
+        until = row.get("exited_at") or now_ms
+        accumulation = row.get("accumulation_score")
+        narrow = scan.get("narrow_bars")
+
+        line = (
+            f"{row['symbol']:<14}{row['tf']:>4}{row['status']:>11}"
+            f"{_pair(row.get('rank_at_entry'), row.get('last_rank')):>10}"
+            f"{index_now if index_now is not None else 0:>7.2f}{delta:>7}"
+            f"{f'{accumulation:.2f}' if accumulation is not None else 'n/a':>8}"
+            f"{narrow if narrow is not None else '—':>5}"
+            f"{_price(price_in):>13}{move:>9}"
+            f"{(until - row['entered_at']) / 86_400_000:>6.1f}  {row['entered_by']}"
+        )
+        if row.get("exited_at"):
+            line += f"  ·  {row.get('exit_reason') or row['status']}"
+        lines.append(line)
+
+    lines += [
+        "",
+        "ранг и Δинд — «при входе → сейчас»; инд — squeeze_index последнего скана",
+        "узк — свечей подряд с шириной диапазона(20) ниже 20-го перцентиля "
+        "своей истории",
+        "накопл — метрика накопления; колонка заведена, метрика ещё не считается",
+    ]
+    return "\n".join(lines)
+
+
+def render_scan_history(
+    symbol: str, tf: str, rows: Sequence[dict[str, Any]], version: str
+) -> str:
+    """История индекса по паре с разложением на группы, свежие сверху.
+
+    Разложение печатается всегда: вопрос «сжимается третью неделю или вошёл
+    вчера» решается не индексом, а тем, какая из групп его держит и растёт ли
+    она. Группа, исключённая из-за нехватки базы, показывается прочерком, а не
+    нулём — ноль означал бы «признака нет».
+    """
+    if not rows:
+        return (
+            f"{symbol} {tf}: записей скана нет. Сканируются только "
+            f"таймфреймы из списка наблюдения, и только по монетам архива."
+        )
+
+    header = "".join(f"{short:>7}" for _, short in INDEX_GROUPS)
+    lines = [
+        f"{symbol} · {tf} · формула {version} · записей {len(rows)}, свежие сверху",
+        f"{'закрыта':<17}{'индекс':>7}{header}{'BBW':>6}{'диап':>8}{'узк':>5}"
+        f"{'объём':>8}{'цена':>13}",
+    ]
+
+    for row in rows:
+        components = json.loads(row.get("components") or "{}")
+        groups = "".join(
+            f"{components[key]:>7.2f}" if key in components else f"{'—':>7}"
+            for key, _ in INDEX_GROUPS
+        )
+        index = row.get("squeeze_index")
+        bbw = row.get("bbw_pct_rank")
+        width = row.get("range_width_pct")
+        volume = row.get("volume_ratio")
+        # closed_through_ms — последняя миллисекунда свечи, поэтому печатается
+        # граница: «04:00», а не «03:59:59.999». Тот же приём, что в
+        # closed_through(). Запасной ts_ms — просто момент прогона, ему +1 не
+        # нужен, и путать эти две величины нельзя.
+        closed = row.get("closed_through_ms")
+        stamp = int(closed) + 1 if closed else int(row["ts_ms"])
+        lines.append(
+            f"{utc(stamp)[:16]:<17}"
+            f"{index if index is not None else 0:>7.2f}{groups}"
+            f"{f'{bbw:.0f}' if bbw is not None else 'n/a':>6}"
+            f"{f'{width:.2f}%' if width is not None else 'n/a':>8}"
+            f"{row.get('narrow_bars') if row.get('narrow_bars') is not None else '—':>5}"
+            f"{f'{volume:.2f}x' if volume is not None else 'n/a':>8}"
+            f"{_price(row.get('price')):>13}"
+        )
+
+    lines += [
+        "",
+        "группы — вклад в индекс до взвешивания; «—» значит базы не хватило "
+        "и группа исключена из формулы с перенормировкой весов",
+        "запись одна на закрытую свечу, поэтому шаг строк равен таймфрейму",
+    ]
     return "\n".join(lines)

@@ -1,4 +1,4 @@
-"""MCP-сервер: семь инструментов, три уровня выдачи (PLAN §5).
+"""MCP-сервер: девять инструментов, три уровня выдачи (PLAN §5).
 
 Транспорт задаётся переменной CRYPTOMCP_TRANSPORT: stdio для локальной работы,
 streamable-http для сервера за Caddy. В MCP 2.x транспорт передаётся в run(),
@@ -15,26 +15,30 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import sys
 
 from mcp.server.mcpserver import MCPServer
 
+from . import SQUEEZE_FORMULA_VERSION, storage
 from .analysis import MIN_CANDLES, TimeframeView, analyse_timeframe, weekly_pivots_from
 from .client import BinanceClient
+from .collector import watchlist_view
 from .config import Config
 from .derivatives import DerivativesReader
-from .errors import ToolError, bad_params
+from .errors import ErrorKind, ToolError, bad_params
 from .fetcher import CandleFetcher
 from .indicators import MIN_PERCENTILE_SPAN_DAYS
 from .journal import Journal
 from .markets import MARKETS, Market
-from .reader import ArchiveReader
+from .reader import ArchiveReader, archive_path
 from .render import (
     closed_through,
     render_derivatives,
     render_klines,
     render_levels,
     render_pivots,
+    render_scan_history,
     render_snapshot,
     render_squeeze_metrics,
 )
@@ -56,7 +60,14 @@ server = MCPServer(
     version="0.1.0",
     instructions=(
         "Рыночный контекст Binance USDⓈ-M Futures для анализа.\n\n"
-        "Три уровня, идти сверху вниз и останавливаться, как только хватит:\n"
+        "Начинать с get_watchlist. Фоновый сканер каждый час проходит весь "
+        "ликвидный универсум, считает индекс сжатия и ведёт список отобранных "
+        "пар с историей входов и выходов; get_scan_history показывает, как "
+        "индекс и его группы менялись по конкретной паре. Эта работа уже "
+        "сделана — перебирать пары руками через list_symbols и scan_pairs "
+        "стоит только тогда, когда нужен свой срез universe.\n\n"
+        "Три уровня разбора, идти сверху вниз и останавливаться, как только "
+        "хватит:\n"
         "1) get_market_snapshot — общая картина по лестнице таймфреймов;\n"
         "2) get_squeeze_metrics — пять групп признаков с базой сравнения;\n"
         "3) get_klines — сырые свечи, когда нужно увидеть ФОРМУ "
@@ -434,8 +445,8 @@ async def scan_pairs(
             "",
             "узк — свечей подряд с шириной диапазона(20) ниже 20-го перцентиля "
             "своей истории",
-            "объём — к сезонной базе, но история здесь мельче снапшотной "
-            "(пагинация отключена ради веса), поэтому число приблизительное",
+            "объём — к сезонной базе; окно то же каноническое, что в снапшоте, "
+            "поэтому числа сопоставимы напрямую",
         ]
         if problems:
             lines += ["", "пропущены — остальные посчитаны:"] + [f"  {p}" for p in problems]
@@ -482,6 +493,91 @@ async def list_symbols(
             for volume, symbol, change in rows
         ]
         return "\n".join(lines)
+    except ToolError as error:
+        return _fail(error)
+
+
+def _archive() -> sqlite3.Connection:
+    """Соединение с архивом только на чтение.
+
+    Сервер и сборщик монтируют один том, поэтому список наблюдения и журнал
+    скана доступны серверу без единого запроса к бирже. Открывается на чтение
+    не из осторожности, а по правилу схемы: писатель в базе один — сборщик.
+    """
+    path = archive_path()
+    if path is None:
+        raise ToolError(
+            ErrorKind.DATA_GAP,
+            "Архив недоступен: сборщик рядом не запущен. Список наблюдения и "
+            "журнал скана ведёт он, из биржи их взять неоткуда.",
+        )
+    try:
+        return storage.connect(path, read_only=True)
+    except sqlite3.Error as error:
+        raise ToolError(ErrorKind.DATA_GAP, f"Архив не открылся: {error}") from error
+
+
+@server.tool(
+    description=(
+        "Список наблюдения, который ведёт фоновый сканер: какая пара и на "
+        "каком таймфрейме отобрана, ранг при входе и сейчас, индекс и его "
+        "изменение с входа, длительность сжатия, цена входа и ход от неё, "
+        "чем кончился закрытый эпизод. Смотреть ПЕРВЫМ: сканер каждый час "
+        "проходит весь универсум и уже отобрал кандидатов — перебирать пары "
+        "руками через list_symbols и scan_pairs для этого не нужно. "
+        "status: candidate, active, broken_out, expired, closed, all; по "
+        "умолчанию только открытые эпизоды. Отбор идёт рангом индекса с "
+        "гистерезисом (вход в топ-15, выход из топ-40), а не порогом."
+    )
+)
+async def get_watchlist(
+    status: str | None = None,
+    timeframe: str | None = None,
+    limit: int = 100,
+) -> str:
+    try:
+        if status is not None and status not in storage.EPISODE_STATUSES:
+            raise bad_params(
+                f"Неизвестный статус {status!r}. Доступны: "
+                + ", ".join(storage.EPISODE_STATUSES),
+                status=status,
+            )
+        if timeframe is not None:
+            timeframe = _validate_timeframes([timeframe])[0]
+        con = _archive()
+        try:
+            return watchlist_view(
+                con, status=status, tf=timeframe, limit=max(1, min(limit, 500))
+            )
+        finally:
+            con.close()
+    except ToolError as error:
+        return _fail(error)
+
+
+@server.tool(
+    description=(
+        "История сканирования одной пары: как менялся squeeze_index и каждая "
+        "из пяти групп от свечи к свече. Отвечает на вопрос, который по одному "
+        "снимку не решается — вошла в сжатие вчера или сжимается третью неделю "
+        "и признак усиливается. Запись одна на закрытую свечу; сравниваются "
+        "только записи текущей версии формулы, потому что индексы разных "
+        "версий между собой несопоставимы."
+    )
+)
+async def get_scan_history(symbol: str, timeframe: str = "4h", limit: int = 20) -> str:
+    try:
+        interval = _validate_timeframes([timeframe])[0]
+        con = _archive()
+        try:
+            rows = storage.scan_history(
+                con, symbol.upper(), interval, limit=max(1, min(limit, 200))
+            )
+        finally:
+            con.close()
+        return render_scan_history(
+            symbol.upper(), interval, rows, SQUEEZE_FORMULA_VERSION
+        )
     except ToolError as error:
         return _fail(error)
 

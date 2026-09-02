@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS watchlist (
     entered_by         TEXT    NOT NULL,
     squeeze_index      REAL,
     accumulation_score REAL,
+    rank_at_entry      INTEGER,
     price_at_entry     REAL,
     range_low          REAL,
     range_high         REAL,
@@ -200,7 +201,28 @@ def connect(path: str = DEFAULT_PATH, *, read_only: bool = False) -> sqlite3.Con
     if not read_only:
         con.executescript(SCHEMA)
         con.commit()
+        _migrate(con)
     return con
+
+
+#: Колонки, добавленные после первого выпуска схемы: таблица, колонка, тип.
+#:
+#: `CREATE TABLE IF NOT EXISTS` существующую таблицу не трогает, а база на
+#: сервере переживает выкладку — значит новую колонку надо дописывать явно,
+#: иначе после деплоя код ждёт поля, которого в файле нет. Пересоздавать
+#: таблицу нельзя: в ней лежат эпизоды, ради истории которых она и заведена.
+MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("watchlist", "rank_at_entry", "INTEGER"),
+)
+
+
+def _migrate(con: sqlite3.Connection) -> None:
+    """Дописать недостающие колонки. Идемпотентно: повторный запуск — no-op."""
+    for table, column, decl in MIGRATIONS:
+        have = {row["name"] for row in con.execute(f"PRAGMA table_info({table})")}
+        if column not in have:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    con.commit()
 
 
 #: Колонки свечи, кроме ключа и источника.
@@ -446,6 +468,28 @@ def latest_scan(
     return [dict(row) for row in rows]
 
 
+def scan_history(
+    con: sqlite3.Connection,
+    symbol: str,
+    tf: str,
+    limit: int = 20,
+    formula_version: str | None = None,
+) -> list[dict[str, Any]]:
+    """История записей скана по паре, свежие сверху.
+
+    Версия формулы по умолчанию текущая: показать в одной таблице индексы,
+    посчитанные по разным формулам, значило бы предложить сравнить
+    несравнимое — ровно то, ради чего версия и попала в ключ журнала.
+    """
+    version = formula_version or SQUEEZE_FORMULA_VERSION
+    rows = con.execute(
+        "SELECT * FROM scan_log WHERE symbol = ? AND tf = ? AND formula_version = ? "
+        "ORDER BY ts_ms DESC LIMIT ?",
+        (symbol.upper(), tf, version, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def open_episodes(con: sqlite3.Connection, tf: str | None = None) -> list[dict[str, Any]]:
     sql = "SELECT * FROM watchlist WHERE exited_at IS NULL"
     params: tuple[Any, ...] = ()
@@ -453,6 +497,52 @@ def open_episodes(con: sqlite3.Connection, tf: str | None = None) -> list[dict[s
         sql += " AND tf = ?"
         params = (tf,)
     return [dict(row) for row in con.execute(sql + " ORDER BY id", params)]
+
+
+#: Что принимает фильтр статуса: два открытых состояния, два закрытых и два
+#: собирательных значения.
+EPISODE_STATUSES = ("candidate", "active", "broken_out", "expired", "closed", "all")
+
+
+def episodes(
+    con: sqlite3.Connection,
+    *,
+    status: str | None = None,
+    tf: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Эпизоды наблюдения для выдачи наружу.
+
+    По умолчанию отдаются только открытые: это рабочий список, ради которого
+    инструмент и нужен. Закрытые запрашиваются явно — тогда видно, чем
+    кончилось, и `exit_reason` перестаёт быть мёртвой колонкой.
+
+    Порядок — по текущему рангу внутри таймфрейма: он и есть порядок внимания.
+    Эпизод без ранга (монета выпала из универсума) уезжает вниз, а не наверх,
+    как случилось бы при NULL в обычной сортировке SQLite.
+    """
+    where: list[str] = []
+    params: list[Any] = []
+    if status is None:
+        where.append("exited_at IS NULL")
+    elif status == "closed":
+        where.append("exited_at IS NOT NULL")
+    elif status != "all":
+        where.append("status = ?")
+        params.append(status)
+    if tf is not None:
+        where.append("tf = ?")
+        params.append(tf)
+
+    sql = "SELECT * FROM watchlist"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += (
+        " ORDER BY exited_at IS NOT NULL, tf, "
+        "CASE WHEN last_rank IS NULL THEN 1 ELSE 0 END, last_rank, id LIMIT ?"
+    )
+    params.append(limit)
+    return [dict(row) for row in con.execute(sql, params)]
 
 
 def open_episode(
@@ -474,11 +564,12 @@ def open_episode(
     scan = scan or {}
     cursor = con.execute(
         "INSERT OR IGNORE INTO watchlist (symbol, tf, status, entered_at, entered_by, "
-        "squeeze_index, price_at_entry, range_low, range_high, last_rank, last_index) "
-        "VALUES (?, ?, 'candidate', ?, ?, ?, ?, ?, ?, ?, ?)",
+        "squeeze_index, rank_at_entry, price_at_entry, range_low, range_high, "
+        "last_rank, last_index) "
+        "VALUES (?, ?, 'candidate', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             symbol, tf, entered_at, entered_by,
-            scan.get("squeeze_index"), scan.get("price"),
+            scan.get("squeeze_index"), rank, scan.get("price"),
             scan.get("range_low"), scan.get("range_high"),
             rank, scan.get("squeeze_index"),
         ),

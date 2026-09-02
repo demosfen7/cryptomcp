@@ -383,3 +383,159 @@ class TestFormulaVersionIsolation:
                 "squeeze_index, closed_through_ms) "
                 "VALUES (1000, 'CAKEUSDT', 'spot', '4h', 'v2', 0.9, 1000)"
             )
+
+
+class TestWatchlistQueries:
+    """Выдача эпизодов наружу: фильтры, порядок и ранг при входе."""
+
+    NOW = 1_756_000_000_000
+
+    def episode(self, con, symbol, tf="4h", *, rank=1, index=0.5, price=100.0):
+        return storage.open_episode(
+            con, symbol, tf, entered_at=self.NOW, entered_by="scanner",
+            scan={"squeeze_index": index, "price": price,
+                  "range_low": price * 0.9, "range_high": price * 1.1},
+            rank=rank,
+        )
+
+    def test_rank_at_entry_survives_touch(self, con):
+        """Ранг входа не должен затираться текущим: их и просят рядом."""
+        episode_id = self.episode(con, "AAAUSDT", rank=3)
+        storage.touch_episode(con, episode_id, rank=27, index=0.31)
+
+        row = storage.episodes(con)[0]
+        assert row["rank_at_entry"] == 3
+        assert row["last_rank"] == 27
+
+    def test_open_only_by_default(self, con):
+        self.episode(con, "AAAUSDT")
+        closed = self.episode(con, "BBBUSDT")
+        storage.close_episode(
+            con, closed, status="broken_out", reason="пробой", ts_ms=self.NOW + 1
+        )
+
+        assert [row["symbol"] for row in storage.episodes(con)] == ["AAAUSDT"]
+        assert len(storage.episodes(con, status="all")) == 2
+        assert [row["symbol"] for row in storage.episodes(con, status="closed")] == [
+            "BBBUSDT"
+        ]
+
+    def test_filters_by_status_and_timeframe(self, con):
+        self.episode(con, "AAAUSDT", tf="4h")
+        self.episode(con, "AAAUSDT", tf="1d")
+
+        assert len(storage.episodes(con, tf="1d")) == 1
+        assert len(storage.episodes(con, status="candidate")) == 2
+        assert storage.episodes(con, status="active") == []
+
+    def test_episode_without_rank_sorts_last(self, con):
+        """Выпавшая из универсума монета не должна всплывать наверх из-за NULL."""
+        lost = self.episode(con, "AAAUSDT", rank=1)
+        storage.touch_episode(con, lost, rank=None, index=None)
+        self.episode(con, "BBBUSDT", rank=9)
+
+        assert [row["symbol"] for row in storage.episodes(con)] == [
+            "BBBUSDT", "AAAUSDT"
+        ]
+
+
+class TestScanHistory:
+    NOW = 1_756_000_000_000
+    STEP = 4 * 3_600_000
+
+    def scan(self, con, symbol, ts, index, version=None):
+        from cryptomcp import SQUEEZE_FORMULA_VERSION
+
+        con.execute(
+            "INSERT OR REPLACE INTO scan_log (ts_ms, symbol, source, tf, "
+            "formula_version, squeeze_index, components, price, closed_through_ms) "
+            "VALUES (?, ?, 'futures', '4h', ?, ?, ?, 100.0, ?)",
+            (ts, symbol, version or SQUEEZE_FORMULA_VERSION, index,
+             '{"volatility": 0.5}', ts),
+        )
+        con.commit()
+
+    def test_newest_first_and_limited(self, con):
+        for i in range(5):
+            self.scan(con, "AAAUSDT", self.NOW + i * self.STEP, 0.10 * i)
+
+        rows = storage.scan_history(con, "aaausdt", "4h", limit=2)
+        assert [row["ts_ms"] for row in rows] == [
+            self.NOW + 4 * self.STEP, self.NOW + 3 * self.STEP
+        ]
+
+    def test_other_formula_version_excluded(self, con):
+        """Индексы разных версий формулы в одной таблице несопоставимы."""
+        self.scan(con, "AAAUSDT", self.NOW, 0.5)
+        self.scan(con, "AAAUSDT", self.NOW + self.STEP, 0.9, version="v0")
+
+        rows = storage.scan_history(con, "AAAUSDT", "4h")
+        assert [row["squeeze_index"] for row in rows] == [0.5]
+
+
+class TestMigration:
+    """Колонка, добавленная после выпуска, на базе с уже накопленной историей.
+
+    CREATE TABLE IF NOT EXISTS существующую таблицу не трогает, а база на
+    сервере переживает выкладку. Без ALTER деплой уронил бы чтение эпизодов, и
+    заметили бы это уже в проде.
+    """
+
+    OLD_SCHEMA = """
+    CREATE TABLE watchlist (
+        id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, tf TEXT NOT NULL,
+        status TEXT NOT NULL, entered_at INTEGER NOT NULL,
+        entered_by TEXT NOT NULL, squeeze_index REAL, accumulation_score REAL,
+        price_at_entry REAL, range_low REAL, range_high REAL,
+        last_rank INTEGER, last_index REAL, exited_at INTEGER, exit_reason TEXT
+    );
+    """
+
+    def old_base(self, tmp_path):
+        """База прошлой выкладки: все таблицы на месте, watchlist без колонки."""
+        path = str(tmp_path / "old.sqlite")
+        con = sqlite3.connect(path)
+        con.executescript(storage.SCHEMA)
+        con.execute("DROP TABLE watchlist")
+        con.executescript(self.OLD_SCHEMA)
+        con.execute(
+            "INSERT INTO watchlist (symbol, tf, status, entered_at, entered_by,"
+            " last_rank) VALUES ('OLDUSDT', '4h', 'active', 1, 'scanner', 5)"
+        )
+        con.commit()
+        con.close()
+        return path
+
+    def test_existing_episodes_survive(self, tmp_path):
+        path = self.old_base(tmp_path)
+        con = storage.connect(path)
+        try:
+            rows = storage.episodes(con)
+            assert [row["symbol"] for row in rows] == ["OLDUSDT"]
+            assert rows[0]["rank_at_entry"] is None
+            assert rows[0]["last_rank"] == 5
+        finally:
+            con.close()
+
+    def test_migration_is_idempotent(self, tmp_path):
+        path = self.old_base(tmp_path)
+        storage.connect(path).close()
+        con = storage.connect(path)
+        try:
+            columns = [
+                row["name"] for row in con.execute("PRAGMA table_info(watchlist)")
+            ]
+            assert columns.count("rank_at_entry") == 1
+        finally:
+            con.close()
+
+    def test_read_only_base_without_column_still_renders(self, tmp_path):
+        """Сервер может открыть базу раньше, чем сборщик её дополнит."""
+        from cryptomcp.collector import watchlist_view
+
+        path = self.old_base(tmp_path)
+        con = storage.connect(path, read_only=True)
+        try:
+            assert "OLDUSDT" in watchlist_view(con)
+        finally:
+            con.close()

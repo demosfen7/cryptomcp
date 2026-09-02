@@ -242,3 +242,106 @@ class TestSkippedTimeframes:
             live_price=100.5, change_24h=1.0, quote_volume_24h=1e9, now_ms=4 * H4,
         )
         assert "недоступные ТФ" not in text
+
+
+class TestWatchlistRender:
+    """Выдача списка наблюдения: чего в ней не должно быть видно неправильно."""
+
+    NOW = 1_788_393_600_000
+    H4 = 4 * 3_600_000
+
+    def episode(self, **over):
+        row = {
+            "symbol": "BTCUSDT", "tf": "4h", "status": "active",
+            "entered_at": self.NOW - 2 * 86_400_000, "entered_by": "scanner",
+            "squeeze_index": 0.41, "accumulation_score": None,
+            "rank_at_entry": 7, "price_at_entry": 90123.45,
+            "last_rank": 3, "last_index": 0.47,
+            "exited_at": None, "exit_reason": None,
+        }
+        row.update(over)
+        return row
+
+    def render(self, rows, scans=None):
+        from cryptomcp.render import render_watchlist
+
+        return render_watchlist(rows, scans or {}, now_ms=self.NOW)
+
+    def test_empty_says_so(self):
+        assert self.render([]) == "список наблюдения пуст"
+
+    def test_high_price_keeps_its_order_of_magnitude(self):
+        """Формат %.6g обрезал бы 90123.45 до 90123.4 — разряд важнее знака."""
+        assert "90123.45" in self.render([self.episode()])
+
+    def test_rank_shows_entry_and_current(self):
+        assert "7→3" in self.render([self.episode()])
+
+    def test_missing_rank_is_dash_not_zero(self):
+        """У ручной записи ранга при входе не было; ноль читался бы как «первый»."""
+        text = self.render([self.episode(rank_at_entry=None, entered_by="manual")])
+        assert "—→3" in text
+
+    def test_accumulation_prints_na_while_not_measured(self):
+        """Пусто в колонке — «не измерено», а не «признака нет»."""
+        assert "n/a" in self.render([self.episode()])
+
+    def test_closed_episode_stops_aging_and_shows_reason(self):
+        row = self.episode(
+            status="broken_out", exited_at=self.NOW - 86_400_000,
+            exit_reason="пробой диапазона входа",
+        )
+        text = self.render([row])
+        assert "пробой диапазона входа" in text
+        # Вошёл двое суток назад, вышел сутки назад — эпизод прожил ровно сутки.
+        assert " 1.0  scanner" in text
+
+    def test_move_counted_from_entry_price(self):
+        scans = {("BTCUSDT", "4h"): {"price": 99135.795, "narrow_bars": 4}}
+        text = self.render([self.episode()], scans)
+        assert "+10.0%" in text
+        assert "    4" in text
+
+
+class TestScanHistoryRender:
+    NOW = 1_788_393_600_000
+
+    def row(self, **over):
+        row = {
+            "ts_ms": self.NOW + 900_000, "symbol": "HOMEUSDT", "tf": "4h",
+            "squeeze_index": 0.64,
+            "components": (
+                '{"volatility": 0.59, "range": 0.62, "volume": 0.59, '
+                '"divergence": 1.0}'
+            ),
+            "excluded": '["value_area"]', "price": 0.005929,
+            "range_width_pct": 12.86, "narrow_bars": 26,
+            "bbw_pct_rank": 69.0, "volume_ratio": 0.83,
+            "closed_through_ms": self.NOW - 1,
+        }
+        row.update(over)
+        return row
+
+    def render(self, rows):
+        from cryptomcp.render import render_scan_history
+
+        return render_scan_history("HOMEUSDT", "4h", rows, "v3")
+
+    def test_empty_explains_why(self):
+        assert "записей скана нет" in self.render([])
+
+    def test_candle_boundary_not_last_millisecond(self):
+        """closed_through_ms — конец свечи: печатать надо границу, а не 23:59."""
+        import datetime as dt
+
+        expected = dt.datetime.fromtimestamp(self.NOW / 1000, dt.UTC)
+        text = self.render([self.row()])
+        assert expected.strftime("%Y-%m-%d %H:%M") in text
+        assert "23:59" not in text
+
+    def test_excluded_group_is_dash_not_zero(self):
+        """Ноль в группе означал бы «признака нет», а не «не измерили»."""
+        line = self.render([self.row()]).splitlines()[2]
+        groups = line[24:59]  # пять колонок по 7 знаков после времени и индекса
+        assert groups.count("—") == 1
+        assert "0.00" not in groups
