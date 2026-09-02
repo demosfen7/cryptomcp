@@ -1,4 +1,8 @@
-"""HTTP-клиент к Binance USDⓈ-M Futures (PLAN §6.4, §6.6).
+"""HTTP-клиент к публичным рыночным данным Binance (PLAN §6.4, §6.6).
+
+Один класс на оба рынка: различия фьючерсов и спота — хост, префикс пути,
+веса и потолок свечей в ответе — описаны данными в markets.py. Логика запроса,
+бюджет веса, ретраи и часы биржи от рынка не зависят.
 
 Только публичные рыночные данные. Ни одного API-ключа в проекте нет и не
 предполагается — все подписанные эндпоинты требуют ключ, поэтому торговые
@@ -14,9 +18,8 @@ from typing import Any
 import httpx
 
 from .errors import ErrorKind, ToolError, bad_params, unknown_symbol
-from .ratelimit import WeightBudget, klines_weight
-
-BASE_URL = "https://fapi.binance.com"
+from .markets import FUTURES, Market
+from .ratelimit import WeightBudget
 
 #: Одновременных запросов к бирже. Последовательный scan_pairs занимал бы
 #: минуты, неограниченно параллельный уводит в 418 (PLAN §6.4).
@@ -61,20 +64,23 @@ class _TTLCache:
         self._data.clear()
 
 
-class BinanceFuturesClient:
+class BinanceClient:
     """Асинхронный клиент с бюджетом веса, семафором и учётом Retry-After."""
 
     def __init__(
         self,
-        base_url: str = BASE_URL,
+        market: Market = FUTURES,
         *,
+        base_url: str | None = None,
         concurrency: int = DEFAULT_CONCURRENCY,
         budget: WeightBudget | None = None,
         timeout: float = 20.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self._budget = budget or WeightBudget()
+        self.market = market
+        self.base_url = (base_url or market.base_url).rstrip("/")
+        # Пулы веса у рынков раздельные: 2400/мин у фьючерсов, 6000 у спота.
+        self._budget = budget or WeightBudget(market.weight_limit)
         self._sem = asyncio.Semaphore(concurrency)
         self._cache = _TTLCache()
         self._http = httpx.AsyncClient(
@@ -92,7 +98,7 @@ class BinanceFuturesClient:
         # запросы отклоняются локально — ретраи продлевают бан.
         self._banned_until: float = 0.0
 
-    async def __aenter__(self) -> BinanceFuturesClient:
+    async def __aenter__(self) -> BinanceClient:
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -104,7 +110,7 @@ class BinanceFuturesClient:
     # -- время биржи --------------------------------------------------------
 
     async def server_time_ms(self) -> int:
-        data = await self._request("/fapi/v1/time", weight=1, cache_ttl_s=0)
+        data = await self._request(self.market.path("time"), weight=1, cache_ttl_s=0)
         return int(data["serverTime"])
 
     async def sync_clock(self) -> int:
@@ -226,8 +232,7 @@ class BinanceFuturesClient:
                 retry_after_s=remaining,
             )
 
-    @staticmethod
-    def _client_error(response: httpx.Response, params: dict[str, Any]) -> ToolError:
+    def _client_error(self, response: httpx.Response, params: dict[str, Any]) -> ToolError:
         try:
             payload = response.json()
             code = int(payload.get("code", 0))
@@ -236,7 +241,7 @@ class BinanceFuturesClient:
             code, msg = 0, response.text[:200]
 
         if code in _UNKNOWN_SYMBOL_CODES:
-            return unknown_symbol(str(params.get("symbol", "?")))
+            return unknown_symbol(str(params.get("symbol", "?")), self.market.name)
         if code in _BAD_PARAM_CODES:
             return bad_params(f"Binance отклонил параметры: {msg}", code=code, **params)
         return ToolError(
@@ -257,10 +262,14 @@ class BinanceFuturesClient:
         end_time: int | None = None,
         cache_ttl_s: float = 0.0,
     ) -> list[list[Any]]:
-        if not 1 <= limit <= 1500:
-            raise bad_params(f"limit={limit} вне диапазона 1..1500", limit=limit)
+        top = self.market.max_limit
+        if not 1 <= limit <= top:
+            raise bad_params(
+                f"limit={limit} вне диапазона 1..{top} для рынка {self.market.name}",
+                limit=limit,
+            )
         return await self._request(
-            "/fapi/v1/klines",
+            self.market.path("klines"),
             params={
                 "symbol": symbol.upper(),
                 "interval": interval,
@@ -268,21 +277,26 @@ class BinanceFuturesClient:
                 "startTime": start_time,
                 "endTime": end_time,
             },
-            weight=klines_weight(limit),
+            weight=self.market.klines_weight(limit),
             cache_ttl_s=cache_ttl_s,
         )
 
     async def exchange_info(self) -> dict[str, Any]:
         # tickSize и статус символов меняются редко (PLAN §6.3).
         return await self._request(
-            "/fapi/v1/exchangeInfo", weight=1, cache_ttl_s=24 * 3600
+            self.market.path("exchangeInfo"),
+            weight=self.market.exchange_info_weight,
+            cache_ttl_s=24 * 3600,
         )
 
     async def ticker_24hr(self, symbol: str | None = None) -> Any:
         return await self._request(
-            "/fapi/v1/ticker/24hr",
+            self.market.path("ticker/24hr"),
             params={"symbol": symbol.upper() if symbol else None},
-            weight=1 if symbol else 40,
+            weight=(
+                self.market.ticker_one_weight if symbol
+                else self.market.ticker_all_weight
+            ),
             cache_ttl_s=30,
         )
 

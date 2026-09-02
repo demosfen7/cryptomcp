@@ -10,11 +10,12 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from .client import BinanceFuturesClient
+from .client import BinanceClient
 from .errors import insufficient_history
 from .series import Series, build_series, interval_ms
 
-#: Максимум свечей в одном ответе /fapi/v1/klines.
+#: Максимум свечей в одном ответе по умолчанию. Фактический потолок берётся у
+#: рынка: у фьючерсов 1500, у спота 1000 (спот молча обрезает запрос сверх).
 MAX_LIMIT = 1500
 
 #: Потолок числа страниц при догрузке истории. Ограничивает и вес (страница
@@ -40,16 +41,16 @@ def cache_ttl_for(interval: str) -> float:
     return max(_TTL_FLOOR_S, min(_TTL_CAP_S, seconds * _TTL_FRACTION))
 
 
-def pages_needed(interval: str, span_days: float) -> int:
-    """Сколько страниц по 1500 свечей нужно, чтобы покрыть span_days."""
+def pages_needed(interval: str, span_days: float, max_limit: int = MAX_LIMIT) -> int:
+    """Сколько страниц по max_limit свечей нужно, чтобы покрыть span_days."""
     candles = span_days * 86_400_000 / interval_ms(interval)
-    return max(1, -(-int(candles) // MAX_LIMIT))
+    return max(1, -(-int(candles) // max_limit))
 
 
 class CandleFetcher:
     """Отдаёт ряды закрытых свечей, скрывая кэш, пагинацию и часы биржи."""
 
-    def __init__(self, client: BinanceFuturesClient) -> None:
+    def __init__(self, client: BinanceClient) -> None:
         self._client = client
         self._cache: dict[Any, tuple[float, Series]] = {}
 
@@ -75,8 +76,8 @@ class CandleFetcher:
         на 1h и 15m: одной страницы там хватает лишь на 62 и 15 суток
         соответственно, а правилу §4.2 нужно 60.
 
-        Пагинация не бесплатна: страница на 1500 свечей стоит 10 единиц веса.
-        Поэтому пакетные инструменты вроде scan_pairs её не запрашивают.
+        Пагинация не бесплатна: у фьючерсов полная страница стоит 10 единиц
+        веса. Поэтому пакетные инструменты вроде scan_pairs её не запрашивают.
         """
         interval_ms(interval)  # ранняя валидация с понятным сообщением
         symbol = symbol.upper()
@@ -119,8 +120,11 @@ class CandleFetcher:
         # него, не должно попадать в расчёт даже как незакрытая свеча.
         effective_now = min(as_of_ms, now_ms) if as_of_ms is not None else now_ms
 
-        page_limit = MAX_LIMIT if target_span_days else limit
-        pages_left = pages_needed(interval, target_span_days) if target_span_days else 1
+        top = self._client.market.max_limit
+        page_limit = top if target_span_days else min(limit, top)
+        pages_left = (
+            pages_needed(interval, target_span_days, top) if target_span_days else 1
+        )
         pages_left = min(pages_left, max_pages)
 
         rows: list[list[Any]] = []

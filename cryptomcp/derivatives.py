@@ -15,7 +15,7 @@ from typing import Literal
 
 import numpy as np
 
-from .client import BinanceFuturesClient
+from .client import BinanceClient
 from .indicators import Metric, with_percentile
 
 HOURS_PER_YEAR = 24 * 365
@@ -179,7 +179,7 @@ def classify_price_oi(
 class DerivativesReader:
     """Собирает фандинг и открытый интерес по символу."""
 
-    def __init__(self, client: BinanceFuturesClient) -> None:
+    def __init__(self, client: BinanceClient) -> None:
         self._client = client
         self._intervals: dict[str, int] | None = None
 

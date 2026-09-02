@@ -20,6 +20,7 @@ from .derivatives import Funding, OpenInterest
 from .errors import ErrorKind, ToolError
 from .indicators import Metric
 from .levels import Level, Pivots
+from .markets import FUTURES, Market
 from .series import Series
 from .symbols import SymbolInfo, format_price
 from .volume import MIN_SAMPLES_PER_SLOT, baseline_series
@@ -125,6 +126,7 @@ def render_snapshot(
     as_of_ms: int | None = None,
     skipped: dict[str, ToolError] | None = None,
     order: tuple[str, ...] | None = None,
+    market: Market = FUTURES,
 ) -> str:
     """Уровень L1: общая картина, 20–25 строк.
 
@@ -135,14 +137,21 @@ def render_snapshot(
     precision = info.price_precision
     lines: list[str] = []
 
-    head = f"{info.symbol}.P (USDⓈ-M perp) · цена {format_price(live_price, precision)}"
+    head = (
+        f"{info.symbol}{market.suffix} ({market.label}) · "
+        f"цена {format_price(live_price, precision)}"
+    )
     if as_of_ms is None:
         head += f" (live {utc(now_ms)} UTC)"
     else:
         head += f" (состояние на {utc(as_of_ms)} UTC)"
     lines.append(head)
+    turnover = (
+        f"{quote_volume_24h / 1e9:.2f}B" if quote_volume_24h >= 1e9
+        else f"{quote_volume_24h / 1e6:.1f}M"
+    )
     lines.append(
-        f"24h {change_24h:+.2f}% · оборот {quote_volume_24h / 1e9:.2f}B USDT · "
+        f"24h {change_24h:+.2f}% · оборот {turnover} USDT · "
         f"метрики по ЗАКРЫТЫМ свечам"
     )
     lines.append("")
@@ -219,6 +228,12 @@ def render_snapshot(
     if funding or open_interest:
         lines.append("")
         lines.append(render_derivatives(funding, open_interest, precision=precision))
+    elif not market.has_derivatives:
+        lines.append("")
+        lines.append(
+            "фандинга и открытого интереса у спота не существует — "
+            "смотреть по фьючерсу (get_derivatives)"
+        )
 
     lines.append("")
     lines.append("согласованность ТФ: " + " · ".join(
@@ -368,7 +383,9 @@ def render_squeeze_metrics(view: TimeframeView, threshold_pct: float) -> str:
     return "\n".join(lines)
 
 
-def render_klines(series: Series, info: SymbolInfo, limit: int) -> str:
+def render_klines(
+    series: Series, info: SymbolInfo, limit: int, *, market: Market = FUTURES
+) -> str:
     """Уровень L3: сырые закрытые свечи с производными по каждой."""
     tail = series.tail(limit)
     precision = info.price_precision
@@ -383,7 +400,8 @@ def render_klines(series: Series, info: SymbolInfo, limit: int) -> str:
     samples = baseline.samples[offset:]
 
     lines = [
-        f"{info.symbol} {series.interval} · последние {len(tail)} ЗАКРЫТЫХ свечей · "
+        f"{info.symbol}{market.suffix} ({market.label}) {series.interval} · "
+        f"последние {len(tail)} ЗАКРЫТЫХ свечей · "
         f"время UTC · объём в USDT",
         f"{'время':<17}{'open':>12}{'high':>12}{'low':>12}{'close':>12}"
         f"{'тело%':>8}{'верх%':>7}{'низ%':>7}{'объём':>8}{'takerB':>7}",

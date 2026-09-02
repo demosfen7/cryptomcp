@@ -63,11 +63,20 @@ class ToolError(Exception):
         return payload
 
 
-def unknown_symbol(symbol: str) -> ToolError:
+def unknown_symbol(symbol: str, market: str = "futures") -> ToolError:
+    """Символа нет на этом рынке — но, возможно, есть на соседнем.
+
+    Списки не совпадают в обе стороны: UAIUSDT торгуется перпетуалом и не
+    торгуется на споте, а спотовых пар без фьючерса ещё больше. Подсказка про
+    второй рынок избавляет от вывода «монеты нет на Binance».
+    """
+    other = "spot" if market == "futures" else "futures"
     return ToolError(
         ErrorKind.UNKNOWN_SYMBOL,
-        f"Символ {symbol!r} не найден среди USDⓈ-M перпетуалов Binance Futures.",
-        details={"symbol": symbol},
+        f"Символ {symbol!r} не найден на рынке {market} Binance. "
+        f"Часть монет есть только на одном из рынков — попробовать "
+        f"market={other!r}.",
+        details={"symbol": symbol, "market": market},
     )
 
 

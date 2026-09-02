@@ -15,13 +15,13 @@ __version__ = "0.1.0"
 #: после первой калибровки весов история станет несопоставимой (PLAN §4.11).
 SQUEEZE_FORMULA_VERSION = "v1"
 
-from .client import BinanceFuturesClient  # noqa: E402
+from .client import BinanceClient  # noqa: E402
 from .errors import ErrorKind, ToolError  # noqa: E402
 from .fetcher import CandleFetcher  # noqa: E402
 from .series import Series, build_series, interval_ms  # noqa: E402
 
 __all__ = [
-    "BinanceFuturesClient",
+    "BinanceClient",
     "CandleFetcher",
     "ErrorKind",
     "SQUEEZE_FORMULA_VERSION",

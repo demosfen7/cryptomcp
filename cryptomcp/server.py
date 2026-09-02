@@ -20,13 +20,14 @@ import sys
 from mcp.server.mcpserver import MCPServer
 
 from .analysis import MIN_CANDLES, TimeframeView, analyse_timeframe, weekly_pivots_from
-from .client import BinanceFuturesClient
+from .client import BinanceClient
 from .config import Config
 from .derivatives import DerivativesReader
 from .errors import ToolError, bad_params
 from .fetcher import CandleFetcher
 from .indicators import MIN_PERCENTILE_SPAN_DAYS
 from .journal import Journal
+from .markets import MARKETS, Market
 from .render import (
     closed_through,
     render_derivatives,
@@ -60,6 +61,11 @@ server = MCPServer(
         "3) get_klines — сырые свечи, когда нужно увидеть ФОРМУ "
         "(последовательность экстремумов, отбои от уровня), которую агрегаты "
         "не показывают.\n\n"
+        "Каждый инструмент работает и по фьючерсам (market=\"futures\", по "
+        "умолчанию), и по споту (market=\"spot\"). Перпетуал ценово производен "
+        "от спота: когда открытый интерес мал и сигналы шумные, подтверждение "
+        "объёмом стоит проверять на споте. Деривативов у спота нет, и списки "
+        "символов у рынков не совпадают в обе стороны.\n\n"
         "Все метрики считаются по ЗАКРЫТЫМ свечам. Числа сопровождаются базой "
         "сравнения; где базы не хватило, честно стоит n/a — это не сбой.\n"
         "Инструменты не предсказывают направление и не дают рекомендаций: "
@@ -67,16 +73,32 @@ server = MCPServer(
     ),
 )
 
-_client: BinanceFuturesClient | None = None
+#: Клиент на рынок: у фьючерсов и спота разные хосты и раздельные пулы веса,
+#: поэтому и бюджеты должны быть разными объектами.
+_clients: dict[str, BinanceClient] = {}
 _lock = asyncio.Lock()
 
 
-async def _ctx() -> tuple[BinanceFuturesClient, CandleFetcher, SymbolRegistry, DerivativesReader]:
-    global _client
+def _market(name: str) -> Market:
+    market = MARKETS.get(name)
+    if market is None:
+        raise bad_params(
+            f"Неизвестный рынок {name!r}. Доступны: {', '.join(MARKETS)}",
+            market=name,
+        )
+    return market
+
+
+async def _ctx(
+    market_name: str = "futures",
+) -> tuple[BinanceClient, CandleFetcher, SymbolRegistry, DerivativesReader | None, Market]:
+    market = _market(market_name)
     async with _lock:
-        if _client is None:
-            _client = BinanceFuturesClient()
-    return _client, CandleFetcher(_client), SymbolRegistry(_client), DerivativesReader(_client)
+        client = _clients.get(market.name)
+        if client is None:
+            client = _clients[market.name] = BinanceClient(market)
+    derivatives = DerivativesReader(client) if market.has_derivatives else None
+    return client, CandleFetcher(client), SymbolRegistry(client), derivatives, market
 
 
 def _fail(error: ToolError) -> str:
@@ -106,6 +128,7 @@ async def _views(
     timeframes: tuple[str, ...],
     as_of_ms: int | None,
     *,
+    market: str = "futures",
     paginate: bool = True,
 ) -> tuple[dict[str, TimeframeView], dict[str, ToolError]]:
     """Разбор по таймфреймам, устойчивый к нехватке истории на отдельном ТФ.
@@ -139,7 +162,7 @@ async def _views(
         except ToolError as error:
             skipped[interval] = error
             continue
-        journal.record(symbol, view, as_of_ms=as_of_ms)
+        journal.record(symbol, view, market=market, as_of_ms=as_of_ms)
         views[interval] = view
 
     if not views:
@@ -154,24 +177,30 @@ async def _views(
         "таймфреймов, положение в диапазоне, RSI, ATR, объём с поправкой на "
         "время суток, ближайшие уровни и недельные пивоты, фандинг и открытый "
         "интерес, squeeze_index. Начинать разбор отсюда. По умолчанию "
-        "1w/1d/4h/1h/15m; 5m и 1m доступны, но запрашиваются явно."
+        "1w/1d/4h/1h/15m; 5m и 1m доступны, но запрашиваются явно. "
+        "Параметр market: futures (перпетуал, по умолчанию) или spot. Спот "
+        "нужен, когда перпетуал тонкий: подтверждение пробоя объёмом честнее "
+        "искать там, где происходит поставка. Деривативов у спота нет."
     )
 )
 async def get_market_snapshot(
     symbol: str,
     timeframes: list[str] | None = None,
     as_of_ms: int | None = None,
+    market: str = "futures",
 ) -> str:
     try:
-        client, fetcher, registry, derivatives = await _ctx()
+        client, fetcher, registry, derivatives, mkt = await _ctx(market)
         info = await registry.get(symbol)
         intervals = _validate_timeframes(timeframes)
 
-        views, skipped = await _views(fetcher, info.symbol, intervals, as_of_ms)
+        views, skipped = await _views(
+            fetcher, info.symbol, intervals, as_of_ms, market=mkt.name
+        )
         ticker = await client.ticker_24hr(info.symbol)
 
         funding = oi = None
-        if as_of_ms is None:
+        if derivatives is not None and as_of_ms is None:
             # Деривативы существуют только «сейчас»: восстановить их состояние
             # на историческую дату биржа не даёт.
             funding = await derivatives.funding(info.symbol)
@@ -193,6 +222,7 @@ async def get_market_snapshot(
             as_of_ms=as_of_ms,
             skipped=skipped,
             order=intervals,
+            market=mkt,
         )
     except ToolError as error:
         return _fail(error)
@@ -204,22 +234,29 @@ async def get_market_snapshot(
         "число с базой сравнения: волатильность (BBW, ATR), объём (сезонная "
         "поправка, затухание, бары набора позиции, доля тейкер-покупок), "
         "диапазон и его длительность, объёмный профиль, дивергенции RSI. "
-        "Вызывать, когда снапшот показал, куда смотреть."
+        "Вызывать, когда снапшот показал, куда смотреть. Параметр market: "
+        "futures (по умолчанию) или spot."
     )
 )
 async def get_squeeze_metrics(
     symbol: str,
     timeframe: str = "4h",
     as_of_ms: int | None = None,
+    market: str = "futures",
 ) -> str:
     try:
-        _, fetcher, registry, _ = await _ctx()
+        _, fetcher, registry, _, mkt = await _ctx(market)
         info = await registry.get(symbol)
         interval = _validate_timeframes([timeframe])[0]
 
-        views, _ = await _views(fetcher, info.symbol, (interval,), as_of_ms)
+        views, _ = await _views(
+            fetcher, info.symbol, (interval,), as_of_ms, market=mkt.name
+        )
         view = views[interval]
-        return render_squeeze_metrics(view, config.range_threshold(interval))
+        return (
+            f"{info.symbol}{mkt.suffix} ({mkt.label})\n\n"
+            + render_squeeze_metrics(view, config.range_threshold(interval))
+        )
     except ToolError as error:
         return _fail(error)
 
@@ -232,7 +269,8 @@ async def get_squeeze_metrics(
         "доля тейкер-покупок. Нужен, "
         "когда важна ФОРМА, которую агрегаты не передают: последовательность "
         "экстремумов, сужение подходов к уровню, характер отбоев. Это не "
-        "запасной вариант, а полноправный третий уровень."
+        "запасной вариант, а полноправный третий уровень. Параметр market: "
+        "futures (по умолчанию) или spot."
     )
 )
 async def get_klines(
@@ -240,9 +278,10 @@ async def get_klines(
     timeframe: str = "4h",
     limit: int = 30,
     as_of_ms: int | None = None,
+    market: str = "futures",
 ) -> str:
     try:
-        _, fetcher, registry, _ = await _ctx()
+        _, fetcher, registry, _, mkt = await _ctx(market)
         info = await registry.get(symbol)
         interval = _validate_timeframes([timeframe])[0]
         if not 1 <= limit <= MAX_RAW_KLINES:
@@ -255,7 +294,7 @@ async def get_klines(
         series = await fetcher.get(
             info.symbol, interval, limit=max(limit, 500), as_of_ms=as_of_ms
         )
-        return render_klines(series, info, limit)
+        return render_klines(series, info, limit, market=mkt)
     except ToolError as error:
         return _fail(error)
 
@@ -265,25 +304,30 @@ async def get_klines(
         "Уровни поддержки и сопротивления: кластеры swing-экстремумов с числом "
         "касаний, недельные и дневные пивоты, POC и Value Area. Все расстояния "
         "и в процентах, и в ATR. Когда цена стоит вплотную к уровню, "
-        "показывается и следующий за ним."
+        "показывается и следующий за ним. Параметр market: futures "
+        "(по умолчанию) или spot."
     )
 )
 async def get_key_levels(
     symbol: str,
     timeframe: str = "4h",
     as_of_ms: int | None = None,
+    market: str = "futures",
 ) -> str:
     try:
-        _, fetcher, registry, _ = await _ctx()
+        _, fetcher, registry, _, mkt = await _ctx(market)
         info = await registry.get(symbol)
         interval = _validate_timeframes([timeframe])[0]
 
-        views, _ = await _views(fetcher, info.symbol, (interval,), as_of_ms)
+        views, _ = await _views(
+            fetcher, info.symbol, (interval,), as_of_ms, market=mkt.name
+        )
         view = views[interval]
         precision = info.price_precision
 
         lines = [
-            f"{info.symbol} {interval} · цена {format_price(view.price, precision)} "
+            f"{info.symbol}{mkt.suffix} ({mkt.label}) {interval} · "
+            f"цена {format_price(view.price, precision)} "
             f"— закрытие свечи на {closed_through(view)} UTC, не live "
             f"(в снапшоте цена live, и числа расходятся)",
             f"ATR {format_price(view.atr_value, precision)} ({view.atr_pct:.2f}%)",
@@ -319,10 +363,12 @@ async def get_key_levels(
 )
 async def get_derivatives(symbol: str) -> str:
     try:
-        _, _, registry, derivatives = await _ctx()
+        # Фандинга и открытого интереса у спота не существует: инструмент
+        # всегда работает по фьючерсам, параметра market у него нет.
+        _, _, registry, derivatives, _ = await _ctx("futures")
         info = await registry.get(symbol)
-        funding = await derivatives.funding(info.symbol)
-        oi = await derivatives.open_interest(info.symbol)
+        funding = await derivatives.funding(info.symbol)  # type: ignore[union-attr]
+        oi = await derivatives.open_interest(info.symbol)  # type: ignore[union-attr]
         return f"{info.symbol}\n\n" + render_derivatives(
             funding, oi, history=True, precision=info.price_precision
         )
@@ -335,12 +381,15 @@ async def get_derivatives(symbol: str) -> str:
         "Пакетное сканирование списка пар по squeeze_index на одном "
         "таймфрейме, по строке на монету. Пагинация истории отключена ради "
         "веса запросов, поэтому на младших таймфреймах часть перцентилей будет "
-        "недоступна — для разбора конкретной пары вызывать get_squeeze_metrics."
+        "недоступна — для разбора конкретной пары вызывать get_squeeze_metrics. "
+        "Параметр market: futures (по умолчанию) или spot."
     )
 )
-async def scan_pairs(symbols: list[str], timeframe: str = "4h") -> str:
+async def scan_pairs(
+    symbols: list[str], timeframe: str = "4h", market: str = "futures"
+) -> str:
     try:
-        _, fetcher, registry, _ = await _ctx()
+        _, fetcher, registry, _, mkt = await _ctx(market)
         interval = _validate_timeframes([timeframe])[0]
         if not symbols:
             raise bad_params("Список symbols пуст")
@@ -356,7 +405,7 @@ async def scan_pairs(symbols: list[str], timeframe: str = "4h") -> str:
                     info.symbol, interval, limit=500, min_candles=MIN_CANDLES
                 )
                 view = analyse_timeframe(series, config)
-                journal.record(info.symbol, view)
+                journal.record(info.symbol, view, market=mkt.name)
                 index = view.squeeze_index if view.squeeze_index is not None else -1.0
                 bbw = (
                     f"{view.bbw.pct_rank:>3.0f}" if view.bbw.has_context else "n/a"
@@ -372,7 +421,7 @@ async def scan_pairs(symbols: list[str], timeframe: str = "4h") -> str:
 
         rows.sort(key=lambda item: -item[0])
         lines = [
-            f"{interval} · сортировка по squeeze_index",
+            f"{interval} · {mkt.label} · сортировка по squeeze_index",
             f"{'символ':<14}{'индекс':>6}{'BBW':>7}{'диап':>9}"
             f"{'узк':>6}{'объём':>9}  EMA/структура",
         ]
@@ -392,29 +441,35 @@ async def scan_pairs(symbols: list[str], timeframe: str = "4h") -> str:
 
 @server.tool(
     description=(
-        "Список торгуемых USDⓈ-M перпетуалов по обороту за сутки, со "
-        "стейблкоин-парами, исключёнными из выдачи. Нужен, чтобы получить "
-        "список для scan_pairs."
+        "Список торгуемых пар к USDT по обороту за сутки, со стейблкоин-парами, "
+        "исключёнными из выдачи. Нужен, чтобы получить список для scan_pairs. "
+        "Параметр market: futures (только бессрочные контракты, по умолчанию) "
+        "или spot."
     )
 )
-async def list_symbols(min_quote_volume_usdt: float = 50_000_000, limit: int = 50) -> str:
+async def list_symbols(
+    min_quote_volume_usdt: float = 50_000_000,
+    limit: int = 50,
+    market: str = "futures",
+) -> str:
     try:
-        client, _, registry, _ = await _ctx()
-        perpetuals = {info.symbol for info in await registry.tradable_perpetuals()}
+        client, _, registry, _, mkt = await _ctx(market)
+        tradable = {info.symbol for info in await registry.tradable()}
         tickers = await client.ticker_24hr()
 
         rows = [
             (float(row["quoteVolume"]), row["symbol"], float(row["priceChangePercent"]))
             for row in tickers
-            if row["symbol"] in perpetuals
+            if row["symbol"] in tradable
             and float(row["quoteVolume"]) >= min_quote_volume_usdt
         ]
         rows.sort(reverse=True)
         rows = rows[:limit]
 
+        kind = "перпетуалов" if mkt.has_derivatives else "спотовых пар"
         lines = [
-            f"торгуемых перпетуалов с оборотом ≥ {min_quote_volume_usdt / 1e6:.0f}M USDT: "
-            f"{len(rows)}",
+            f"{mkt.label} · торгуемых {kind} с оборотом "
+            f"≥ {min_quote_volume_usdt / 1e6:.0f}M USDT: {len(rows)}",
             f"{'символ':<14}{'оборот 24ч':>14}{'24ч %':>9}",
         ]
         lines += [

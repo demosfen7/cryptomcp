@@ -33,6 +33,7 @@ class Journal:
         symbol: str,
         view: Any,
         *,
+        market: str = "futures",
         as_of_ms: int | None = None,
         extra: dict[str, Any] | None = None,
     ) -> None:
@@ -48,6 +49,10 @@ class Journal:
         entry = {
             "ts_ms": int(time.time() * 1000),
             "symbol": symbol,
+            # Без рынка спотовые и фьючерсные записи по одному символу
+            # смешаются, и калибровка весов пойдёт по мешанине из двух разных
+            # инструментов. formula_version их не различает.
+            "market": market,
             "interval": view.interval,
             "formula_version": SQUEEZE_FORMULA_VERSION,
             "squeeze_index": view.squeeze_index,

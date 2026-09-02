@@ -1,0 +1,92 @@
+"""Рынки Binance: фьючерсы и спот (расширение ТЗ, открытый вопрос №1).
+
+Перпетуал ценово производен от спота, и подтверждение пробоя объёмом логично
+искать там, где происходит поставка. Плюс часть монет на фьючерсах либо тонкая,
+либо не торгуется вовсе: UAIUSDT есть на фьючерсах и нет на споте, обратных
+случаев ещё больше.
+
+Различия между рынками — данные, а не логика: те же свечи из двенадцати полей,
+те же индикаторы поверх. Поэтому здесь описание рынка, а не второй клиент.
+
+Все значения проверены запросами 02.09.2026, а не взяты из документации:
+
+| | futures | spot |
+|---|---|---|
+| хост | fapi.binance.com | api.binance.com |
+| префикс | /fapi/v1 | /api/v3 |
+| лимит веса на IP | 2400/мин | 6000/мин |
+| вес klines | 1/2/5/10 по limit | **2 при любом limit** |
+| максимум свечей за запрос | 1500 | **1000** (limit=1500 молча вернул 1000) |
+| вес exchangeInfo | 1 | **20** |
+| вес ticker/24hr | 1 / 40 | 2 / 80 |
+| деривативы | есть | нет |
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass, field
+
+from .ratelimit import klines_weight as futures_klines_weight
+
+
+def _spot_klines_weight(limit: int) -> int:
+    """У спота вес klines не зависит от limit — проверено на 3 и на 1000."""
+    return 2
+
+
+@dataclass(frozen=True)
+class Market:
+    """Всё, чем один рынок Binance отличается от другого."""
+
+    name: str
+    base_url: str
+    prefix: str
+    #: Максимум свечей в одном ответе. Спот молча обрезает до 1000.
+    max_limit: int
+    #: Лимит веса на IP в минуту. Пулы у рынков раздельные.
+    weight_limit: int
+    exchange_info_weight: int
+    ticker_one_weight: int
+    ticker_all_weight: int
+    #: Как рынок называется в выдаче и что дописывается к символу.
+    label: str
+    suffix: str
+    has_derivatives: bool
+    klines_weight: Callable[[int], int] = field(compare=False)
+
+    def path(self, endpoint: str) -> str:
+        return f"{self.prefix}/{endpoint}"
+
+
+FUTURES = Market(
+    name="futures",
+    base_url="https://fapi.binance.com",
+    prefix="/fapi/v1",
+    max_limit=1500,
+    weight_limit=2400,
+    exchange_info_weight=1,
+    ticker_one_weight=1,
+    ticker_all_weight=40,
+    label="USDⓈ-M perp",
+    suffix=".P",
+    has_derivatives=True,
+    klines_weight=futures_klines_weight,
+)
+
+SPOT = Market(
+    name="spot",
+    base_url="https://api.binance.com",
+    prefix="/api/v3",
+    max_limit=1000,
+    weight_limit=6000,
+    exchange_info_weight=20,
+    ticker_one_weight=2,
+    ticker_all_weight=80,
+    label="спот",
+    suffix="",
+    has_derivatives=False,
+    klines_weight=_spot_klines_weight,
+)
+
+MARKETS: dict[str, Market] = {FUTURES.name: FUTURES, SPOT.name: SPOT}
