@@ -29,6 +29,7 @@ from .fetcher import CandleFetcher
 from .indicators import MIN_PERCENTILE_SPAN_DAYS
 from .journal import Journal
 from .render import (
+    closed_through,
     render_derivatives,
     render_klines,
     render_levels,
@@ -204,7 +205,9 @@ async def get_squeeze_metrics(
 @server.tool(
     description=(
         "Уровень 3. Сырые ЗАКРЫТЫЕ свечи (не более 50) с производными по "
-        "каждой: тело, фитили, объём к среднему, доля тейкер-покупок. Нужен, "
+        "каждой: тело, фитили, объём к базе (та же, что в снапшоте: уровень "
+        "20 предыдущих свечей с поправкой на слот суток — от limit не зависит), "
+        "доля тейкер-покупок. Нужен, "
         "когда важна ФОРМА, которую агрегаты не передают: последовательность "
         "экстремумов, сужение подходов к уровню, характер отбоев. Это не "
         "запасной вариант, а полноправный третий уровень."
@@ -225,8 +228,10 @@ async def get_klines(
                 f"limit={limit} вне диапазона 1..{MAX_RAW_KLINES}", limit=limit
             )
 
+        # 500 свечей, а не запрошенные limit: база объёма должна быть той же,
+        # что в снапшоте, иначе одна и та же свеча снова получит два числа.
         series = await fetcher.get(
-            info.symbol, interval, limit=max(limit, 100), as_of_ms=as_of_ms
+            info.symbol, interval, limit=max(limit, 500), as_of_ms=as_of_ms
         )
         return render_klines(series, info, limit)
     except ToolError as error:
@@ -256,7 +261,9 @@ async def get_key_levels(
         precision = info.price_precision
 
         lines = [
-            f"{info.symbol} {interval} · цена {format_price(view.price, precision)} · "
+            f"{info.symbol} {interval} · цена {format_price(view.price, precision)} "
+            f"— закрытие свечи на {closed_through(view)} UTC, не live "
+            f"(в снапшоте цена live, и числа расходятся)",
             f"ATR {format_price(view.atr_value, precision)} ({view.atr_pct:.2f}%)",
             f"найдено уровней: {len(view.levels)}",
             "",
@@ -278,7 +285,10 @@ async def get_key_levels(
 
 @server.tool(
     description=(
-        "Фандинг и открытый интерес. Ставка приводится к годовым — без этого "
+        "Фандинг и открытый интерес с рядами: почасовая динамика OI вместе с "
+        "ценой за последние сутки и последние начисления фандинга. Три дельты "
+        "показывают итог окна, ряд — момент, когда поток развернулся. "
+        "Ставка приводится к годовым — без этого "
         "сравнение между монетами бессмысленно, интервал начисления у разных "
         "символов 1, 4 или 8 часов. Динамика OI считается по числу контрактов, "
         "а не по стоимости в USDT, и классифицируется: приток новых денег, "
@@ -291,7 +301,9 @@ async def get_derivatives(symbol: str) -> str:
         info = await registry.get(symbol)
         funding = await derivatives.funding(info.symbol)
         oi = await derivatives.open_interest(info.symbol)
-        return f"{info.symbol}\n\n" + render_derivatives(funding, oi)
+        return f"{info.symbol}\n\n" + render_derivatives(
+            funding, oi, history=True, precision=info.price_precision
+        )
     except ToolError as error:
         return _fail(error)
 
@@ -330,7 +342,7 @@ async def scan_pairs(symbols: list[str], timeframe: str = "4h") -> str:
                 rows.append((
                     index,
                     f"{info.symbol:<14}{index:>6.2f}{bbw:>7}"
-                    f"{view.range_width * 100:>8.2f}%{view.range_duration:>6}"
+                    f"{view.range_width * 100:>8.2f}%{view.narrow_bars:>6}"
                     f"{view.volume.ratio:>8.2f}x  {view.ema_state}/{view.structure}",
                 ))
             except ToolError as error:
@@ -340,7 +352,8 @@ async def scan_pairs(symbols: list[str], timeframe: str = "4h") -> str:
         lines = [
             f"{interval} · сортировка по squeeze_index",
             f"{'символ':<14}{'индекс':>6}{'BBW':>7}{'диап':>9}"
-            f"{'длит':>6}{'объём':>9}  EMA/структура",
+            f"{'узк':>6}{'объём':>9}  EMA/структура",
+            "узк — свечей подряд с шириной диапазона(20) ниже порога ТФ",
         ]
         lines += [text for _, text in rows]
         if problems:

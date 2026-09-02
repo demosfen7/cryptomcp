@@ -70,7 +70,12 @@ class TimeframeView:
     range_high: float
     range_width: float
     range_width_atr: float
-    range_duration: int
+    #: Порог ширины диапазона для этого ТФ, доля от цены.
+    range_threshold: float
+    #: Сколько последних свечей ПОДРЯД ширина диапазона(20) держалась ниже
+    #: порога. Это длительность СЖАТИЯ, а не возраст текущего диапазона:
+    #: у широкого диапазона здесь ноль, и это верное значение, а не сбой.
+    narrow_bars: int
 
     volume: VolumeContext
     profile: VolumeProfile | None
@@ -101,7 +106,8 @@ class TimeframeView:
                 "high": self.range_high,
                 "width_pct": round(self.range_width * 100, 2),
                 "width_atr": round(self.range_width_atr, 2),
-                "duration_bars": self.range_duration,
+                "threshold_pct": round(self.range_threshold * 100, 2),
+                "bars_below_threshold": self.narrow_bars,
             },
             "volume": self.volume.to_dict(),
             "divergence": self.divergence,
@@ -201,7 +207,7 @@ def score_range(view: TimeframeView, config: Config) -> float | None:
     if np.isnan(view.range_width) or threshold <= 0:
         return None
     tightness = _clamp((threshold - view.range_width) / threshold)
-    duration = _clamp(view.range_duration / 20.0)
+    duration = _clamp(view.narrow_bars / 20.0)
     return _clamp(0.6 * tightness + 0.4 * duration)
 
 
@@ -322,7 +328,8 @@ def analyse_timeframe(
         range_high=window_high,
         range_width=range_width,
         range_width_atr=(range_width * price / atr_value) if atr_value else float("nan"),
-        range_duration=consecutive_below(width_series, threshold),
+        range_threshold=threshold,
+        narrow_bars=consecutive_below(width_series, threshold),
         volume=volume_context(series, atr_values),
         profile=profile,
         divergence=rsi_divergence(series, rsi_values, config.divergence_window),

@@ -83,10 +83,39 @@ def slot_of_day(open_time_ms: np.ndarray, interval: str) -> np.ndarray:
 LEVEL_WINDOW = 20
 
 
-def seasonal_baseline(series: Series) -> tuple[float, str, int]:
+@dataclass(frozen=True)
+class Baseline:
+    """База сравнения объёма, посчитанная по свечам ряда.
+
+    Одна конструкция обслуживает и снапшот, и сырые свечи. Раньше их было две:
+    снапшот сравнивал свечу с сезонной базой, а get_klines — со средним по
+    показанному окну, из-за чего одна и та же свеча получала разные числа в
+    похоже названных колонках, а число в get_klines вдобавок зависело от
+    параметра limit (30.08 CAKE: 4.10x при limit=50 и 2.25x при limit=14).
+    """
+
+    #: База на каждую свечу ряда; nan там, где она не считалась.
+    values: np.ndarray
+    #: Наблюдений в базе на каждую свечу.
+    samples: np.ndarray
+    #: Как считалась база последней свечи ряда.
+    basis: str
+
+    def ratio(self, volumes: np.ndarray) -> np.ndarray:
+        """Отношение объёма к базе для каждой свечи."""
+        return np.divide(
+            volumes, self.values,
+            out=np.full(len(volumes), np.nan), where=self.values > 0,
+        )
+
+
+def baseline_series(series: Series, count: int = 1) -> Baseline:
     """База для сравнения объёма: свежий уровень, поправленный на форму суток.
 
-    Возвращает (база, описание, число наблюдений на слот).
+    Считается для последних ``count`` свечей ряда; для остальных в values стоит
+    nan. Ограничение по count здесь ради стоимости: медиана истории на каждую
+    свечу по ряду в несколько тысяч свечей ощутима, а нужны всегда либо одна
+    последняя свеча (снапшот), либо показываемый хвост (get_klines).
 
     Наивная медиана того же слота за всё окно смешивает два разных эффекта:
     форму суток и общий дрейф активности. Измерено на живых данных: у SUIUSDT
@@ -103,32 +132,53 @@ def seasonal_baseline(series: Series) -> tuple[float, str, int]:
     MA20/MA100, где он и является предметом (ТЗ §4.2, группа 2).
     """
     volumes = series.quote_volume
-    if len(volumes) < 2:
-        return float("nan"), "недостаточно данных", 0
+    n = len(volumes)
+    values = np.full(n, np.nan)
+    samples = np.zeros(n, dtype="int64")
+    if n < 2:
+        return Baseline(values, samples, "недостаточно данных")
 
-    recent = volumes[-(LEVEL_WINDOW + 1):-1]
-    level = float(np.median(recent)) if len(recent) else float("nan")
-
-    if series.interval in _NO_SEASONALITY:
-        return level, f"медиана последних {len(recent)}", len(recent)
-
-    slots = slot_of_day(series.df["open_time"].to_numpy(dtype="int64"), series.interval)
-    current_slot = int(slots[-1])
-    # Текущая свеча из базы исключается: сравнивать её с самой собой нельзя.
-    history = volumes[:-1]
-    same_slot = history[slots[:-1] == current_slot]
-
-    overall = float(np.median(history)) if len(history) else float("nan")
-    if len(same_slot) == 0 or not overall or np.isnan(overall):
-        return level, f"медиана последних {len(recent)} (слот не набран)", len(recent)
-
-    factor = float(np.median(same_slot)) / overall
-    hours = current_slot * interval_ms(series.interval) / 3_600_000
-    return (
-        level * factor,
-        f"уровень последних {len(recent)} × сезонность слота {hours:04.1f} UTC ({factor:.2f})",
-        len(same_slot),
+    seasonal = series.interval not in _NO_SEASONALITY
+    slots = (
+        slot_of_day(series.df["open_time"].to_numpy(dtype="int64"), series.interval)
+        if seasonal else np.zeros(n, dtype="int64")
     )
+
+    basis = "недостаточно данных"
+    for i in range(max(1, n - count), n):
+        # Свеча в свою базу не входит: сравнивать её с самой собой нельзя.
+        recent = volumes[max(0, i - LEVEL_WINDOW):i]
+        level = float(np.median(recent))
+        history = volumes[:i]
+        same_slot = history[slots[:i] == slots[i]] if seasonal else np.empty(0)
+        overall = float(np.median(history)) if len(history) else float("nan")
+
+        if not seasonal:
+            values[i], samples[i] = level, len(recent)
+            note = f"медиана последних {len(recent)}"
+        elif len(same_slot) == 0 or not overall or np.isnan(overall):
+            values[i], samples[i] = level, len(recent)
+            note = f"медиана последних {len(recent)} (слот не набран)"
+        else:
+            factor = float(np.median(same_slot)) / overall
+            values[i], samples[i] = level * factor, len(same_slot)
+            hours = int(slots[i]) * interval_ms(series.interval) / 3_600_000
+            note = (
+                f"уровень последних {len(recent)} × "
+                f"сезонность слота {hours:04.1f} UTC ({factor:.2f})"
+            )
+        if i == n - 1:
+            basis = note
+
+    return Baseline(values, samples, basis)
+
+
+def seasonal_baseline(series: Series) -> tuple[float, str, int]:
+    """База сравнения для последней свечи ряда: (база, описание, наблюдений)."""
+    baseline = baseline_series(series)
+    if len(baseline.values) == 0:
+        return float("nan"), baseline.basis, 0
+    return float(baseline.values[-1]), baseline.basis, int(baseline.samples[-1])
 
 
 def anomalous_bars(series: Series, atr_values: np.ndarray, *, window: int = 30,

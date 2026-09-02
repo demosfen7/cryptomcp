@@ -21,6 +21,7 @@ from .indicators import Metric
 from .levels import Level, Pivots
 from .series import Series
 from .symbols import SymbolInfo, format_price
+from .volume import MIN_SAMPLES_PER_SLOT, baseline_series
 
 #: Ближе этого расстояния уровень считается «под ценой», и показывается
 #: следующий за ним — иначе видно, что цена на уровне, но не видно, куда ход.
@@ -31,6 +32,21 @@ def utc(ms: int) -> str:
     if not ms:
         return "n/a"
     return dt.datetime.fromtimestamp(ms / 1000, dt.UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def closed_through(view: TimeframeView, *, short: bool = False) -> str:
+    """Момент, по который у таймфрейма есть закрытые свечи.
+
+    Печатается граница, а не время закрытия последней свечи: «2026-09-02 00:00»
+    вместо «2026-09-01 23:59:59». Без этой строки было не понять, каким
+    закрытием заканчивается каждая строка лестницы, а недельная метрика
+    выглядела так же «свежо», как пятнадцатиминутная.
+    """
+    ms = view.meta.get("closed_through_ms")
+    if not ms:
+        return "n/a"
+    stamp = utc(int(ms) + 1)
+    return stamp[5:16] if short else stamp[:16]
 
 
 def render_metric(metric: Metric, *, precision: int = 4) -> str:
@@ -124,9 +140,13 @@ def render_snapshot(
         if view.bbw.has_context:
             squeeze = f"BBW {view.bbw.pct_rank:.0f} pct"
             if view.bbw.flagged:
-                squeeze = f"ДА · {squeeze}, {view.range_duration} св."
+                squeeze = f"ДА · {squeeze}"
         else:
             squeeze = view.bbw.base_note or "n/a"
+        # Длительность сжатия — отдельный признак ТЗ §4.2, и критерий у неё свой
+        # (порог ширины диапазона), а не перцентиль BBW. Раньше оба числа стояли
+        # в одной фразе через запятую и читались как одно.
+        squeeze += f" · узк {view.narrow_bars}"
         volume = f"{view.volume.ratio:.2f}x" + ("~" if view.volume.weak_basis else "")
         lines.append(
             f"{interval:<5}{view.ema_state:<8}{view.structure:<9}"
@@ -135,16 +155,26 @@ def render_snapshot(
         )
 
     lines.append("")
+    lines.append("закрыты по (UTC): " + " · ".join(
+        f"{tf} {closed_through(v, short=True)}" for tf, v in views.items()
+    ))
+    gaps = [
+        f"{tf} {v.meta['missing']} св."
+        for tf, v in views.items() if v.meta.get("missing")
+    ]
+    if gaps:
+        lines.append("пропуски в истории: " + " · ".join(gaps) + " — метрики на них смещены")
     lines.append("объём — к уровню последних свечей с поправкой на слот суток; ~ слабая база")
     lines.append("EMA — цена против EMA50/EMA200; структ — два последних swing-экстремума")
+    lines.append("узк N — свечей подряд с шириной диапазона(20) ниже порога ТФ")
 
     anchor = views.get("4h") or next(iter(views.values()))
     lines.append("")
     lines.append(
-        f"диапазон {anchor.interval}: {format_price(anchor.range_low, precision)} – "
-        f"{format_price(anchor.range_high, precision)} "
-        f"({anchor.range_width * 100:.2f}%, {anchor.range_width_atr:.1f} ATR, "
-        f"держится {anchor.range_duration} св.)"
+        f"диапазон {anchor.interval} (20 св.): {format_price(anchor.range_low, precision)} – "
+        f"{format_price(anchor.range_high, precision)} · "
+        f"{anchor.range_width * 100:.2f}% = {anchor.range_width_atr:.1f} ATR · "
+        f"узким (<{anchor.range_threshold * 100:.1f}%) был {anchor.narrow_bars} св. подряд"
     )
     lines.extend(render_levels(anchor.levels, live_price, anchor.atr_value, precision))
     if anchor.pivots_weekly:
@@ -162,7 +192,7 @@ def render_snapshot(
 
     if funding or open_interest:
         lines.append("")
-        lines.append(render_derivatives(funding, open_interest))
+        lines.append(render_derivatives(funding, open_interest, precision=precision))
 
     lines.append("")
     lines.append("согласованность ТФ: " + " · ".join(
@@ -176,30 +206,74 @@ def render_snapshot(
     return "\n".join(lines)
 
 
+def _metric_context(metric: Metric | None, unit: str = "сут.") -> str:
+    """Хвост «, 65 pct за 83 сут.» — или причина, по которой его нет."""
+    if metric is None:
+        return ""
+    if not metric.has_context:
+        return f", {metric.base_note or 'нет базы для сравнения'}"
+    text = f", {metric.pct_rank:.0f} pct за {metric.span_days:.0f} {unit}"
+    if metric.base_note:
+        text += f" ({metric.base_note})"
+    return text
+
+
 def render_derivatives(
-    funding: Funding | None, open_interest: OpenInterest | None
+    funding: Funding | None,
+    open_interest: OpenInterest | None,
+    *,
+    history: bool = False,
+    precision: int = 4,
 ) -> str:
+    """Фандинг и открытый интерес.
+
+    ``history`` включает ряды. В снапшоте их нет: он обязан оставаться на
+    двух десятках строк. В get_derivatives есть, потому что три дельты
+    сообщают итог окна, а ряд — момент, когда поток развернулся.
+    """
     lines: list[str] = []
     if funding:
-        context = ""
-        if funding.percentile and funding.percentile.has_context:
-            context = (
-                f", {funding.percentile.pct_rank:.0f} pct за "
-                f"{funding.percentile.span_days:.0f} сут."
-            )
+        basis = f" · базис {funding.basis_pct:+.3f}%" if funding.index_price else ""
         lines.append(
             f"фандинг {funding.rate * 100:+.4f}% / {funding.interval_hours}ч "
-            f"= {funding.annualized_pct:+.2f}% годовых{context}"
+            f"= {funding.annualized_pct:+.2f}% годовых"
+            f"{_metric_context(funding.percentile)}{basis}"
         )
+        if history and funding.history:
+            since = utc(funding.history[0][0])[:16]
+            rates = " ".join(f"{rate * 100:+.4f}" for _, rate in funding.history)
+            lines.append(f"  начисления, % за период, старые→новые (с {since} UTC):")
+            lines.append(f"    {rates}")
+
     if open_interest:
         notional = open_interest.notional_usdt
         scale = f"{notional / 1e9:.2f}B" if notional >= 1e9 else f"{notional / 1e6:.0f}M"
-        lines.append(f"OI {scale} USDT:")
+        lines.append(
+            f"OI {scale} USDT{_metric_context(open_interest.percentile)}:"
+        )
         for window in open_interest.change:
             lines.append(
                 f"  {window:>4}: OI {open_interest.change[window] * 100:+6.2f}% · "
                 f"цена {open_interest.price_change[window] * 100:+6.2f}% "
                 f"→ {open_interest.quadrant(window)}"
+            )
+        if history and open_interest.history:
+            base_ms, base_oi, base_price = open_interest.history[0]
+            lines.append(f"  по часам, Δ от начала окна ({utc(base_ms)[:16]} UTC):")
+            lines.append(
+                f"    {'время':<12}{'OI, контр.':>14}{'ΔOI%':>8}"
+                f"{'цена':>11}{'Δцены%':>9}"
+            )
+            for stamp, contracts, price in open_interest.history:
+                d_oi = (contracts / base_oi - 1) * 100 if base_oi else float("nan")
+                d_price = (price / base_price - 1) * 100 if base_price else float("nan")
+                lines.append(
+                    f"    {utc(stamp)[5:16]:<12}{contracts:>14,.0f}{d_oi:>+8.2f}"
+                    f"{format_price(price, precision):>11}{d_price:>+9.2f}"
+                )
+            lines.append(
+                "    цена восстановлена из sumOpenInterestValue/sumOpenInterest — "
+                "моменты замеров совпадают с OI точно"
             )
     return "\n".join(lines)
 
@@ -208,7 +282,8 @@ def render_squeeze_metrics(view: TimeframeView, threshold_pct: float) -> str:
     """Уровень L2: пять групп признаков ТЗ §4.2 с базой сравнения."""
     volume = view.volume
     lines = [
-        f"{view.interval} · база перцентилей: {view.bbw.n_obs} наблюдений, "
+        f"{view.interval} · свечи закрыты по {closed_through(view)} UTC",
+        f"база перцентилей: {view.bbw.n_obs} наблюдений, "
         f"охват {view.bbw.span_days:.0f} сут.",
         "",
         "1. Волатильность",
@@ -229,7 +304,8 @@ def render_squeeze_metrics(view: TimeframeView, threshold_pct: float) -> str:
         f"   ширина(20)       {view.range_width * 100:.2f}% = {view.range_width_atr:.1f} ATR"
         f"  → порог {threshold_pct * 100:.1f}%"
         + ("  ⚑" if view.range_width < threshold_pct else ""),
-        f"   длительность     {view.range_duration} свечей подряд",
+        f"   ниже порога      {view.narrow_bars} свечей подряд"
+        + ("" if view.narrow_bars else "  (диапазон шире порога — длительность сжатия нулевая)"),
         "",
     ]
 
@@ -270,15 +346,21 @@ def render_klines(series: Series, info: SymbolInfo, limit: int) -> str:
     """Уровень L3: сырые закрытые свечи с производными по каждой."""
     tail = series.tail(limit)
     precision = info.price_precision
-    volumes = tail.quote_volume
-    mean_volume = float(volumes.mean()) if len(volumes) else 0.0
     taker = tail.taker_buy_ratio
+
+    # База объёма — та же, что в снапшоте. Среднее по показанному окну, стоявшее
+    # здесь раньше, зависело от limit: свеча CAKE 30.08 давала 4.10x при
+    # limit=50 и 2.25x при limit=14, а снапшот по ней же — третье число.
+    offset = len(series) - len(tail)
+    baseline = baseline_series(series, len(tail))
+    ratios = baseline.ratio(series.quote_volume)[offset:]
+    samples = baseline.samples[offset:]
 
     lines = [
         f"{info.symbol} {series.interval} · последние {len(tail)} ЗАКРЫТЫХ свечей · "
         f"время UTC · объём в USDT",
         f"{'время':<17}{'open':>12}{'high':>12}{'low':>12}{'close':>12}"
-        f"{'тело%':>8}{'верх%':>7}{'низ%':>7}{'об./ср':>8}{'takerB':>7}",
+        f"{'тело%':>8}{'верх%':>7}{'низ%':>7}{'объём':>8}{'takerB':>7}",
     ]
 
     opens, highs, lows, closes = (
@@ -289,19 +371,27 @@ def render_klines(series: Series, info: SymbolInfo, limit: int) -> str:
         body = (closes[i] - opens[i]) / opens[i] * 100 if opens[i] else 0.0
         upper = (highs[i] - max(opens[i], closes[i])) / span * 100 if span else 0.0
         lower = (min(opens[i], closes[i]) - lows[i]) / span * 100 if span else 0.0
-        ratio = volumes[i] / mean_volume if mean_volume else float("nan")
+        ratio = float(ratios[i])
+        volume = "n/a" if ratio != ratio else (
+            f"{ratio:.2f}x" + ("~" if samples[i] < MIN_SAMPLES_PER_SLOT else "")
+        )
         lines.append(
             f"{utc(int(tail.df['open_time'].iloc[i]))[:16]:<17}"
             f"{format_price(opens[i], precision):>12}"
             f"{format_price(highs[i], precision):>12}"
             f"{format_price(lows[i], precision):>12}"
             f"{format_price(closes[i], precision):>12}"
-            f"{body:>+8.2f}{upper:>7.0f}{lower:>7.0f}{ratio:>8.2f}{taker[i]:>7.2f}"
+            f"{body:>+8.2f}{upper:>7.0f}{lower:>7.0f}{volume:>8}{taker[i]:>7.2f}"
         )
 
     lines.append("")
     lines.append(
-        "тело% — изменение от open к close; верх%/низ% — доля фитилей в диапазоне свечи; "
-        "об./ср — объём к среднему по показанному окну"
+        "тело% — изменение от open к close; "
+        "верх%/низ% — доля фитилей в диапазоне свечи"
     )
+    lines.append(
+        "объём — к той же базе, что в колонке «объём» снапшота: уровень 20 предыдущих "
+        "свечей × сезонность слота суток; ~ слабая база. От limit не зависит."
+    )
+    lines.append(f"база последней свечи: {baseline.basis}")
     return "\n".join(lines)

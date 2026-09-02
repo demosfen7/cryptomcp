@@ -1,0 +1,186 @@
+"""Тесты рендера (PLAN §4.2, §4.10, §5).
+
+Здесь проверяется не арифметика, а то, что выдача не вводит в заблуждение:
+одна и та же свеча не должна получать разные числа в разных инструментах, а
+у каждого числа должно быть видно, к какому моменту оно относится.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from cryptomcp.analysis import TimeframeView
+from cryptomcp.derivatives import Funding, OpenInterest
+from cryptomcp.indicators import Metric
+from cryptomcp.levels import VolumeProfile
+from cryptomcp.render import (
+    closed_through,
+    render_derivatives,
+    render_klines,
+    render_snapshot,
+)
+from cryptomcp.series import INTERVAL_MS, build_series
+from cryptomcp.symbols import SymbolInfo
+from cryptomcp.volume import VolumeContext, volume_context
+
+H4 = INTERVAL_MS["4h"]
+INFO = SymbolInfo("TESTUSDT", "TEST", "USDT", 0.0001, 4, "PERPETUAL", "TRADING")
+
+
+def kline(open_time: int, step: int, quote_vol: float, close: float):
+    return [
+        open_time, f"{close:.8f}", f"{close + 1:.8f}", f"{close - 1:.8f}",
+        f"{close:.8f}", "1.0", open_time + step - 1, f"{quote_vol:.8f}", 10,
+        "0.5", f"{quote_vol * 0.5:.8f}", "0",
+    ]
+
+
+def series_4h(days: int = 40):
+    """Ряд с суточной сезонностью: ночной слот втрое тише дневных."""
+    volumes = [1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 300.0]
+    raw = [
+        kline(((day * 6) + slot) * H4, H4, volumes[slot], 100.0 + day * 0.1)
+        for day in range(days)
+        for slot in range(6)
+    ]
+    return build_series(raw, "TESTUSDT", "4h", raw[-1][6] + 10_000, grace_ms=0)
+
+
+def volume_cells(text: str) -> list[str]:
+    """Колонка «объём» из строк со свечами."""
+    return [
+        line.split()[-2]
+        for line in text.splitlines()
+        if line and line[0].isdigit()
+    ]
+
+
+def view(**overrides) -> TimeframeView:
+    defaults = dict(
+        interval="4h", price=100.0, atr_value=2.0, atr_pct=2.0, rsi_value=50.0,
+        ema_state="above", structure="HH/HL", position_in_range=0.5,
+        bbw=Metric("BBW", 0.04, pct_rank=10.0, n_obs=360, span_days=90,
+                   threshold=20.0, threshold_side="below"),
+        atr_metric=Metric("ATR", 2.0, pct_rank=10.0, n_obs=360, span_days=90),
+        atr_declining_bars=10,
+        range_low=95.0, range_high=105.0, range_width=0.10, range_width_atr=5.0,
+        range_threshold=0.06, narrow_bars=0,
+        volume=VolumeContext(0.7, "медиана слота", 250, 0.6, 3, 0.55),
+        profile=VolumeProfile(100.0, 95.0, 105.0, 1e6, 60),
+        divergence=None,
+        meta={"closed_through_ms": 4 * H4 - 1, "missing": 0},
+    )
+    defaults.update(overrides)
+    return TimeframeView(**defaults)
+
+
+class TestVolumeColumnIsOneMetric:
+    """Одна свеча — одно число, независимо от инструмента и от limit.
+
+    Регрессия: колонка «об./ср» считалась от среднего по показанному окну.
+    У CAKE свеча 30.08 давала 4.10x при limit=50 и 2.25x при limit=14, а
+    снапшот по ней же — третье число, и колонки выглядели сопоставимыми.
+    """
+
+    def test_last_candle_same_at_any_limit(self):
+        s = series_4h()
+        assert volume_cells(render_klines(s, INFO, 10))[-1] == (
+            volume_cells(render_klines(s, INFO, 50))[-1]
+        )
+
+    def test_whole_overlap_matches_between_limits(self):
+        s = series_4h()
+        short = volume_cells(render_klines(s, INFO, 10))
+        long_window = volume_cells(render_klines(s, INFO, 50))
+        assert short == long_window[-len(short):]
+
+    def test_matches_snapshot_column(self):
+        s = series_4h()
+        cell = volume_cells(render_klines(s, INFO, 10))[-1]
+        ratio = volume_context(s, np.full(len(s), 1.0)).ratio
+        assert float(cell.rstrip("x~")) == pytest.approx(round(ratio, 2))
+
+    def test_quiet_slot_is_not_read_as_fading(self):
+        """Ночная свеча сравнивается со своим слотом, а не с сутками."""
+        s = series_4h()
+        assert float(volume_cells(render_klines(s, INFO, 10))[-1].rstrip("x~")) == (
+            pytest.approx(1.0, abs=0.1)
+        )
+
+
+class TestClosedThrough:
+    """Каким закрытием заканчивается строка — должно быть написано."""
+
+    def test_boundary_not_last_millisecond(self):
+        assert closed_through(view()) == "1970-01-01 16:00"
+
+    def test_short_form_drops_year(self):
+        assert closed_through(view(), short=True) == "01-01 16:00"
+
+    def test_missing_meta_is_na(self):
+        assert closed_through(view(meta={})) == "n/a"
+
+    def test_snapshot_lists_every_timeframe(self):
+        text = render_snapshot(
+            INFO, {"4h": view(), "1h": view(interval="1h")},
+            live_price=100.5, change_24h=1.0, quote_volume_24h=1e9, now_ms=4 * H4,
+        )
+        assert "закрыты по (UTC): 4h 01-01 16:00 · 1h 01-01 16:00" in text
+
+
+class TestNarrowBarsWording:
+    """Ноль у широкого диапазона — верное значение, а не сломанный счётчик."""
+
+    def test_range_line_names_the_threshold(self):
+        text = render_snapshot(
+            INFO, {"4h": view()},
+            live_price=100.5, change_24h=1.0, quote_volume_24h=1e9, now_ms=4 * H4,
+        )
+        assert "узким (<6.0%) был 0 св. подряд" in text
+        assert "держится 0 св." not in text
+
+    def test_squeeze_column_separates_two_criteria(self):
+        text = render_snapshot(
+            INFO, {"4h": view(narrow_bars=7)},
+            live_price=100.5, change_24h=1.0, quote_volume_24h=1e9, now_ms=4 * H4,
+        )
+        assert "ДА · BBW 10 pct · узк 7" in text
+
+
+class TestDerivativesRendering:
+    """Посчитанное должно доезжать до выдачи."""
+
+    def funding(self) -> Funding:
+        return Funding(
+            "TESTUSDT", 0.0001, 4, 0, mark_price=101.0, index_price=100.0,
+            percentile=Metric("funding", 0.0001, pct_rank=65.0, n_obs=500,
+                              span_days=83.0),
+            history=((0, 0.0001), (H4, 0.0002)),
+        )
+
+    def open_interest(self) -> OpenInterest:
+        return OpenInterest(
+            "TESTUSDT", 1000.0, 2e6, {"1h": 0.02}, {"1h": 0.03},
+            percentile=Metric("open_interest", 1000.0, pct_rank=88.0, n_obs=499,
+                              span_days=21.0, base_note="история OI ограничена"),
+            history=((0, 1000.0, 100.0), (3_600_000, 1020.0, 101.0)),
+        )
+
+    def test_basis_reaches_output(self):
+        assert "базис +1.000%" in render_derivatives(self.funding(), None)
+
+    def test_oi_percentile_reaches_output(self):
+        text = render_derivatives(None, self.open_interest())
+        assert "88 pct за 21 сут. (история OI ограничена)" in text
+
+    def test_series_only_when_asked(self):
+        """Снапшот обязан оставаться коротким, get_derivatives — нет."""
+        short = render_derivatives(self.funding(), self.open_interest())
+        full = render_derivatives(
+            self.funding(), self.open_interest(), history=True, precision=2
+        )
+        assert "по часам" not in short
+        assert "начисления" not in short
+        assert "по часам" in full
+        assert "+2.00" in full  # ΔOI% относительно начала окна

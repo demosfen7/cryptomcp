@@ -32,6 +32,12 @@ OI_SPAN_EXEMPTION = "история OI ограничена биржей 30 су
 #: Порог значимости изменения OI для классификации, доля.
 DEFAULT_OI_THRESHOLD = 0.01
 
+#: Сколько точек ряда отдавать в выдачу. Три дельты показывают итог окна, ряд
+#: показывает, КОГДА поток развернулся. Данные для него уже загружены ради
+#: дельт, поэтому ряд не стоит ни одного дополнительного запроса.
+OI_HISTORY_POINTS = 24
+FUNDING_HISTORY_POINTS = 8
+
 Quadrant = Literal[
     "приток новых денег",
     "закрытие шортов",
@@ -55,6 +61,8 @@ class Funding:
     mark_price: float
     index_price: float
     percentile: Metric | None = None
+    #: Последние начисления, старые→новые: (время, ставка).
+    history: tuple[tuple[int, float], ...] = ()
 
     @property
     def annualized_pct(self) -> float:
@@ -101,6 +109,8 @@ class OpenInterest:
     #: Изменение цены за те же окна, доля.
     price_change: dict[str, float]
     percentile: Metric | None = None
+    #: Почасовой ряд, старые→новые: (время, контракты, цена).
+    history: tuple[tuple[int, float, float], ...] = ()
 
     def quadrant(
         self, window: str, threshold: float = DEFAULT_OI_THRESHOLD
@@ -189,6 +199,7 @@ class DerivativesReader:
         rate = float(premium["lastFundingRate"])
 
         percentile: Metric | None = None
+        settlements: tuple[tuple[int, float], ...] = ()
         if history:
             # История фандинга глубокая — проверено на 900 суток назад,
             # поэтому правило §4.2 выполняется без всяких послаблений.
@@ -202,6 +213,10 @@ class DerivativesReader:
                     "funding", rate, values[:-1], span_days,
                     unit="", threshold=90, threshold_side="above",
                 )
+                settlements = tuple(
+                    (int(r["fundingTime"]), float(r["fundingRate"]))
+                    for r in rows[-FUNDING_HISTORY_POINTS:]
+                )
 
         return Funding(
             symbol=symbol,
@@ -211,6 +226,7 @@ class DerivativesReader:
             mark_price=float(premium["markPrice"]),
             index_price=float(premium["indexPrice"]),
             percentile=percentile,
+            history=settlements,
         )
 
     async def open_interest(
@@ -219,10 +235,24 @@ class DerivativesReader:
         *,
         period: str = "5m",
         windows: tuple[str, ...] = ("1h", "4h", "24h"),
+        history_period: str = "1h",
     ) -> OpenInterest:
+        """Открытый интерес: дельты по окнам, почасовой ряд и перцентиль.
+
+        Два запроса истории вместо одного, и вот почему. Пятиминутный шаг нужен
+        дельтам: он даёт свежий отсчёт, отставший от «сейчас» не больше чем на
+        пять минут. Но 500 пятиминутных точек — это всего 41 час, и перцентиль
+        на такой базе означал бы «против позавчера», а не против месяца.
+        Часовой шаг за те же 500 точек покрывает 20 суток — близко к тому
+        максимуму в 30 суток, который вообще хранит биржа. Каждый запрос стоит
+        единицу веса и кэшируется на пять минут.
+        """
         symbol = symbol.upper()
         current = await self._client.open_interest(symbol)
         rows = await self._client.open_interest_hist(symbol, period=period, limit=500)
+        long_rows = await self._client.open_interest_hist(
+            symbol, period=history_period, limit=500
+        )
 
         contracts = float(current["openInterest"])
         if not rows:
@@ -247,9 +277,24 @@ class DerivativesReader:
             change[window] = _pct_change(oi_series[-1], oi_series[-1 - back])
             price_change[window] = _pct_change(price_series[-1], price_series[-1 - back])
 
-        span_days = len(oi_series) * step_minutes / (60 * 24)
+        # Ряд и перцентиль — по длинной истории; дельты выше — по короткой.
+        base_rows = long_rows or rows
+        base_step = _period_minutes(history_period if long_rows else period)
+        base_oi = np.array([float(r["sumOpenInterest"]) for r in base_rows])
+        base_value = np.array([float(r["sumOpenInterestValue"]) for r in base_rows])
+        base_price = np.divide(
+            base_value, base_oi,
+            out=np.full_like(base_value, np.nan), where=base_oi > 0,
+        )
+        tail = slice(max(0, len(base_rows) - OI_HISTORY_POINTS), len(base_rows))
+        oi_history = tuple(
+            (int(base_rows[i]["timestamp"]), float(base_oi[i]), float(base_price[i]))
+            for i in range(tail.start, tail.stop)
+        )
+
+        span_days = len(base_oi) * base_step / (60 * 24)
         percentile = with_percentile(
-            "open_interest", oi_series[-1], oi_series[:-1], span_days,
+            "open_interest", base_oi[-1], base_oi[:-1], span_days,
             span_exemption=OI_SPAN_EXEMPTION,
         )
 
@@ -260,6 +305,7 @@ class DerivativesReader:
             change=change,
             price_change=price_change,
             percentile=percentile,
+            history=oi_history,
         )
 
 
