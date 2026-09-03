@@ -13,7 +13,12 @@ from __future__ import annotations
 import pytest
 
 from cryptomcp import notify
-from cryptomcp.notify import Telegram, notify_watchlist, render_watchlist_delta
+from cryptomcp.notify import (
+    Telegram,
+    notify_watchlist,
+    render_watchlist_delta,
+    tradingview_url,
+)
 
 EMPTY: dict[str, list] = {"entered": [], "exited": [], "promoted": []}
 
@@ -71,11 +76,25 @@ class TestRender:
         }, now_ms=1_756_800_000_000)
 
         assert "Вошли (1)" in text
-        assert "+ ONDOUSDT 4h · ранг 2" in text
+        assert ">ONDOUSDT</a> 4h · ранг 2" in text
         assert "Подтверждены (1)" in text
-        assert "↑ HBARUSDT 1d · ранг 7" in text
+        assert ">HBARUSDT</a> 1d · ранг 7" in text
         assert "Вышли (1)" in text
-        assert "− WLDUSDT 4h · пробой" in text
+        assert ">WLDUSDT</a> 4h · пробой" in text
+
+    def test_symbol_is_a_link_to_the_same_timeframe(self):
+        """Смысл ссылки — открыть тот же контракт и тот же таймфрейм."""
+        text = render_watchlist_delta({"entered": [("ONDOUSDT", "4h", 2)]})
+
+        assert '<a href="https://www.tradingview.com/chart/?' in text
+        assert "symbol=BINANCE%3AONDOUSDT.P" in text
+        assert "interval=240" in text
+
+    def test_outside_text_is_escaped(self):
+        """Причина выхода приходит извне: угловая скобка не должна стать тегом."""
+        text = render_watchlist_delta({"exited": [("WLDUSDT", "4h", "цена < уровня")]})
+
+        assert "цена &lt; уровня" in text
 
     def test_only_filled_sections_appear(self):
         text = render_watchlist_delta({"exited": [("WLDUSDT", "4h", "истёк срок")]})
@@ -83,6 +102,24 @@ class TestRender:
         assert "Вышли" in text
         assert "Вошли" not in text
         assert "Подтверждены" not in text
+
+
+class TestTradingViewUrl:
+    """Промах в символе тихо открывает соседний рынок — это стоит теста."""
+
+    def test_perpetual_suffix(self):
+        url = tradingview_url("ONDOUSDT")
+
+        assert "symbol=BINANCE%3AONDOUSDT.P" in url
+
+    def test_known_timeframes(self):
+        assert "interval=240" in tradingview_url("ONDOUSDT", "4h")
+        assert "interval=D" in tradingview_url("ONDOUSDT", "1d")
+
+    def test_unknown_timeframe_is_omitted(self):
+        """Лучше график на умолчании биржи, чем ссылка, которую отвергнут."""
+        assert "interval" not in tradingview_url("ONDOUSDT", "17m")
+        assert "interval" not in tradingview_url("ONDOUSDT")
 
 
 class TestFromEnv:
@@ -141,12 +178,29 @@ class TestSend:
         assert len(transport.calls) == 2
 
     @pytest.mark.asyncio
+    async def test_message_goes_as_html(self, transport):
+        """Без parse_mode ссылка пришла бы сырым тегом."""
+        await Telegram("123:abc", "-1").send("<a href=\"u\">X</a>")
+
+        assert transport.calls[0]["json"]["parse_mode"] == "HTML"
+
+    @pytest.mark.asyncio
     async def test_long_message_is_trimmed(self, transport):
         await Telegram("123:abc", "-1").send("я" * 9000)
 
         sent = transport.calls[0]["json"]["text"]
         assert len(sent) <= 4096
         assert sent.endswith("список обрезан")
+
+    @pytest.mark.asyncio
+    async def test_trim_never_cuts_a_tag_in_half(self, transport):
+        """Разрезанный тег — это 400 и потеря всего сообщения, а не хвоста."""
+        line = '  + <a href="https://www.tradingview.com/chart/?symbol=X">SYM</a> 4h'
+        await Telegram("123:abc", "-1").send("\n".join([line] * 200))
+
+        sent = transport.calls[0]["json"]["text"]
+        assert len(sent) <= 4096
+        assert sent.count("<a ") == sent.count("</a>")
 
     @pytest.mark.asyncio
     async def test_empty_text_is_not_sent(self, transport):
@@ -169,7 +223,9 @@ class TestNotifyWatchlist:
         monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1")
 
         assert await notify_watchlist({"entered": [("CAKEUSDT", "4h", 3)]}) is True
-        assert "CAKEUSDT" in transport.calls[0]["json"]["text"]
+        text = transport.calls[0]["json"]["text"]
+        assert "CAKEUSDT" in text
+        assert "tradingview.com" in text
 
     @pytest.mark.asyncio
     async def test_without_secrets_it_is_a_no_op(self, transport, monkeypatch):
