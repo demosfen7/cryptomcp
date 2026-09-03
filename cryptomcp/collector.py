@@ -540,6 +540,9 @@ def accumulation_context(
             taker_streak=data.taker_streak,
             volume_lead=data.lead_bars,
             lead_state=data.lead_state,
+            absorption_clusters=data.clusters,
+            cluster_longest=data.cluster_longest,
+            wick_streak=data.wick_streak,
         )
 
     settlements = storage.funding_window(con, symbol, now_ms, limit=60)

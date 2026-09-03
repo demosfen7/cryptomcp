@@ -124,7 +124,11 @@ CREATE TABLE IF NOT EXISTS scan_log (
     lead_state        TEXT,
     oi_change_24h     REAL,
     oi_reading        TEXT,
-    funding_annual    REAL
+    funding_annual    REAL,
+    -- Кластеры набора: серия важнее одиночного бара (§4.25).
+    absorption_clusters INTEGER,
+    cluster_longest     INTEGER,
+    wick_streak         INTEGER
 );
 
 -- Одна строка на закрытую свечу И версию формулы. Сканер ходит раз в час, а
@@ -194,7 +198,8 @@ CREATE TABLE IF NOT EXISTS collector_runs (
 ACCUMULATION_COLUMNS = frozenset({
     "absorption_tf", "absorption_bars", "taker_max", "taker_above",
     "taker_streak", "volume_lead", "lead_state", "oi_change_24h",
-    "oi_reading", "funding_annual",
+    "oi_reading", "funding_annual", "absorption_clusters", "cluster_longest",
+    "wick_streak",
 })
 
 #: Колонки derivatives, кроме ключа. Порядок фиксирован: по нему строится upsert.
@@ -244,6 +249,9 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("scan_log", "oi_change_24h", "REAL"),
     ("scan_log", "oi_reading", "TEXT"),
     ("scan_log", "funding_annual", "REAL"),
+    ("scan_log", "absorption_clusters", "INTEGER"),
+    ("scan_log", "cluster_longest", "INTEGER"),
+    ("scan_log", "wick_streak", "INTEGER"),
 )
 
 
@@ -551,6 +559,18 @@ def listing_dates(con: sqlite3.Connection, market: str = "futures") -> dict[str,
     return {row["symbol"]: int(row["first_kline_ms"]) for row in rows}
 
 
+def _int(row: sqlite3.Row, column: str) -> int:
+    """Целое из строки журнала, устойчивое к отсутствию колонки.
+
+    Записи, сделанные до появления признака, этой колонки не имеют вовсе, а
+    sqlite3.Row на неизвестное имя бросает IndexError, а не отдаёт None.
+    """
+    try:
+        return int(row[column] or 0)
+    except (IndexError, KeyError, TypeError):
+        return 0
+
+
 def screen_scan(
     con: sqlite3.Connection,
     tf: str,
@@ -587,10 +607,15 @@ def screen_scan(
     if sort_by == "duration":
         rows.sort(key=lambda r: (-(r["narrow_bars"] or 0), -(r["squeeze_index"] or 0)))
     elif sort_by == "accumulation":
+        # Кластер стоит перед одиночными барами сознательно: замерено, что на
+        # ASTER (набор) и UAI (реакция) счётчик баров дал 3 против 4, то есть
+        # различал НЕВЕРНО, а кластеры — 1 против 0 (§4.25).
         rows.sort(key=lambda r: (
-            -(r["absorption_bars"] or 0),
-            -(r["taker_above"] or 0),
-            -(r["volume_lead"] or 0),
+            -_int(r, "absorption_clusters"),
+            -_int(r, "cluster_longest"),
+            -_int(r, "absorption_bars"),
+            -_int(r, "taker_above"),
+            -_int(r, "volume_lead"),
             -(r["squeeze_index"] or 0),
         ))
     return rows

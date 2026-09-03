@@ -547,16 +547,18 @@ class TestScreenScan:
 
     NOW = 1_788_400_000_000
 
-    def scan(self, con, symbol, index, *, narrow=0, bars=None, above=None, lead=None):
+    def scan(self, con, symbol, index, *, narrow=0, bars=None, above=None,
+             lead=None, clusters=None):
         from cryptomcp import SQUEEZE_FORMULA_VERSION
 
         con.execute(
             "INSERT OR REPLACE INTO scan_log (ts_ms, symbol, source, tf, "
             "formula_version, squeeze_index, price, narrow_bars, "
-            "absorption_bars, taker_above, volume_lead, closed_through_ms) "
-            "VALUES (?, ?, 'futures', '4h', ?, ?, 100.0, ?, ?, ?, ?, ?)",
+            "absorption_bars, taker_above, volume_lead, absorption_clusters, "
+            "closed_through_ms) "
+            "VALUES (?, ?, 'futures', '4h', ?, ?, 100.0, ?, ?, ?, ?, ?, ?)",
             (self.NOW, symbol, SQUEEZE_FORMULA_VERSION, index, narrow,
-             bars, above, lead, self.NOW - 1),
+             bars, above, lead, clusters, self.NOW - 1),
         )
         con.commit()
 
@@ -581,6 +583,19 @@ class TestScreenScan:
 
         rows = storage.screen_scan(con, "4h", sort_by="accumulation")
         assert [r["symbol"] for r in rows] == ["BBBUSDT", "AAAUSDT"]
+
+    def test_cluster_outranks_single_bars(self, con):
+        """Кластер важнее счётчика одиночных баров (§4.25).
+
+        Замерено на живых данных: ASTER (набор) дал 3 бара и 1 кластер, UAI
+        (реакция на движение) — 4 бара и 0 кластеров. По барам порядок вышел
+        бы обратным правильному.
+        """
+        self.scan(con, "UAIUSDT", 0.50, bars=4, above=7, lead=4, clusters=0)
+        self.scan(con, "ASTERUSDT", 0.50, bars=3, above=18, lead=29, clusters=1)
+
+        rows = storage.screen_scan(con, "4h", sort_by="accumulation")
+        assert [r["symbol"] for r in rows] == ["ASTERUSDT", "UAIUSDT"]
 
     def test_allowed_and_exclude(self, con):
         for symbol in ("AAAUSDT", "BBBUSDT", "CCCUSDT"):

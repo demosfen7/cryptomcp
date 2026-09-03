@@ -306,6 +306,79 @@ class TestQuietBarFloor:
         assert anomalous_bars(s, np.full(len(s), 10.0)) == 1
 
 
+class TestClusters:
+    """Набор — это серия, а не один бар (PLAN §4.25).
+
+    Одиночный бар с большим объёмом почти всегда новость или вынос стопов.
+    Замерено: на ASTER (набор) и UAI (реакция) счётчик одиночных баров дал 3
+    против 4, то есть различал НЕВЕРНО, а кластеры — 1 против 0.
+    """
+
+    def bar(self, i, *, o, c, high, low, vol):
+        step = H4
+        return [
+            T0 + i * step, f"{o:.8f}", f"{high:.8f}", f"{low:.8f}", f"{c:.8f}",
+            "1.0", T0 + (i + 1) * step - 1, f"{vol:.8f}", 10, "0.5",
+            f"{vol / 2:.8f}", "0",
+        ]
+
+    def build(self, tail):
+        raw = [self.bar(i, o=100.0, c=100.0, high=101.0, low=99.0, vol=100.0)
+               for i in range(60 - len(tail))]
+        raw += [self.bar(60 - len(tail) + i, **spec) for i, spec in enumerate(tail)]
+        s = build_series(raw, "T", "4h", raw[-1][6] + 10_000, grace_ms=0)
+        return s, np.full(len(s), 0.5)
+
+    def quiet(self, base):
+        return dict(o=base, c=base + 0.1, high=base + 1.0, low=base - 1.0, vol=300.0)
+
+    def test_three_quiet_bars_at_one_price_form_a_cluster(self):
+        from cryptomcp.volume import clusters
+
+        s, atr_values = self.build([self.quiet(100.0) for _ in range(3)])
+        assert clusters(s, atr_values, window=30) == (1, 3)
+
+    def test_two_bars_is_not_a_cluster(self):
+        from cryptomcp.volume import clusters
+
+        s, atr_values = self.build([self.quiet(100.0) for _ in range(2)])
+        assert clusters(s, atr_values, window=30) == (0, 0)
+
+    def test_series_that_moves_price_is_not_a_cluster(self):
+        """Тела малы, объём есть, но цена ушла — это импульс, а не набор."""
+        from cryptomcp.volume import clusters
+
+        s, atr_values = self.build([self.quiet(100.0 + 0.6 * i) for i in range(3)])
+        assert clusters(s, atr_values, window=30) == (0, 0)
+
+    def test_ordinary_volume_is_not_a_cluster(self):
+        from cryptomcp.volume import clusters
+
+        tail = [dict(self.quiet(100.0), vol=100.0) for _ in range(3)]
+        s, atr_values = self.build(tail)
+        assert clusters(s, atr_values, window=30) == (0, 0)
+
+
+class TestWickStreak:
+    """Серия выкупленных проливов: ASTER 16.08.2026 21:00–23:00."""
+
+    def test_consecutive_lower_wicks_counted(self):
+        from cryptomcp.volume import wick_streak
+
+        step = H4
+        raw = []
+        for i in range(40):
+            # Нижний фитиль 0.83 диапазона у трёх свечей подряд в конце ряда.
+            low = 99.0 if i >= 37 else 99.9
+            high = 100.2 if i >= 37 else 100.1
+            raw.append([
+                T0 + i * step, "100.0", f"{high:.8f}", f"{low:.8f}", "100.0",
+                "1.0", T0 + (i + 1) * step - 1, "100.0", 10, "0.5", "50.0", "0",
+            ])
+        s = build_series(raw, "T", "4h", raw[-1][6] + 10_000, grace_ms=0)
+        assert wick_streak(s, window=30) == 3
+
+
 class TestVolumeLeadsPrice:
     """Признак, отличающий набор позиции от реакции на событие.
 

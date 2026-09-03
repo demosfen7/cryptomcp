@@ -295,6 +295,26 @@ TAKER_NEUTRAL = 0.50
 #: Выше этого доля считается перевесом покупателя, а не шумом вокруг нейтрали.
 TAKER_PRESSURE = 0.55
 
+#: Кластер набора: серия свечей подряд с повышенным объёмом, малым телом и
+#: без итогового хода цены. Один бар с большим объёмом почти всегда новость или
+#: вынос стопов; набор — это серия, и мерить её надо серией.
+#:
+#: Пороги подобраны по редкости, а не круглым числом: на 77 монетах с оборотом
+#: от 10M кластер за трое суток нашёлся у двух. Ослабление любого из трёх
+#: условий выводит признак из этой полосы, и он перестаёт отбирать.
+CLUSTER_MIN_BARS = 3
+CLUSTER_VOLUME_MULTIPLE = 1.5
+CLUSTER_BODY_FRACTION = 0.4
+
+#: Итоговый ход цены за кластер. Максимум из двух по той же причине, что и у
+#: тела одиночного бара: доля цены не должна исчезать вместе с волатильностью.
+CLUSTER_NET_MOVE_PCT = 0.005
+CLUSTER_NET_MOVE_ATR = 0.5
+
+#: Доля нижнего фитиля, выше которой свеча считается выкупленной снизу.
+WICK_FRACTION = 0.5
+
+
 #: Во сколько раз объём должен превысить базу, чтобы считаться всплеском.
 LEAD_VOLUME_MULTIPLE = 3.0
 
@@ -339,6 +359,11 @@ class Absorption:
     #: голое число не отличает «ещё не разрешилось» от «объём пришёл позже».
     lead_bars: int | None = None
     lead_state: str = ""
+    #: Кластеры набора: серии свечей, за которые цена никуда не ушла.
+    clusters: int = 0
+    cluster_longest: int = 0
+    #: Самая длинная серия свечей подряд с нижним фитилём больше половины.
+    wick_streak: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -352,6 +377,9 @@ class Absorption:
             "volume_ratio": round(self.volume_ratio, 3),
             "volume_lead_bars": self.lead_bars,
             "volume_lead_state": self.lead_state,
+            "absorption_clusters": self.clusters,
+            "cluster_longest": self.cluster_longest,
+            "wick_streak": self.wick_streak,
         }
 
 
@@ -367,12 +395,89 @@ def longest_streak(values: np.ndarray, threshold: float) -> int:
     return best
 
 
+def wick_streak(series: Series, *, window: int) -> int:
+    """Самая длинная серия свечей подряд с нижним фитилём больше половины.
+
+    Ряд длинных нижних теней при стоящей цене — это выкуп проливов, а не одна
+    заявка. Кейс ASTER 16.08.2026 21:00–23:00: фитили 0.65, 0.77 и 0.75 при
+    объёмах 3.5x, 1.7x и 2.0x и телах меньше четверти диапазона.
+    """
+    high, low = series.high[-window:], series.low[-window:]
+    opens, closes = series.col("open")[-window:], series.close[-window:]
+    best = current = 0
+    for i in range(len(high)):
+        span = high[i] - low[i]
+        if span <= 0:
+            current = 0
+            continue
+        lower = (min(opens[i], closes[i]) - low[i]) / span
+        current = current + 1 if lower > WICK_FRACTION else 0
+        best = max(best, current)
+    return best
+
+
+def clusters(
+    series: Series, atr_values: np.ndarray, *, window: int
+) -> tuple[int, int]:
+    """Кластеры набора в окне: сколько их и какой самый длинный.
+
+    Условия на свечу — повышенный объём и малое тело относительно СВОЕГО
+    диапазона; условие на серию — цена за неё никуда не ушла. Последнее и
+    отличает набор от импульса: три свечи подряд с объёмом 2x бывают и в
+    начале движения, но там они сдвигают цену.
+
+    База объёма та же скользящая двадцатка, что у одиночных баров набора:
+    два числа в одном блоке обязаны считаться от одной величины.
+    """
+    volumes = series.quote_volume
+    if len(volumes) < window + 20:
+        return 0, 0
+
+    rolling = pd.Series(volumes).rolling(20).mean().to_numpy()
+    opens, closes, high, low = (
+        series.col("open"), series.close, series.high, series.low
+    )
+
+    count = best = 0
+    run: list[int] = []
+
+    def close_run() -> None:
+        nonlocal count, best
+        if len(run) >= CLUSTER_MIN_BARS:
+            first, last = run[0], run[-1]
+            net = abs(closes[last] - opens[first])
+            limit = max(
+                CLUSTER_NET_MOVE_PCT * opens[first],
+                CLUSTER_NET_MOVE_ATR * atr_values[last],
+            )
+            if net < limit:
+                count += 1
+                best = max(best, len(run))
+        run.clear()
+
+    for i in range(len(volumes) - window, len(volumes)):
+        mean = rolling[i]
+        span = high[i] - low[i]
+        quiet = (
+            not np.isnan(mean) and mean > 0 and span > 0
+            and volumes[i] >= CLUSTER_VOLUME_MULTIPLE * mean
+            and abs(closes[i] - opens[i]) / span < CLUSTER_BODY_FRACTION
+        )
+        if quiet:
+            run.append(i)
+        else:
+            close_run()
+    close_run()
+    return count, best
+
+
 def absorption(
     series: Series, atr_values: np.ndarray, *, window: int | None = None
 ) -> Absorption:
     """Поглощение по младшему ряду: бары набора и разрешение по тейкерам."""
     if window is None:
         window = absorption_window(series.interval)
+    cluster_count, cluster_longest = clusters(series, atr_values, window=window)
     taker = series.taker_buy_ratio[-window:]
     lead_bars, lead_state = volume_leads_price(series, atr_values, window=window)
     volumes = series.quote_volume
@@ -393,6 +498,9 @@ def absorption(
         weak_basis=samples < MIN_SAMPLES_PER_SLOT,
         lead_bars=lead_bars,
         lead_state=lead_state,
+        clusters=cluster_count,
+        cluster_longest=cluster_longest,
+        wick_streak=wick_streak(series, window=window),
     )
 
 
