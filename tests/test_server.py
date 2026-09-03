@@ -128,3 +128,150 @@ class TestRawKlineCap:
         assert max_raw_klines("4h") == 50
         assert max_raw_klines("1d") == 50
         assert max_raw_klines("1w") == 50
+
+
+class TestScanTimeframeAlias:
+    """scan_pairs обязан понимать и timeframe, и timeframes.
+
+    Единственный инструмент со списком: у остальных параметр в единственном
+    числе. Лишний ключ MCP-сервер отбрасывает молча, поэтому написание
+    timeframe="1d" уводило выдачу на дефолтные 4h без единого признака ошибки.
+    """
+
+    @staticmethod
+    def _capture(monkeypatch):
+        seen: list[tuple[str, ...]] = []
+
+        async def fake_screen(intervals, **kwargs):
+            seen.append(intervals)
+            return ""
+
+        monkeypatch.setattr("cryptomcp.server._scan_screen", fake_screen)
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_singular_reaches_the_screen(self, monkeypatch):
+        from cryptomcp.server import scan_pairs
+
+        seen = self._capture(monkeypatch)
+        await scan_pairs(timeframe="1d")
+
+        assert seen == [("1d",)]
+
+    @pytest.mark.asyncio
+    async def test_plural_still_works(self, monkeypatch):
+        from cryptomcp.server import scan_pairs
+
+        seen = self._capture(monkeypatch)
+        await scan_pairs(timeframes=["1d", "1h"])
+
+        assert seen == [("1d", "1h")]
+
+    @pytest.mark.asyncio
+    async def test_default_stays_four_hours(self, monkeypatch):
+        from cryptomcp.server import scan_pairs
+
+        seen = self._capture(monkeypatch)
+        await scan_pairs()
+
+        assert seen == [("4h",)]
+
+    @pytest.mark.asyncio
+    async def test_both_spellings_merge_without_duplicates(self, monkeypatch):
+        from cryptomcp.server import scan_pairs
+
+        seen = self._capture(monkeypatch)
+        await scan_pairs(timeframes=["4h"], timeframe="1d")
+
+        assert seen == [("4h", "1d")]
+
+    @pytest.mark.asyncio
+    async def test_singular_is_published_in_the_schema(self):
+        """Параметра нет в схеме — клиент отбросит ключ, не дойдя до функции."""
+        from cryptomcp.server import server
+
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        properties = tools["scan_pairs"].input_schema["properties"]
+
+        assert "timeframe" in properties
+        assert "timeframes" in properties
+
+
+class TestScanSymbolAlias:
+    """scan_pairs обязан понимать и symbol, и symbols.
+
+    Потеря этого ключа дороже потерянного таймфрейма: она не меняла ТФ, а
+    молча переключала режим — вместо пересчёта по бирже по названной монете
+    уходил полный отбор по журналу.
+    """
+
+    @staticmethod
+    def _capture(monkeypatch):
+        seen: dict[str, object] = {}
+
+        async def fake_explicit(symbols, intervals, market):
+            seen["explicit"] = (symbols, intervals)
+            return ""
+
+        async def fake_screen(intervals, **kwargs):
+            seen["screen"] = intervals
+            return ""
+
+        monkeypatch.setattr("cryptomcp.server._scan_explicit", fake_explicit)
+        monkeypatch.setattr("cryptomcp.server._scan_screen", fake_screen)
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_singular_goes_to_the_exchange_path(self, monkeypatch):
+        from cryptomcp.server import scan_pairs
+
+        seen = self._capture(monkeypatch)
+        await scan_pairs(symbol="BTCUSDT")
+
+        assert seen["explicit"] == (["BTCUSDT"], ("4h",))
+        assert "screen" not in seen
+
+    @pytest.mark.asyncio
+    async def test_plural_still_works(self, monkeypatch):
+        from cryptomcp.server import scan_pairs
+
+        seen = self._capture(monkeypatch)
+        await scan_pairs(symbols=["BTCUSDT", "ETHUSDT"])
+
+        assert seen["explicit"] == (["BTCUSDT", "ETHUSDT"], ("4h",))
+
+    @pytest.mark.asyncio
+    async def test_both_spellings_merge_without_duplicates(self, monkeypatch):
+        from cryptomcp.server import scan_pairs
+
+        seen = self._capture(monkeypatch)
+        await scan_pairs(symbols=["BTCUSDT"], symbol="ETHUSDT")
+
+        assert seen["explicit"] == (["BTCUSDT", "ETHUSDT"], ("4h",))
+
+        seen.clear()
+        await scan_pairs(symbols=["BTCUSDT"], symbol="BTCUSDT")
+
+        assert seen["explicit"] == (["BTCUSDT"], ("4h",))
+
+    @pytest.mark.asyncio
+    async def test_without_pairs_the_screen_still_runs(self, monkeypatch):
+        """Отбор по журналу — режим по умолчанию, алиас его не отменяет."""
+        from cryptomcp.server import scan_pairs
+
+        seen = self._capture(monkeypatch)
+        await scan_pairs()
+
+        assert seen["screen"] == ("4h",)
+        assert "explicit" not in seen
+
+    @pytest.mark.asyncio
+    async def test_singular_is_published_in_the_schema(self):
+        """Параметра нет в схеме — клиент отбросит ключ, не дойдя до функции."""
+        from cryptomcp.server import server
+
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        properties = tools["scan_pairs"].input_schema["properties"]
+
+        assert "symbol" in properties
+        assert "symbols" in properties

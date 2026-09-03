@@ -454,17 +454,21 @@ async def get_derivatives(symbol: str, as_of_ms: int | None = None) -> str:
         "содержит признаки накопления (бары набора, тейкеры, лид объёма над "
         "ценой, сторона набора по фандингу). Доступные ТФ в этом режиме — "
         "4h, 1d, 1h; строка пишется на закрытие свечи, поэтому может отставать "
-        "почти на таймфрейм, и «закрыта по» печатается в выдаче. С явным "
-        "symbols — пересчёт по бирже, до 100 пар, любой ТФ: нужен для монет вне "
+        "почти на таймфрейм, и «закрыта по» печатается в выдаче. С явными "
+        "парами (symbols списком, либо symbol одним значением) — пересчёт по "
+        "бирже, до 100 пар, любой ТФ: нужен для монет вне "
         "архива или когда важна свежесть, а не охват. Фильтры: оборот, возраст "
         "листинга, максимальное движение за сутки (монета в движении — не "
         "кандидат на накопление), длительность сжатия, исключения. Сортировка: "
-        "squeeze, duration, accumulation. Несколько таймфреймов за вызов."
+        "squeeze, duration, accumulation. Несколько таймфреймов за вызов: "
+        "timeframes списком, либо timeframe одним значением."
     )
 )
 async def scan_pairs(
     symbols: list[str] | None = None,
+    symbol: str | None = None,
     timeframes: list[str] | None = None,
+    timeframe: str | None = None,
     min_volume_usdt: float = 10_000_000,
     max_volume_usdt: float | None = None,
     min_age_days: int | None = None,
@@ -476,15 +480,31 @@ async def scan_pairs(
     market: str = "futures",
 ) -> str:
     try:
-        intervals = _validate_timeframes(timeframes or ["4h"])
+        # Единственный инструмент со списком таймфреймов: у остальных параметр
+        # называется timeframe, и вызывающий пишет привычное единственное
+        # число. Лишний ключ MCP-сервер молча отбрасывает (pydantic по
+        # умолчанию extra="ignore"), и вместо запрошенного ТФ выдача уходила
+        # на дефолтные 4h — тихо, без единого признака в шапке. Принимаем оба
+        # написания.
+        requested = list(timeframes) if timeframes else []
+        if timeframe is not None and timeframe not in requested:
+            requested.append(timeframe)
+        intervals = _validate_timeframes(requested or ["4h"])
         if sort_by not in storage.SCAN_SORTS:
             raise bad_params(
                 f"Неизвестная сортировка {sort_by!r}. Доступны: "
                 + ", ".join(storage.SCAN_SORTS),
                 sort_by=sort_by,
             )
-        if symbols:
-            return await _scan_explicit(symbols, intervals, market)
+        # Та же ловушка, что и с таймфреймом, но дороже: у остальных
+        # инструментов пара задаётся как symbol, и потерянный ключ здесь не
+        # просто менял ТФ, а тихо переключал режим — вместо пересчёта по бирже
+        # по одной монете уходил полный отбор по журналу.
+        wanted = list(symbols) if symbols else []
+        if symbol is not None and symbol not in wanted:
+            wanted.append(symbol)
+        if wanted:
+            return await _scan_explicit(wanted, intervals, market)
         return await _scan_screen(
             intervals,
             min_volume_usdt=min_volume_usdt,
