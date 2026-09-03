@@ -170,7 +170,26 @@ CORE_MAX_SYMBOLS = _env_int("COLLECTOR_MAX_SYMBOLS", 60)
 #: Порог попадания в архив свечей и в суточный снимок универсума. Ниже ядра:
 #: интересные сжатия чаще встречаются в диапазоне 10–50M, а хранение свечей
 #: по старшим ТФ стоит копейки — 0.9 МБ на монету за пять лет.
-ARCHIVE_MIN_VOLUME = _env_float("COLLECTOR_ARCHIVE_MIN_VOLUME", 10_000_000)
+#:
+#: 3M вместо 10M с 03.09.2026 (§4.30). Замерено в тот день: 231 монета против
+#: 121, и 15 из топ-20 по индексу на 4h — из полосы 3–10M, которую архив не
+#: видел вовсе; HOME, с которого начался разбор происхождения сжатия, тоже
+#: оттуда. Ниже 2M сознательно не идём: там стакан тонкий, takerB считается по
+#: десяткам сделок, и метрики шумят.
+ARCHIVE_MIN_VOLUME = _env_float("COLLECTOR_ARCHIVE_MIN_VOLUME", 3_000_000)
+
+#: Сколько НОВЫХ символов впускать в архив за один прогон.
+#:
+#: Понижение порога сразу приводит сотню незнакомых монет, и первый же прогон
+#: попытался бы взять по каждой 30 суток деривативов (36 запросов) плюс
+#: лестницу свечей (около 13 страниц). Это единовременный залп в несколько
+#: тысяч запросов там, где обычный прогон обходится сотнями.
+#:
+#: Растягивание ничего не стоит, и это ключевое свойство: окно деривативов у
+#: новичка всё равно начинается от границы доступных 30 суток, а не от момента
+#: приёма. Монета, впущенная через пять часов, получит ровно ту же историю, что
+#: и впущенная сейчас. Терять нечего, а пик нагрузки исчезает.
+NEW_SYMBOLS_PER_RUN = _env_int("COLLECTOR_NEW_SYMBOLS_PER_RUN", 25)
 
 INTERVAL_S = _env_int("COLLECTOR_INTERVAL_S", 3600)
 
@@ -798,6 +817,27 @@ def archived_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if row["quote_volume_24h"] >= ARCHIVE_MIN_VOLUME]
 
 
+def admit(
+    con: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    *,
+    limit: int = NEW_SYMBOLS_PER_RUN,
+) -> tuple[list[dict[str, Any]], int]:
+    """Знакомые символы плюс не более ``limit`` новых.
+
+    Возвращает пару «кого берём в этот прогон» и «сколько осталось в очереди».
+    Новые берутся по обороту, потому что ``rows`` уже отсортирован по нему:
+    крупная монета из очереди дождётся своего часа раньше мелкой.
+
+    Знакомым считается символ, попавший в таблицу `symbols`, — туда его пишет
+    снимок универсума при первом появлении в архивном слое.
+    """
+    known = storage.known_symbols(con, FUTURES.name)
+    familiar = [row for row in rows if row["symbol"] in known]
+    fresh = [row for row in rows if row["symbol"] not in known]
+    return familiar + fresh[:limit], max(0, len(fresh) - limit)
+
+
 async def snapshot_universe(
     client: BinanceClient,
     spot: BinanceClient,
@@ -851,7 +891,13 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
     try:
         rows = await universe_rows(client)
         core = core_symbols(rows)
-        archived = archived_rows(rows)
+        archived, waiting = admit(con, archived_rows(rows))
+        if waiting:
+            log.info(
+                "новых символов в очереди: %d — впускаются по %d за прогон, "
+                "история от этого не теряется",
+                waiting, NEW_SYMBOLS_PER_RUN,
+            )
         # Деривативы пишутся по всему архивному слою, а не по ядру. Замерено на
         # живой выдаче: из топ-15 по индексу восемь монет имели оборот ниже
         # порога ядра, то есть больше половины кандидатов в список наблюдения

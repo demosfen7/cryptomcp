@@ -812,3 +812,66 @@ class TestAccumulationLogging:
         ).fetchall()
         by_tf = {row["tf"]: row["absorption_tf"] for row in rows}
         assert by_tf.get("1h") is None
+
+
+class TestAdmission:
+    """Понижение порога приводит сотню новых монет разом (PLAN §4.30).
+
+    Растягивание приёма ничего не стоит: окно деривативов у новичка всё равно
+    начинается от границы доступных 30 суток, а не от момента приёма, — монета,
+    впущенная через пять часов, получит ту же историю.
+    """
+
+    def rows(self, count, start=100_000_000):
+        """Универсум, отсортированный по обороту, как его отдаёт universe_rows."""
+        return [
+            {"symbol": f"C{i:03d}USDT", "quote_volume_24h": start - i * 1_000_000}
+            for i in range(count)
+        ]
+
+    def test_new_symbols_are_capped(self, con):
+        from cryptomcp.collector import admit
+
+        admitted, waiting = admit(con, self.rows(30), limit=10)
+
+        assert len(admitted) == 10
+        assert waiting == 20
+
+    def test_biggest_new_symbols_go_first(self, con):
+        from cryptomcp.collector import admit
+
+        admitted, _ = admit(con, self.rows(30), limit=3)
+        assert [row["symbol"] for row in admitted] == [
+            "C000USDT", "C001USDT", "C002USDT"
+        ]
+
+    def test_known_symbols_are_never_held_back(self, con):
+        """Ограничитель тормозит приём, а не обслуживание уже принятых."""
+        from cryptomcp.collector import admit
+        from cryptomcp.markets import FUTURES
+
+        rows = self.rows(30)
+        for row in rows[10:]:
+            storage.remember_symbol(con, row["symbol"], FUTURES.name, 0)
+        con.commit()
+
+        admitted, waiting = admit(con, rows, limit=2)
+
+        assert len(admitted) == 22          # 20 знакомых плюс двое новых
+        assert waiting == 8
+        assert {row["symbol"] for row in rows[10:]} <= {
+            row["symbol"] for row in admitted
+        }
+
+    def test_nothing_new_means_no_queue(self, con):
+        from cryptomcp.collector import admit
+        from cryptomcp.markets import FUTURES
+
+        rows = self.rows(5)
+        for row in rows:
+            storage.remember_symbol(con, row["symbol"], FUTURES.name, 0)
+        con.commit()
+
+        admitted, waiting = admit(con, rows, limit=1)
+        assert len(admitted) == 5
+        assert waiting == 0
