@@ -35,6 +35,10 @@ class SymbolInfo:
     status: str
     market: str = "futures"
     spot_allowed: bool = True
+    #: Момент листинга по бирже (`onboardDate`). У спота такого поля нет, там
+    #: возраст берётся из архива по первой свече, и потому здесь 0, а не
+    #: выдуманное число.
+    onboard_ms: int = 0
 
     @property
     def is_perpetual(self) -> bool:
@@ -71,6 +75,7 @@ class SymbolRegistry:
                     status=row.get("status", ""),
                     market=market.name,
                     spot_allowed=bool(row.get("isSpotTradingAllowed", True)),
+                    onboard_ms=int(row.get("onboardDate") or 0),
                 )
             self._symbols = result
         return self._symbols

@@ -690,7 +690,7 @@ async def list_symbols(
         if min_volume_usdt is not None:
             min_quote_volume_usdt = min_volume_usdt
         client, _, registry, _, mkt = await _ctx(market)
-        tradable = {info.symbol for info in await registry.tradable()}
+        tradable = {info.symbol: info for info in await registry.tradable()}
         tickers = await client.ticker_24hr()
 
         rows = [
@@ -702,19 +702,100 @@ async def list_symbols(
         rows.sort(reverse=True)
         rows = rows[:limit]
 
+        other, other_label = await _other_market_volumes(market)
+        ages = _listing_ages(
+            [tradable[symbol] for _, symbol, _ in rows],
+            await client.now_ms(), mkt.name,
+        )
+
         kind = "перпетуалов" if mkt.has_derivatives else "спотовых пар"
         lines = [
             f"{mkt.label} · торгуемых {kind} с оборотом "
             f"≥ {min_quote_volume_usdt / 1e6:.0f}M USDT: {len(rows)}",
-            f"{'символ':<14}{'оборот 24ч':>14}{'24ч %':>9}",
+            f"{'символ':<14}{'оборот 24ч':>14}{'24ч %':>9}{'листинг':>11}"
+            f"{other_label:>12}",
         ]
-        lines += [
-            f"{symbol:<14}{volume / 1e6:>12,.0f}M{change:>9.2f}"
-            for volume, symbol, change in rows
-        ]
+        for volume, symbol, change in rows:
+            age = ages.get(symbol)
+            twin = other.get(symbol)
+            lines.append(
+                f"{symbol:<14}{volume / 1e6:>12,.0f}M{change:>9.2f}"
+                f"{f'{age} сут.' if age is not None else '—':>11}"
+                + (f"{twin / 1e6:>11,.1f}M" if twin is not None else f"{'нет':>12}")
+            )
+        lines += ["", f"{other_label} — оборот той же пары на соседнем рынке; "
+                  "«нет» значит, что пары там не существует."]
+        if mkt.has_derivatives:
+            # Замерено 03.09.2026 по 248 перпетуалам с оборотом от 3M. Числа
+            # стоят в выдаче не для красоты: без них тонкий спот читается как
+            # признак, хотя он норма у всех, включая BTC.
+            lines.append(
+                "  спота нет почти у трети ликвидных перпетуалов, а тонкий "
+                "спот сам по себе не примета: медианное отношение "
+                "спот/фьючерс 0.21, у BTC и ETH около 0.08. Значим обратный "
+                "случай, и он редок — таких монет три из 173."
+            )
+        lines.append(
+            "листинг — возраст пары. Моложе 60 суток означает, что перцентилям "
+            "не хватит базы и часть метрик вернётся с n/a."
+            + ("" if mkt.has_derivatives else
+               " У спота биржа даты листинга не отдаёт вовсе: возраст берётся "
+               "из архива, и для монет вне архива стоит прочерк.")
+        )
         return "\n".join(lines)
     except ToolError as error:
         return _fail(error)
+
+
+async def _other_market_volumes(market: str) -> tuple[dict[str, float], str]:
+    """Обороты той же пары на СОСЕДНЕМ рынке и подпись колонки.
+
+    Зачем: у 75 ликвидных перпетуалов из 248 спотовой пары нет вовсе, и до сих
+    пор это выяснялось только неудачным вызовом с market="spot" — при том что
+    подтверждение объёмом инструменты советуют искать именно на споте.
+
+    Отказ соседнего рынка не отменяет выдачу: колонка честно пустеет. Список
+    пар — не то, ради чего стоит возвращать ошибку целиком.
+    """
+    twin = "spot" if market == "futures" else "futures"
+    label = "спот" if twin == "spot" else "фьюч"
+    try:
+        client, _, _, _, _ = await _ctx(twin)
+        return {
+            row["symbol"]: float(row["quoteVolume"])
+            for row in await client.ticker_24hr()
+        }, label
+    except (ToolError, KeyError, ValueError):
+        return {}, label
+
+
+def _listing_ages(infos: list[Any], now_ms: int, market: str) -> dict[str, int]:
+    """Возраст листинга в сутках.
+
+    Два источника, и порядок между ними не случаен. У фьючерсов биржа отдаёт
+    `onboardDate` прямо в exchangeInfo — это точная дата, и она есть по всем
+    парам. У спота такого поля нет вовсе, там возраст берётся из архива по
+    первой свече; для монет вне архива его просто нет, и печатается прочерк.
+    """
+    ages = {
+        info.symbol: int((now_ms - info.onboard_ms) / 86_400_000)
+        for info in infos if info.onboard_ms
+    }
+    missing = [info.symbol for info in infos if info.symbol not in ages]
+    if not missing or archive_path() is None:
+        return ages
+    try:
+        con = _archive()
+    except ToolError:
+        return ages
+    try:
+        first = storage.listing_dates(con, market)
+    finally:
+        con.close()
+    for symbol in missing:
+        if symbol in first:
+            ages[symbol] = int((now_ms - first[symbol]) / 86_400_000)
+    return ages
 
 
 async def _now_ms() -> int:

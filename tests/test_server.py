@@ -404,3 +404,58 @@ class TestMergedSpellings:
     def test_nothing_given(self):
         """Пустой список — сигнал «бери значение по умолчанию», не ошибка."""
         assert _merged(None, None) == []
+
+
+class TestListingAges:
+    """Возраст листинга: два источника, и порядок между ними не случаен."""
+
+    def info(self, symbol, onboard_ms=0):
+        return SimpleNamespace(symbol=symbol, onboard_ms=onboard_ms)
+
+    def test_onboard_date_is_preferred(self):
+        from cryptomcp.server import _listing_ages
+
+        now = 1_788_500_000_000
+        ages = _listing_ages(
+            [self.info("BTCUSDT", now - 60 * 86_400_000)], now, "futures"
+        )
+        assert ages == {"BTCUSDT": 60}
+
+    def test_without_onboard_and_archive_the_age_is_absent(self, monkeypatch):
+        """Прочерк, а не ноль: возраст неизвестен, а не равен нулю.
+
+        Так у спота, где биржа даты листинга не отдаёт вовсе.
+        """
+        from cryptomcp import server
+
+        monkeypatch.setattr(server, "archive_path", lambda: None)
+        assert server._listing_ages([self.info("BTCUSDT")], 1_788_500_000_000,
+                                    "spot") == {}
+
+
+class TestOtherMarketVolumes:
+    """Соседний рынок не обязан отвечать."""
+
+    @pytest.mark.asyncio
+    async def test_failure_leaves_the_column_empty(self, monkeypatch):
+        from cryptomcp import server
+
+        async def broken(_market):
+            raise ToolError(ErrorKind.UPSTREAM_ERROR, "спот недоступен")
+
+        monkeypatch.setattr(server, "_ctx", broken)
+        volumes, label = await server._other_market_volumes("futures")
+
+        assert volumes == {}
+        assert label == "спот"
+
+    @pytest.mark.asyncio
+    async def test_label_follows_the_market(self, monkeypatch):
+        from cryptomcp import server
+
+        async def broken(_market):
+            raise ToolError(ErrorKind.UPSTREAM_ERROR, "фьючерсы недоступны")
+
+        monkeypatch.setattr(server, "_ctx", broken)
+        _, label = await server._other_market_volumes("spot")
+        assert label == "фьюч"
