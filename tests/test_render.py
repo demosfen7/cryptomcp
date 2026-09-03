@@ -18,6 +18,7 @@ from cryptomcp.render import (
     closed_through,
     render_derivatives,
     render_klines,
+    render_screen,
     render_snapshot,
 )
 from cryptomcp.series import INTERVAL_MS, build_series
@@ -345,3 +346,37 @@ class TestScanHistoryRender:
         groups = line[24:59]  # пять колонок по 7 знаков после времени и индекса
         assert groups.count("—") == 1
         assert "0.00" not in groups
+
+
+class TestEmptyScreenReason:
+    """Пустая выдача обязана называть СВОЮ причину.
+
+    Их три, и лечатся они разным: журнала по этому ТФ нет вовсе, фильтры
+    отсеяли всех, и — сразу после подъёма версии формулы — записи есть, но
+    прежнего поколения. Последняя причина временная и проходит сама с
+    ближайшим прогоном; без неё выдача винила таймфрейм, и это читалось как
+    поломка сканера.
+    """
+
+    def test_version_bump_is_named(self):
+        text = render_screen(
+            "4h", [], version="v4", sort_by="squeeze",
+            filtered=122, logged=0, matched=0, earlier=["v3"],
+        )
+        assert "формула поднята до v4" in text
+        assert "v3" in text
+        assert "ближайшим часовым прогоном" in text
+
+    def test_no_journal_at_all(self):
+        text = render_screen(
+            "2h", [], version="v4", sort_by="squeeze",
+            filtered=122, logged=0, matched=0,
+        )
+        assert "записей скана нет вовсе" in text
+
+    def test_filters_rejected_everyone(self):
+        text = render_screen(
+            "4h", [], version="v4", sort_by="squeeze",
+            filtered=122, logged=130, matched=0,
+        )
+        assert "ни одна не прошла фильтры" in text

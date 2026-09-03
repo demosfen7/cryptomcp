@@ -500,6 +500,22 @@ def record_outcome(
     )
 
 
+def earlier_versions(con: sqlite3.Connection, tf: str) -> list[str]:
+    """Версии формулы, по которым записи этого ТФ есть, кроме текущей.
+
+    Нужно ровно для одного случая: сразу после подъёма версии журнал пуст,
+    хотя данные в нём есть — просто прежнего поколения. Без этой подсказки
+    выдача винит таймфрейм («записей нет вовсе»), и пустой экран читается как
+    поломка сканера, хотя он наполнится ближайшим часовым прогоном.
+    """
+    rows = con.execute(
+        "SELECT DISTINCT formula_version FROM scan_log WHERE tf = ? "
+        "AND formula_version <> ? ORDER BY formula_version",
+        (tf, SQUEEZE_FORMULA_VERSION),
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
 def latest_scan(
     con: sqlite3.Connection, tf: str, formula_version: str | None = None
 ) -> list[dict[str, Any]]:

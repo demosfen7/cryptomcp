@@ -584,6 +584,20 @@ class TestScreenScan:
         rows = storage.screen_scan(con, "4h", sort_by="accumulation")
         assert [r["symbol"] for r in rows] == ["BBBUSDT", "AAAUSDT"]
 
+    def test_earlier_versions_seen_after_a_bump(self, con):
+        """Сразу после подъёма версии журнал пуст, но данные в нём есть."""
+        from cryptomcp import SQUEEZE_FORMULA_VERSION
+
+        self.scan(con, "AAAUSDT", 0.5)
+        con.execute(
+            "UPDATE scan_log SET formula_version = 'v0' WHERE symbol = 'AAAUSDT'"
+        )
+        con.commit()
+
+        assert storage.latest_scan(con, "4h") == []
+        assert storage.earlier_versions(con, "4h") == ["v0"]
+        assert SQUEEZE_FORMULA_VERSION not in storage.earlier_versions(con, "4h")
+
     def test_cluster_outranks_single_bars(self, con):
         """Кластер важнее счётчика одиночных баров (§4.25).
 

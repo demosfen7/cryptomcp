@@ -653,6 +653,7 @@ async def _scan_screen(
                 interval, matched[:limit], version=SQUEEZE_FORMULA_VERSION,
                 sort_by=sort_by, filtered=passed, logged=logged,
                 matched=len(matched),
+                earlier=storage.earlier_versions(con, interval) if not logged else (),
             ))
     finally:
         con.close()
