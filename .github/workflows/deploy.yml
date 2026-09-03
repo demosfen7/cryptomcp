@@ -108,3 +108,64 @@ jobs:
             https://cryptomcp.aithinglab.com/health || true)
           echo "внешний health: HTTP $code"
           test "$code" = "200"
+
+  # Уведомление о результате. Отдельная работа, а не шаг внутри deploy: шаг
+  # там не выполнился бы как раз в самом важном случае — когда упали тесты и
+  # до деплоя дело не дошло. `needs` обе работы + `if: always()` дают
+  # уведомление при любом исходе, включая «тесты красные, выката не было».
+  notify:
+    needs: [test, deploy]
+    if: always() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: есть ли секреты для уведомления
+        id: gate
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Секреты Telegram не заданы — уведомление пропущено."
+          fi
+
+      - name: сообщение в Telegram
+        if: steps.gate.outputs.ready == 'true'
+        # Значения контекста передаются через env, а не подставляются в текст
+        # скрипта: сообщение коммита пишет человек, и подстановка ${{ }} прямо
+        # в shell выполнила бы то, что он там напишет.
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_RESULT: ${{ needs.test.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -u
+          case "$TEST_RESULT:$DEPLOY_RESULT" in
+            success:success) head="✅ выкачен" ;;
+            success:skipped) head="⏭ собран, выката не было" ;;
+            success:*)       head="❌ выкат упал" ;;
+            *)               head="❌ тесты не прошли, выката не было" ;;
+          esac
+          subject=$(printf '%s' "$COMMIT_MESSAGE" | head -n 1)
+          text="cryptomcp: $head
+          ${SHA:0:7} · $ACTOR
+          ${subject:-без сообщения коммита}
+          тесты: $TEST_RESULT · деплой: $DEPLOY_RESULT
+          $RUN_URL"
+          # Отступы съедаются здесь, а не в тексте сообщения.
+          text=$(printf '%s' "$text" | sed 's/^[[:space:]]*//')
+          # Недоставленное уведомление не повод красить сборку: выкат к этому
+          # моменту уже случился, и его результат виден в Actions.
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+            --data-urlencode "chat_id=$TG_CHAT" \
+            --data-urlencode "text=$text" \
+            --data-urlencode "disable_web_page_preview=true" || true)
+          echo "telegram: HTTP $code"
