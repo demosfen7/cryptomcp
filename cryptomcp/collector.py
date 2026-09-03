@@ -30,7 +30,7 @@ import statistics
 import time
 from typing import Any
 
-from . import SQUEEZE_FORMULA_VERSION, render, storage
+from . import SQUEEZE_FORMULA_VERSION, manual, render, storage
 from .analysis import MIN_CANDLES, analyse_timeframe, required_candles
 from .client import BinanceClient
 from .config import Config
@@ -971,6 +971,48 @@ async def loop(con: sqlite3.Connection) -> None:
         await asyncio.sleep(INTERVAL_S)
 
 
+def merge_manual(
+    episodes: list[dict[str, Any]], manual: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Слить эпизоды сканера с ручными записями в один список.
+
+    Монета, стоящая в обеих базах, показывается ОДНОЙ строкой: ранг и индекс
+    берутся у сканера, заметка — у человека, источник печатается как
+    «scanner+manual». Две строки на одну пару читались бы как два разных
+    наблюдения, а это одно и то же (§4.28).
+
+    Ручная запись без сканерного эпизода идёт своей строкой и без ранга. Ранга
+    у неё нет не потому, что он потерян, а потому что её никто не ранжировал —
+    и по рангу её не снимут.
+    """
+    by_key = {(row["symbol"], row["tf"]): row for row in episodes}
+    merged = list(episodes)
+    for entry in manual:
+        key = (entry["symbol"], entry["tf"])
+        twin = by_key.get(key)
+        if twin is not None and not twin.get("exited_at"):
+            twin["note"] = entry.get("note")
+            twin["entered_by"] = "scanner+manual"
+            continue
+        merged.append({
+            "symbol": entry["symbol"],
+            "tf": entry["tf"],
+            "status": entry["status"],
+            "entered_at": entry["entered_at"],
+            "entered_by": "manual",
+            "exited_at": entry.get("removed_at"),
+            "exit_reason": entry.get("remove_reason"),
+            "price_at_entry": entry.get("price_at_entry"),
+            "note": entry.get("note"),
+            "rank_at_entry": None,
+            "last_rank": None,
+            "squeeze_index": None,
+            "last_index": None,
+            "accumulation_score": None,
+        })
+    return merged
+
+
 def watchlist_view(
     con: sqlite3.Connection,
     *,
@@ -978,6 +1020,8 @@ def watchlist_view(
     tf: str | None = None,
     limit: int = 100,
     now_ms: int | None = None,
+    manual_rows: list[dict[str, Any]] | None = None,
+    prices: dict[str, float] | None = None,
 ) -> str:
     """Список наблюдения текстом: один путь для CLI сборщика и MCP-сервера.
 
@@ -987,16 +1031,18 @@ def watchlist_view(
     наблюдения будет читаться и из терминала, и из чата, и расхождение между
     ними обнаружилось бы не сразу.
     """
-    rows = storage.episodes(con, status=status, tf=tf, limit=limit)
+    stamp = now_ms or int(dt.datetime.now(dt.UTC).timestamp() * 1000)
+    rows = merge_manual(
+        storage.episodes(con, status=status, tf=tf, limit=limit),
+        manual_rows or [],
+    )
     scans = {
         (scan["symbol"], timeframe): scan
         for timeframe in {row["tf"] for row in rows}
         for scan in storage.latest_scan(con, timeframe)
     }
     return render.render_watchlist(
-        rows,
-        scans,
-        now_ms=now_ms or int(dt.datetime.now(dt.UTC).timestamp() * 1000),
+        rows[:limit], scans, now_ms=stamp, prices=prices
     )
 
 
@@ -1060,7 +1106,22 @@ def main() -> None:
             log.info("%s", message)
             raise SystemExit(0 if alive else 1)
         if args.command == "watch":
-            print(watchlist_view(con))
+            # Ручные записи читаются ТОЛЬКО на чтение и только если файл уже
+            # есть: пишет в него сервер, и создавать его здесь нельзя. Без
+            # этого чтения терминал и чат показывали бы разные списки — то
+            # самое расхождение двух путей, из-за которого рендер общий.
+            manual_con = manual.read_only()
+            try:
+                print(watchlist_view(
+                    con,
+                    manual_rows=manual.entries(
+                        manual_con,
+                        now_ms=int(dt.datetime.now(dt.UTC).timestamp() * 1000),
+                    ),
+                ))
+            finally:
+                if manual_con is not None:
+                    manual_con.close()
             return
         if args.command == "notify-test":
             # Проверка связки «токен + chat id + бот в группе». Без неё

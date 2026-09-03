@@ -17,10 +17,11 @@ import logging
 import os
 import sqlite3
 import sys
+from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from . import SQUEEZE_FORMULA_VERSION, storage
+from . import SQUEEZE_FORMULA_VERSION, manual, storage
 from .analysis import (
     MIN_CANDLES,
     TimeframeView,
@@ -29,7 +30,7 @@ from .analysis import (
     weekly_pivots_from,
 )
 from .client import BinanceClient
-from .collector import watchlist_view
+from .collector import merge_manual, watchlist_view
 from .config import Config
 from .derivatives import DerivativesReader
 from .errors import ErrorKind, ToolError, bad_params
@@ -49,6 +50,7 @@ from .render import (
     render_screen,
     render_snapshot,
     render_squeeze_metrics,
+    render_watchlist,
     skip_label,
     utc,
 )
@@ -72,6 +74,11 @@ RAW_INTRADAY_CEILING = "1h"
 
 #: Таймфреймы, на которых пагинация не окупается: 60 суток требуют 58 страниц.
 NO_PAGINATION = {"1m"}
+
+#: Статусы списка наблюдения: к состояниям эпизодов сканера добавлены два
+#: состояния ручной записи (§4.28). «manual» — открытая, «removed» — снятая
+#: руками; истёкшая по сроку попадает в общий «expired».
+WATCHLIST_STATUSES = (*storage.EPISODE_STATUSES, "manual", "removed")
 
 config = Config.load()
 journal = Journal(config.journal_path)
@@ -710,6 +717,12 @@ async def list_symbols(
         return _fail(error)
 
 
+async def _now_ms() -> int:
+    """Часы биржи. Локальные в этом проекте нигде не считаются достоверными."""
+    client, _, _, _, _ = await _ctx("futures")
+    return await client.now_ms()
+
+
 async def _absorption(
     fetcher: ArchiveReader, symbol: str, interval: str, as_of_ms: int | None
 ) -> str:
@@ -755,6 +768,58 @@ def _archive() -> sqlite3.Connection:
         raise ToolError(ErrorKind.DATA_GAP, f"Архив не открылся: {error}") from error
 
 
+async def _manual_prices(manual_rows: list[dict[str, Any]]) -> dict[str, float]:
+    """Живые цены по монетам ручного списка — одним запросом на всех.
+
+    Нужны потому, что ручную запись заводят в том числе по монете ВНЕ архива,
+    и колонка «сейчас» у неё иначе всегда пуста. Запрос делается, только если
+    ручные записи есть: у пустого списка он был бы платой ни за что.
+    """
+    if not manual_rows:
+        return {}
+    client, _, _, _, _ = await _ctx("futures")
+    wanted = {row["symbol"] for row in manual_rows}
+    return {
+        row["symbol"]: float(row["lastPrice"])
+        for row in await client.ticker_24hr()
+        if row["symbol"] in wanted
+    }
+
+
+def _watchlist_text(
+    manual_rows: list[dict[str, Any]],
+    *,
+    now_ms: int,
+    status: str | None = None,
+    tf: str | None = None,
+    limit: int = 100,
+    prices: dict[str, float] | None = None,
+) -> str:
+    """Список наблюдения, устойчивый к отсутствию архива.
+
+    Ручные записи живут в СВОЁМ файле и от сборщика не зависят вовсе: сервер
+    без архива обязан показать их, а не отказать целиком. Эпизоды сканера при
+    этом честно объявляются недоступными — иначе пустая колонка ранга читалась
+    бы как «сканер ничего не отобрал» (§4.28).
+    """
+    try:
+        con = _archive()
+    except ToolError as error:
+        if not manual_rows:
+            raise
+        text = render_watchlist(
+            merge_manual([], manual_rows), {}, now_ms=now_ms, prices=prices
+        )
+        return f"{text}\n\nэпизоды сканера недоступны: {error.message}"
+    try:
+        return watchlist_view(
+            con, status=status, tf=tf, limit=limit,
+            now_ms=now_ms, manual_rows=manual_rows, prices=prices,
+        )
+    finally:
+        con.close()
+
+
 @server.tool(
     description=(
         "Список наблюдения, который ведёт фоновый сканер: какая пара и на "
@@ -774,21 +839,128 @@ async def get_watchlist(
     limit: int = 100,
 ) -> str:
     try:
-        if status is not None and status not in storage.EPISODE_STATUSES:
+        if status is not None and status not in WATCHLIST_STATUSES:
             raise bad_params(
                 f"Неизвестный статус {status!r}. Доступны: "
-                + ", ".join(storage.EPISODE_STATUSES),
+                + ", ".join(WATCHLIST_STATUSES),
                 status=status,
             )
         if timeframe is not None:
             timeframe = _validate_timeframes([timeframe])[0]
-        con = _archive()
+        now_ms = await _now_ms()
+        manual_con = manual.read_only()
         try:
-            return watchlist_view(
-                con, status=status, tf=timeframe, limit=max(1, min(limit, 500))
+            manual_rows = manual.entries(
+                manual_con, now_ms=now_ms, status=status, tf=timeframe
             )
         finally:
+            if manual_con is not None:
+                manual_con.close()
+        return _watchlist_text(
+            manual_rows, now_ms=now_ms, status=status, tf=timeframe,
+            limit=max(1, min(limit, 500)),
+            prices=await _manual_prices(manual_rows),
+        )
+    except ToolError as error:
+        return _fail(error)
+
+
+@server.tool(
+    description=(
+        "Добавить пару в список наблюдения РУКАМИ. Нужно для кандидатов, "
+        "найденных глазами, а не рангом: сканер отбирает по индексу, и часть "
+        "сетапов в его топ не попадает. Запись живёт в отдельной базе, сканер "
+        "её не трогает и по рангу не снимает — снять можно только "
+        "remove_from_watchlist или по сроку в 30 суток. Цена на момент "
+        "добавления фиксируется: без неё ручной отбор потом не сравнить со "
+        "сканерным. note — зачем взяли; она печатается под таблицей."
+    )
+)
+async def add_to_watchlist(
+    symbol: str, timeframe: str = "4h", note: str | None = None
+) -> str:
+    try:
+        client, _, registry, _, _ = await _ctx("futures")
+        info = await registry.get(symbol)
+        interval = _validate_timeframes([timeframe])[0]
+        # Цена берётся живой: ручную запись заводят в момент, когда смотрят на
+        # монету, а не на закрытии свечи. Разница с ценой входа сканерного
+        # эпизода (там последняя ЗАКРЫТАЯ свеча) невелика, но она есть, и при
+        # сравнении исходов о ней надо помнить (§4.28).
+        ticker = await client.ticker_24hr(info.symbol)
+        price = float(ticker["lastPrice"])
+        now_ms = await client.now_ms()
+
+        con = manual.connect()
+        try:
+            entry_id = manual.add(
+                con, info.symbol, interval,
+                entered_at=now_ms, note=note, price=price,
+            )
+            if not entry_id:
+                return (
+                    f"{info.symbol} {interval} уже в ручном списке — запись "
+                    f"не тронута. Снять: remove_from_watchlist."
+                )
+            manual_rows = manual.entries(con, now_ms=now_ms)
+        finally:
             con.close()
+
+        return (
+            f"{info.symbol} {interval} добавлена руками по цене "
+            f"{format_price(price, info.price_precision)}"
+            + (f" · {note}" if note else "")
+            + "\n\n"
+            + _watchlist_text(
+                manual_rows, now_ms=now_ms,
+                prices=await _manual_prices(manual_rows),
+            )
+        )
+    except ToolError as error:
+        return _fail(error)
+
+
+@server.tool(
+    description=(
+        "Убрать пару из РУЧНОГО списка наблюдения. Снимает все открытые ручные "
+        "записи по этой паре, на всех таймфреймах сразу: снимают монету, а не "
+        "строку. Эпизоды, отобранные сканером, этим инструментом не трогаются "
+        "— ими управляет ранг с гистерезисом. reason сохраняется: чем кончилось "
+        "наблюдение, потом и есть предмет разбора."
+    )
+)
+async def remove_from_watchlist(symbol: str, reason: str | None = None) -> str:
+    try:
+        client, _, registry, _, _ = await _ctx("futures")
+        info = await registry.get(symbol)
+        # Часы биржи, а не локальные: тем же временем меряется всё остальное
+        # в проекте, и срок ручной записи не должен зависеть от того, на
+        # сколько уплыли часы контейнера.
+        now_ms = await client.now_ms()
+
+        con = manual.connect()
+        try:
+            removed = manual.remove(
+                con, info.symbol, removed_at=now_ms, reason=reason
+            )
+            manual_rows = manual.entries(con, now_ms=now_ms)
+        finally:
+            con.close()
+
+        if not removed:
+            return (
+                f"{info.symbol} в ручном списке не значится. Записи сканера "
+                f"снимаются не здесь: их ведёт ранг с гистерезисом."
+            )
+        return (
+            f"{info.symbol}: снято ручных записей — {removed}"
+            + (f" · {reason}" if reason else "")
+            + "\n\n"
+            + _watchlist_text(
+                manual_rows, now_ms=now_ms,
+                prices=await _manual_prices(manual_rows),
+            )
+        )
     except ToolError as error:
         return _fail(error)
 

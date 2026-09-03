@@ -571,6 +571,7 @@ def render_watchlist(
     scans: dict[tuple[str, str], dict[str, Any]],
     *,
     now_ms: int,
+    prices: dict[str, float] | None = None,
 ) -> str:
     """Список наблюдения столбиком.
 
@@ -582,6 +583,11 @@ def render_watchlist(
     Колонка накопления печатается всегда, даже пока метрики нет: пустое место
     в ней — это «не измерено», а не «признака нет». Тот же принцип, по
     которому метрика без базы печатает причину, а не ноль.
+
+    Колонка «кем» — источник записи: scanner, manual или scanner+manual у
+    монеты, которую сканер отобрал сам, а человек до того заметил глазами
+    (§4.28). Заметки печатаются под таблицей: в строке им места нет, а
+    выбрасывать их нельзя — ради них ручную запись и заводят.
     """
     if not episodes:
         return "список наблюдения пуст"
@@ -603,7 +609,11 @@ def render_watchlist(
             if index_now is not None and index_in is not None else "—"
         )
         price_in = row.get("price_at_entry")
-        price_now = scan.get("price")
+        # У сканерной записи «сейчас» — цена последней закрытой свечи скана, у
+        # ручной её взять неоткуда: монеты может не быть в архиве вовсе, ради
+        # таких её и заводят руками. Тогда берётся живая цена, и это честно:
+        # цена входа у ручной записи тоже живая (§4.28).
+        price_now = scan.get("price") or (prices or {}).get(row["symbol"])
         move = (
             f"{(price_now / price_in - 1) * 100:+.1f}%"
             if price_now and price_in else "n/a"
@@ -617,7 +627,7 @@ def render_watchlist(
         line = (
             f"{row['symbol']:<14}{row['tf']:>4}{row['status']:>11}"
             f"{_pair(row.get('rank_at_entry'), row.get('last_rank')):>10}"
-            f"{index_now if index_now is not None else 0:>7.2f}{delta:>7}"
+            f"{f'{index_now:.2f}' if index_now is not None else '—':>7}{delta:>7}"
             f"{f'{accumulation:.2f}' if accumulation is not None else 'n/a':>8}"
             f"{narrow if narrow is not None else '—':>5}"
             f"{_price(price_in):>13}{move:>9}"
@@ -627,12 +637,23 @@ def render_watchlist(
             line += f"  ·  {row.get('exit_reason') or row['status']}"
         lines.append(line)
 
+    notes = [
+        f"  {row['symbol']} {row['tf']} — {row['note']}"
+        for row in episodes if row.get("note")
+    ]
+    if notes:
+        lines += ["", "заметки к ручным записям:"] + notes
+
     lines += [
         "",
         "ранг и Δинд — «при входе → сейчас»; инд — squeeze_index последнего скана",
         "узк — свечей подряд с шириной диапазона(20) ниже 20-го перцентиля "
         "своей истории",
         "накопл — метрика накопления; колонка заведена, метрика ещё не считается",
+        "кем — источник: scanner отбирает рангом, manual заводится руками и "
+        "рангом не снимается (только руками или по сроку в 30 суток)",
+        "«сейчас» у сканерных записей — цена последней закрытой свечи скана, "
+        "у ручных — живая: их вход тоже отмечен по живой",
     ]
     return "\n".join(lines)
 
