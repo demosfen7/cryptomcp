@@ -383,39 +383,56 @@ class TestEmptyScreenReason:
 
 
 class TestLadderColumns:
-    """Лестница снапшота показывает то, что видно только в сравнении строк."""
+    """Лестница снапшота показывает то, что видно только в сравнении строк.
 
-    def ladder(self, **kw):
+    Заготовка строится здесь, а не импортируется из соседнего тест-модуля:
+    кросс-импорты между тестами в проекте уже убирали однажды, и они ломаются
+    ровно там, где их не видно локально (в CI нет пакета ``tests``).
+    """
+
+    def view(self, interval="4h", *, ma_ratio=0.6, shock=None):
+        from cryptomcp.analysis import TimeframeView
+        from cryptomcp.indicators import Metric
+        from cryptomcp.volume import VolumeContext
+
+        return TimeframeView(
+            interval=interval, price=100.0, atr_value=2.0, atr_pct=2.0,
+            rsi_value=50.0, ema_state="above", structure="HH/HL",
+            position_in_range=0.5,
+            bbw=Metric("BBW", 0.04, pct_rank=10.0, n_obs=360, span_days=90),
+            atr_metric=Metric("ATR", 2.0, pct_rank=10.0, n_obs=360, span_days=90),
+            atr_declining_bars=10,
+            range_low=95.0, range_high=105.0, range_width=0.03,
+            range_width_atr=1.5, range_threshold=0.06,
+            range_metric=Metric("диапазон(20)", 10.0, unit="%", pct_rank=15.0,
+                                n_obs=360, span_days=90),
+            narrow_bars=20,
+            volume=VolumeContext(1.0, "сезонный слот", 250, ma_ratio, 0, 0.5),
+            profile=None,
+            divergence=None,
+            shock=shock,
+        )
+
+    def ladder(self, views):
         from cryptomcp.render import render_snapshot
         from cryptomcp.symbols import SymbolInfo
-        from tests.test_analysis import view as make_view
 
         info = SymbolInfo(
             symbol="TESTUSDT", base="TEST", quote="USDT", tick_size=0.001,
             price_precision=3, contract_type="PERPETUAL", status="TRADING",
         )
         return render_snapshot(
-            info, kw["views"], live_price=100.0, change_24h=1.0,
+            info, views, live_price=100.0, change_24h=1.0,
             quote_volume_24h=1e7, now_ms=1_788_000_000_000,
-            order=tuple(kw["views"]),
-        ), make_view
+            order=tuple(views),
+        )
 
     def test_ma_ratio_shows_the_divergence_between_timeframes(self):
         """Кейс ASTER 19.08.2026: дневная 0.24x при часовой 1.45x."""
-        from cryptomcp.volume import VolumeContext
-        from tests.test_analysis import view as make_view
-
-        def with_ma(interval, ratio):
-            return make_view(
-                interval=interval,
-                volume=VolumeContext(
-                    ratio=1.0, basis="сезонный слот", samples=60, ma_ratio=ratio,
-                    anomalous_bars=0, taker_buy_mean=0.5,
-                ),
-            )
-
-        views = {"1d": with_ma("1d", 0.24), "1h": with_ma("1h", 1.45)}
-        text, _ = self.ladder(views=views)
+        text = self.ladder({
+            "1d": self.view("1d", ma_ratio=0.24),
+            "1h": self.view("1h", ma_ratio=1.45),
+        })
 
         assert "MA20/100" in text
         assert "0.24x" in text
@@ -423,15 +440,13 @@ class TestLadderColumns:
 
     def test_shock_marks_the_squeeze_cell(self):
         from cryptomcp.analysis import Shock
-        from tests.test_analysis import view as make_view
 
         loud = Shock(bars_ago=9, range_atr=4.0, range_share=0.94, volume_ratio=5.6)
         quiet = Shock(bars_ago=2, range_atr=1.3, range_share=0.34, volume_ratio=1.5)
 
-        text, _ = self.ladder(views={"4h": make_view(interval="4h", shock=loud)})
-        assert "ШОК 4.0 ATR" in text
+        assert "ШОК 4.0 ATR" in self.ladder({"4h": self.view(shock=loud)})
 
-        text, _ = self.ladder(views={"4h": make_view(interval="4h", shock=quiet)})
+        text = self.ladder({"4h": self.view(shock=quiet)})
         # «ШОК» есть и в легенде под лестницей, поэтому проверяется ячейка.
         assert "ШОК 1.3" not in text
         ladder_row = next(line for line in text.splitlines() if line.startswith("4h "))
