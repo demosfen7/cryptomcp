@@ -56,6 +56,11 @@ services:
       COLLECTOR_CORE_MIN_VOLUME: "50000000"
       COLLECTOR_MAX_SYMBOLS: "60"
       COLLECTOR_INTERVAL_S: "3600"
+      # Уведомления о дельте списка наблюдения. Пустые значения — штатный
+      # режим: сборщик просто не шлёт ничего. Уведомляет только сборщик,
+      # MCP-серверу бот не нужен — он ничего не копит и дельты не знает.
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     volumes:
       # Именованный том, а не папка проекта: деплой синхронизирует /opt/cryptomcp
       # с --delete, и база в рабочей папке стиралась бы при каждом выкате.

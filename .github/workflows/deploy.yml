@@ -78,7 +78,10 @@ jobs:
           ssh -p "${{ secrets.SSH_PORT }}" -i ~/.ssh/id_ed25519 \
             "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
             "cd /opt/cryptomcp && \
-             printf 'MCP_AUTH_TOKEN=%s\n' '${{ secrets.MCP_AUTH_TOKEN }}' > .env && \
+             printf 'MCP_AUTH_TOKEN=%s\nTELEGRAM_BOT_TOKEN=%s\nTELEGRAM_CHAT_ID=%s\n' \\
+               '${{ secrets.MCP_AUTH_TOKEN }}' \\
+               '${{ secrets.TELEGRAM_BOT_TOKEN }}' \\
+               '${{ secrets.TELEGRAM_CHAT_ID }}' > .env && \
              chmod 600 .env && \
              docker compose up -d --build && \
              docker image prune -f"

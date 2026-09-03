@@ -38,6 +38,7 @@ from .derivatives import build_open_interest, side_of_flow
 from .errors import ToolError
 from .indicators import atr
 from .markets import FUTURES, SPOT
+from .notify import Telegram, notify_watchlist
 from .reader import WARMUP
 from .series import build_series, series_from_records
 from .volume import absorption
@@ -937,6 +938,13 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
             log.info("  + %s %s (ранг %s)", symbol, tf, extra)
         for symbol, tf, reason in changes["exited"]:
             log.info("  - %s %s (%s)", symbol, tf, reason)
+
+        # Только после commit: доставка не должна стоить данных. Молчащий
+        # Telegram — потеря уведомления, молчащий сборщик — потеря часа
+        # открытого интереса навсегда. notify_watchlist исключений не
+        # поднимает и молчит, когда состав списка не изменился.
+        if await notify_watchlist(changes):
+            log.info("telegram: дельта отправлена")
     finally:
         await client.aclose()
         await spot.aclose()
@@ -1009,11 +1017,24 @@ def health(con: sqlite3.Connection, *, interval_s: int = INTERVAL_S) -> tuple[bo
     return True, f"последний прогон {when} UTC, точек {row['rows']}"
 
 
+async def _notify_test() -> bool:
+    sender = Telegram.from_env()
+    if sender is None:
+        log.error("TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID пусты")
+        return False
+    stamp = dt.datetime.now(dt.UTC).strftime("%d.%m %H:%M")
+    if await sender.send(f"cryptomcp: проверка связи · {stamp} UTC"):
+        log.info("отправлено")
+        return True
+    log.error("не отправлено — причина выше")
+    return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Сборщик рыночных данных")
     parser.add_argument(
         "command",
-        choices=("once", "backfill", "loop", "health", "watch", "add"),
+        choices=("once", "backfill", "loop", "health", "watch", "add", "notify-test"),
         nargs="?",
         default="loop",
     )
@@ -1038,6 +1059,11 @@ def main() -> None:
         if args.command == "watch":
             print(watchlist_view(con))
             return
+        if args.command == "notify-test":
+            # Проверка связки «токен + chat id + бот в группе». Без неё
+            # настройку не подтвердить иначе как дождавшись смены состава
+            # списка, а она может не случиться сутками.
+            raise SystemExit(0 if asyncio.run(_notify_test()) else 1)
         if args.command == "add":
             if not args.symbol:
                 raise SystemExit("нужен символ: add CAKEUSDT [--tf 4h]")
