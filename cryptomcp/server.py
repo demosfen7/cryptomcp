@@ -141,6 +141,23 @@ def _fail(error: ToolError) -> str:
     return json.dumps(error.to_payload(), ensure_ascii=False, indent=2)
 
 
+def _merged(values: list[str] | None, single: str | None) -> list[str]:
+    """Слить список и то же значение в единственном числе.
+
+    Три инструмента принимают список там, где у соседних инструментов стоит
+    одиночное значение (symbols/symbol, timeframes/timeframe). Вызывающий
+    пишет привычное единственное число, а MCP-сервер лишний ключ отбрасывает
+    молча: модель аргументов собирается через create_model без
+    extra="forbid", то есть с умолчанием pydantic extra="ignore". Ошибки не
+    возникает — инструмент отвечает по умолчанию, и подмена незаметна.
+    Поэтому принимаются оба написания; порядок сохраняется, дубли отсеиваются.
+    """
+    merged = list(values) if values else []
+    if single is not None and single not in merged:
+        merged.append(single)
+    return merged
+
+
 def _validate_timeframes(values: list[str] | None) -> tuple[str, ...]:
     timeframes = tuple(values) if values else config.timeframes
     unknown = [tf for tf in timeframes if tf not in INTERVAL_MS]
@@ -222,7 +239,8 @@ async def _views(
         "таймфреймов, положение в диапазоне, RSI, ATR, объём с поправкой на "
         "время суток, ближайшие уровни и недельные пивоты, фандинг и открытый "
         "интерес, squeeze_index. Начинать разбор отсюда. По умолчанию "
-        "1w/1d/4h/1h/15m; 5m и 1m доступны, но запрашиваются явно. "
+        "1w/1d/4h/1h/15m; 5m и 1m доступны, но запрашиваются явно. Лестница "
+        "задаётся как timeframes списком, либо timeframe одним значением. "
         "Параметр market: futures (перпетуал, по умолчанию) или spot. Спот "
         "нужен, когда перпетуал тонкий: подтверждение пробоя объёмом честнее "
         "искать там, где происходит поставка. Деривативов у спота нет."
@@ -231,13 +249,16 @@ async def _views(
 async def get_market_snapshot(
     symbol: str,
     timeframes: list[str] | None = None,
+    timeframe: str | None = None,
     as_of_ms: int | None = None,
     market: str = "futures",
 ) -> str:
     try:
         client, fetcher, registry, derivatives, mkt = await _ctx(market)
         info = await registry.get(symbol)
-        intervals = _validate_timeframes(timeframes)
+        # Потерянный ключ возвращал всю лестницу по умолчанию вместо одного
+        # запрошенного ТФ.
+        intervals = _validate_timeframes(_merged(timeframes, timeframe) or None)
 
         views, skipped = await _views(
             fetcher, info.symbol, intervals, as_of_ms, market=mkt.name
@@ -480,29 +501,19 @@ async def scan_pairs(
     market: str = "futures",
 ) -> str:
     try:
-        # Единственный инструмент со списком таймфреймов: у остальных параметр
-        # называется timeframe, и вызывающий пишет привычное единственное
-        # число. Лишний ключ MCP-сервер молча отбрасывает (pydantic по
-        # умолчанию extra="ignore"), и вместо запрошенного ТФ выдача уходила
-        # на дефолтные 4h — тихо, без единого признака в шапке. Принимаем оба
-        # написания.
-        requested = list(timeframes) if timeframes else []
-        if timeframe is not None and timeframe not in requested:
-            requested.append(timeframe)
-        intervals = _validate_timeframes(requested or ["4h"])
+        # Потерянный таймфрейм уводил выдачу на дефолтные 4h, причём в шапке
+        # честно стояло 4h — признака подмены не было нигде.
+        intervals = _validate_timeframes(_merged(timeframes, timeframe) or ["4h"])
         if sort_by not in storage.SCAN_SORTS:
             raise bad_params(
                 f"Неизвестная сортировка {sort_by!r}. Доступны: "
                 + ", ".join(storage.SCAN_SORTS),
                 sort_by=sort_by,
             )
-        # Та же ловушка, что и с таймфреймом, но дороже: у остальных
-        # инструментов пара задаётся как symbol, и потерянный ключ здесь не
-        # просто менял ТФ, а тихо переключал режим — вместо пересчёта по бирже
-        # по одной монете уходил полный отбор по журналу.
-        wanted = list(symbols) if symbols else []
-        if symbol is not None and symbol not in wanted:
-            wanted.append(symbol)
+        # Здесь потеря ключа дороже: она не меняла ТФ, а тихо переключала
+        # режим — вместо пересчёта по бирже по названной монете уходил полный
+        # отбор по журналу.
+        wanted = _merged(symbols, symbol)
         if wanted:
             return await _scan_explicit(wanted, intervals, market)
         return await _scan_screen(
@@ -652,16 +663,24 @@ async def _scan_screen(
     description=(
         "Список торгуемых пар к USDT по обороту за сутки, со стейблкоин-парами, "
         "исключёнными из выдачи. Нужен, чтобы получить список для scan_pairs. "
-        "Параметр market: futures (только бессрочные контракты, по умолчанию) "
-        "или spot."
+        "Порог оборота: min_quote_volume_usdt, либо min_volume_usdt — как в "
+        "scan_pairs. Параметр market: futures (только бессрочные контракты, "
+        "по умолчанию) или spot."
     )
 )
 async def list_symbols(
     min_quote_volume_usdt: float = 50_000_000,
+    min_volume_usdt: float | None = None,
     limit: int = 50,
     market: str = "futures",
 ) -> str:
     try:
+        # Тот же порог оборота в scan_pairs зовётся min_volume_usdt. Разные
+        # имена одной величины — та же тихая потеря ключа: планка молча
+        # оставалась дефолтной, а в шапке печаталось «≥ 50M», из-за чего
+        # выдача выглядела правдоподобно и при потерянном фильтре.
+        if min_volume_usdt is not None:
+            min_quote_volume_usdt = min_volume_usdt
         client, _, registry, _, mkt = await _ctx(market)
         tradable = {info.symbol for info in await registry.tradable()}
         tickers = await client.ticker_24hr()

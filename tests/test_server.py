@@ -7,12 +7,15 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from cryptomcp.errors import ErrorKind, ToolError, insufficient_history
+from cryptomcp.markets import MARKETS
 from cryptomcp.series import INTERVAL_MS, build_series
-from cryptomcp.server import _views
+from cryptomcp.server import _merged, _views
 
 H4 = INTERVAL_MS["4h"]
 
@@ -275,3 +278,129 @@ class TestScanSymbolAlias:
 
         assert "symbol" in properties
         assert "symbols" in properties
+
+
+class TestParameterNamesAcrossTools:
+    """Расхождение имён между инструментами — тихая потеря ключа.
+
+    MCP-сервер собирает модель аргументов без extra="forbid", поэтому
+    незнакомый ключ не вызывает ошибки: он просто исчезает, и инструмент
+    отвечает по умолчанию — правдоподобно выглядящей, но не тем ответом.
+    Значит имена одной и той же величины обязаны совпадать по всему набору.
+    """
+
+    @staticmethod
+    async def _schemas():
+        from cryptomcp.server import server
+
+        return {
+            tool.name: set(tool.input_schema.get("properties", {}))
+            for tool in await server.list_tools()
+        }
+
+    @pytest.mark.asyncio
+    async def test_plural_parameter_always_has_a_singular_twin(self):
+        """Проверка односторонняя: вызывающий пишет единственное число.
+
+        Обратное неверно: get_derivatives работает по одной паре, и никакой
+        symbols ему не нужен.
+        """
+        schemas = await self._schemas()
+        singulars = {name for names in schemas.values() for name in names}
+
+        missing = {
+            tool: sorted(
+                plural for plural in names
+                if plural.endswith("s")
+                and plural[:-1] in singulars
+                and plural[:-1] not in names
+            )
+            for tool, names in schemas.items()
+        }
+        missing = {tool: gaps for tool, gaps in missing.items() if gaps}
+
+        assert missing == {}
+
+    @pytest.mark.asyncio
+    async def test_volume_threshold_spelled_both_ways(self):
+        """Один порог оборота, два исторических имени в разных инструментах."""
+        schemas = await self._schemas()
+
+        assert {"min_volume_usdt", "min_quote_volume_usdt"} <= schemas["list_symbols"]
+        assert "min_volume_usdt" in schemas["scan_pairs"]
+
+
+class TestSnapshotTimeframeAlias:
+    """get_market_snapshot — второй инструмент со списком таймфреймов.
+
+    Инструмент добирается до таймфреймов только после похода на биржу за
+    символом, поэтому окружение подменяется целиком: тесты этого проекта в
+    сеть не ходят.
+    """
+
+    @staticmethod
+    def _capture(monkeypatch):
+        seen: list[tuple[str, ...]] = []
+
+        class FakeRegistry:
+            async def get(self, symbol):
+                return SimpleNamespace(symbol=symbol.upper())
+
+        async def fake_ctx(market):
+            return None, None, FakeRegistry(), None, MARKETS[market]
+
+        async def fake_views(fetcher, symbol, intervals, as_of_ms, market=None):
+            seen.append(intervals)
+            # Останавливаем инструмент сразу после разбора таймфреймов: всё
+            # дальше — рендер, к имени параметра он отношения не имеет.
+            raise insufficient_history(symbol, intervals[0], 0, 1)
+
+        monkeypatch.setattr("cryptomcp.server._ctx", fake_ctx)
+        monkeypatch.setattr("cryptomcp.server._views", fake_views)
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_singular_narrows_the_ladder(self, monkeypatch):
+        from cryptomcp.server import get_market_snapshot
+
+        seen = self._capture(monkeypatch)
+        await get_market_snapshot("BTCUSDT", timeframe="1d")
+
+        assert seen == [("1d",)]
+
+    @pytest.mark.asyncio
+    async def test_plural_still_works(self, monkeypatch):
+        from cryptomcp.server import get_market_snapshot
+
+        seen = self._capture(monkeypatch)
+        await get_market_snapshot("BTCUSDT", timeframes=["1d", "4h"])
+
+        assert seen == [("1d", "4h")]
+
+    @pytest.mark.asyncio
+    async def test_default_ladder_survives(self, monkeypatch):
+        """Без параметров остаётся лестница из конфига, а не пустой список."""
+        from cryptomcp.server import config, get_market_snapshot
+
+        seen = self._capture(monkeypatch)
+        await get_market_snapshot("BTCUSDT")
+
+        assert seen == [config.timeframes]
+
+
+class TestMergedSpellings:
+    """Слияние списка с одиночным значением — общий помощник трёх мест."""
+
+    def test_singular_alone(self):
+        assert _merged(None, "1d") == ["1d"]
+
+    def test_plural_alone(self):
+        assert _merged(["1d", "4h"], None) == ["1d", "4h"]
+
+    def test_order_is_kept_and_duplicates_dropped(self):
+        assert _merged(["4h"], "1d") == ["4h", "1d"]
+        assert _merged(["4h"], "4h") == ["4h"]
+
+    def test_nothing_given(self):
+        """Пустой список — сигнал «бери значение по умолчанию», не ошибка."""
+        assert _merged(None, None) == []
