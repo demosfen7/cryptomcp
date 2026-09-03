@@ -236,13 +236,86 @@ class TestAbsorption:
         assert absorption(series, atr_values).interval == "1h"
 
 
+class TestAbsorptionWindow:
+    """Окно набора меряется сутками, а не свечами (PLAN §4.25).
+
+    Постоянные тридцать свечей означали тридцать часов на 1h и тридцать суток
+    на 1d — разные вопросы под одним именем. Кейс, на котором это поймано:
+    ASTER 1h на 19.08.2026, фаза набора началась в 51 свече назад и в окно не
+    попадала вовсе, из-за чего в выдаче стояло «баров набора 0».
+    """
+
+    def test_window_follows_calendar_not_candle_count(self):
+        from cryptomcp.volume import absorption_window
+
+        assert absorption_window("1h") == 72       # трое суток
+        assert absorption_window("4h") == 30       # трое суток мало, пол снизу
+        assert absorption_window("1d") == 30       # то же
+        assert absorption_window("5m") == 120      # потолок сверху
+
+    def test_bar_beyond_thirty_candles_is_found_on_1h(self):
+        """Тот самый бар, который старое окно не доставало."""
+        from cryptomcp.volume import anomalous_bars
+
+        step = INTERVAL_MS["1h"]
+        raw = [kline(T0 + i * step, step, 100.0) for i in range(120)]
+        # Пятидесятая свеча с конца: внутри трёх суток, вне тридцати часов.
+        raw[-50] = kline(raw[-50][0], step, 500.0)
+        s = build_series(raw, "T", "1h", raw[-1][6] + 10_000, grace_ms=0)
+        atr_values = np.full(len(s), 10.0)
+
+        assert anomalous_bars(s, atr_values) == 1
+        assert anomalous_bars(s, atr_values, window=30) == 0
+
+
+class TestQuietBarFloor:
+    """Тело сравнивается с максимумом из 0.5 ATR и 0.3% цены (PLAN §4.25).
+
+    Порог, привязанный только к ATR, в сжатии падает вместе с ним и признак
+    исчезает ровно там, где он нужен.
+    """
+
+    def series(self, body: float, volume: float = 500.0):
+        step = H4
+        raw = [kline(T0 + i * step, step, 100.0) for i in range(60)]
+        row = kline(raw[-5][0], step, volume)
+        row[4] = f"{100.0 + body:.8f}"
+        row[2] = f"{100.0 + body + 1:.8f}"
+        raw[-5] = row
+        return build_series(raw, "T", "4h", raw[-1][6] + 10_000, grace_ms=0)
+
+    def test_small_body_counted_when_atr_is_compressed(self):
+        from cryptomcp.volume import anomalous_bars
+
+        # ATR 0.2 при цене 100 — половина ATR это 0.1, тело 0.2 её превышает.
+        # Абсолютный потолок 0.3% = 0.3 и делает бар набором, как и должно.
+        s = self.series(body=0.2)
+        assert anomalous_bars(s, np.full(len(s), 0.2)) == 1
+
+    def test_body_above_both_thresholds_not_counted(self):
+        from cryptomcp.volume import anomalous_bars
+
+        s = self.series(body=0.4)
+        assert anomalous_bars(s, np.full(len(s), 0.2)) == 0
+
+    def test_floor_changes_nothing_when_atr_is_normal(self):
+        """У ликвидной монеты 0.5 ATR и так больше 0.3% — потолок молчит."""
+        from cryptomcp.volume import anomalous_bars
+
+        s = self.series(body=0.4)
+        assert anomalous_bars(s, np.full(len(s), 10.0)) == 1
+
+
 class TestVolumeLeadsPrice:
     """Признак, отличающий набор позиции от реакции на событие.
 
-    Замерено на живых данных: ASTER 19.08 даёт +8 свечей (объём пришёл
-    заранее), UAI 29–30.08 даёт −2 (объём догонял цену). Без требования
-    «свеча всплеска тихая» оба давали положительное число, и признак не
-    различал случаи вовсе — 8 против 2.
+    Замерено на живых данных: ASTER 19.08 даёт +29 свечей (объём пришёл
+    заранее), UAI 02.09 — +4 (объём догонял цену). Без требования «свеча
+    всплеска тихая» оба давали близкие положительные числа, и признак не
+    различал случаи вовсе.
+
+    Ряды в тестах длиннее окна: окно с §4.25 задаётся сутками, и на 1h это 72
+    свечи, а не 30.
     """
 
     def series(self, bars):
@@ -267,7 +340,7 @@ class TestVolumeLeadsPrice:
     def test_quiet_spike_before_move_is_accumulation(self):
         from cryptomcp.volume import volume_leads_price
 
-        bars = [(1000.0, 0.0)] * 45 + [(5000.0, 0.1)] + [(1000.0, 0.0)] * 5
+        bars = [(1000.0, 0.0)] * 87 + [(5000.0, 0.1)] + [(1000.0, 0.0)] * 5
         bars += [(1200.0, 2.0)] + [(1000.0, 0.0)] * 3
         series, atr_values = self.series(bars)
 
@@ -279,7 +352,7 @@ class TestVolumeLeadsPrice:
         """Всплеск объёма СВОИМ телом — это реакция, а не набор. Кейс UAI."""
         from cryptomcp.volume import volume_leads_price
 
-        bars = [(1000.0, 0.0)] * 45 + [(5000.0, 2.5)] + [(1000.0, 0.0)] * 9
+        bars = [(1000.0, 0.0)] * 87 + [(5000.0, 2.5)] + [(1000.0, 0.0)] * 9
         series, atr_values = self.series(bars)
 
         lead, state = volume_leads_price(series, atr_values)
@@ -290,7 +363,7 @@ class TestVolumeLeadsPrice:
         """Самое интересное состояние: набор был, развязки ещё нет."""
         from cryptomcp.volume import volume_leads_price
 
-        bars = [(1000.0, 0.0)] * 45 + [(5000.0, 0.1)] + [(1000.0, 0.0)] * 9
+        bars = [(1000.0, 0.0)] * 87 + [(5000.0, 0.1)] + [(1000.0, 0.0)] * 9
         series, atr_values = self.series(bars)
 
         lead, state = volume_leads_price(series, atr_values)
@@ -300,15 +373,15 @@ class TestVolumeLeadsPrice:
     def test_nothing_happened(self):
         from cryptomcp.volume import volume_leads_price
 
-        series, atr_values = self.series([(1000.0, 0.0)] * 55)
+        series, atr_values = self.series([(1000.0, 0.0)] * 97)
         lead, state = volume_leads_price(series, atr_values)
         assert lead is None
         assert "ни всплеска" in state
 
     def test_plural_forms_are_readable(self):
-        from cryptomcp.volume import _candles
+        from cryptomcp.volume import candles
 
-        assert _candles(1) == "1 свечу"
-        assert _candles(3) == "3 свечи"
-        assert _candles(8) == "8 свечей"
-        assert _candles(11) == "11 свечей"
+        assert candles(1) == "1 свечу"
+        assert candles(3) == "3 свечи"
+        assert candles(8) == "8 свечей"
+        assert candles(11) == "11 свечей"

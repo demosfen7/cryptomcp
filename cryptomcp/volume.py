@@ -23,6 +23,42 @@ DAY_MS = 86_400_000
 #: Таймфреймы, на которых суточной сезонности нет по построению.
 _NO_SEASONALITY = {"1d", "3d", "1w"}
 
+#: Абсолютный потолок тела «тихой» свечи, доля цены открытия.
+#:
+#: Порог, привязанный только к ATR, самоуничтожается ровно там, где нужен: в
+#: сжатии ATR падает, вместе с ним падает и планка. Замерено на ASTER 1h
+#: 18.08.2026: ATR 0.31%, то есть половина ATR — 0.16%, а свеча с объёмом 4.4x
+#: имела тело 0.37% и в набор не попадала. Потолок берётся МАКСИМУМОМ из двух:
+#: по рынку он ничего не меняет (20 баров из 2310 на 77 монетах — столько же,
+#: сколько без него), потому что у ликвидной монеты 0.5 ATR и так больше 0.3%,
+#: и включается только при сжатом ATR.
+QUIET_BAR_PCT = 0.003
+
+#: Календарный срок окна поглощения. Фаза набора меряется сутками, а не
+#: свечами: тридцать свечей — это тридцать часов на 1h и тридцать суток на 1d.
+#: Та же поправка, что сделана для базы перцентилей в §4.17.
+ABSORPTION_WINDOW_DAYS = 3
+
+#: Границы окна в свечах. Нижняя оставляет прежние 30 свечей там, где трёх
+#: суток мало (4h и старше); верхняя держит счёт сопоставимым и цикл конечным
+#: на 15m и 5m, где трое суток — это сотни свечей.
+ABSORPTION_WINDOW_MIN = 30
+ABSORPTION_WINDOW_MAX = 120
+
+
+def absorption_window(interval: str) -> int:
+    """Окно поглощения в свечах для таймфрейма.
+
+    Замерено на кейсе, ради которого правка делалась. ASTER 1h на 19.08.2026
+    00:00 UTC: фаза набора шла с 16.08 21:00, то есть в 51–55 свечах назад,
+    и окно в 30 свечей до неё физически не дотягивалось — «баров набора 0»
+    означало не отсутствие набора, а слишком короткую память. С окном в трое
+    суток тех же баров находится три.
+    """
+    candles = int(ABSORPTION_WINDOW_DAYS * 86_400_000 / interval_ms(interval))
+    return max(ABSORPTION_WINDOW_MIN, min(ABSORPTION_WINDOW_MAX, candles))
+
+
 #: Минимум наблюдений на слот, ниже которого baseline объявляется слабым.
 MIN_SAMPLES_PER_SLOT = 10
 
@@ -46,6 +82,9 @@ class VolumeContext:
     anomalous_bars: int
     #: Средняя доля тейкер-покупок за последние 30 свечей.
     taker_buy_mean: float
+    #: Окно, на котором считались бары набора. Зависит от таймфрейма
+    #: (absorption_window), поэтому печатается вместе с числом.
+    bars_window: int = ABSORPTION_WINDOW_MIN
 
     @property
     def weak_basis(self) -> bool:
@@ -68,7 +107,8 @@ class VolumeContext:
             "samples": self.samples,
             "weak_basis": self.weak_basis,
             "ma20_over_ma100": round(self.ma_ratio, 3),
-            "anomalous_bars_30": self.anomalous_bars,
+            "anomalous_bars": self.anomalous_bars,
+            "anomalous_bars_window": self.bars_window,
             "taker_buy_mean_30": round(self.taker_buy_mean, 3),
         }
 
@@ -181,15 +221,26 @@ def seasonal_baseline(series: Series) -> tuple[float, str, int]:
     return float(baseline.values[-1]), baseline.basis, int(baseline.samples[-1])
 
 
-def anomalous_bars(series: Series, atr_values: np.ndarray, *, window: int = 30,
+def quiet_bar(body: float, atr_value: float, open_price: float,
+              *, move_atr_fraction: float = 0.5) -> bool:
+    """Тихая ли свеча: тело мало и по волатильности, и в абсолюте."""
+    return body < max(move_atr_fraction * atr_value, QUIET_BAR_PCT * open_price)
+
+
+def anomalous_bars(series: Series, atr_values: np.ndarray, *, window: int | None = None,
                    volume_multiple: float = 3.0, move_atr_fraction: float = 0.5) -> int:
     """Бары с большим объёмом и малым движением цены (ТЗ §4.2, группа 2).
 
     Интерпретация из ТЗ: набор позиции без движения цены. Объём сравнивается
-    со скользящей средней, движение — с ATR, чтобы порог был сопоставим с
-    волатильностью инструмента, а не задан в процентах на все случаи.
+    со скользящей средней ДВАДЦАТИ свечей, а не с сезонной базой §4.10, и это
+    осознанно: сезонная база даёт втрое больше срабатываний (3.12% баров против
+    0.87% на тех же 2310 барах), то есть множитель «3x» означал бы при ней
+    совсем другую редкость. База подписана в выдаче, чтобы её нельзя было
+    спутать со строкой «текущий/база» выше, которая считается сезонной.
     """
     volumes = series.quote_volume
+    if window is None:
+        window = absorption_window(series.interval)
     if len(volumes) < window + 20:
         return 0
 
@@ -204,7 +255,10 @@ def anomalous_bars(series: Series, atr_values: np.ndarray, *, window: int = 30,
         if np.isnan(mean) or np.isnan(atr_value) or mean <= 0 or atr_value <= 0:
             continue
         big_volume = volumes[i] >= volume_multiple * mean
-        small_move = abs(closes[i] - opens[i]) < move_atr_fraction * atr_value
+        small_move = quiet_bar(
+            abs(closes[i] - opens[i]), atr_value, opens[i],
+            move_atr_fraction=move_atr_fraction,
+        )
         if big_volume and small_move:
             count += 1
     return count
@@ -231,6 +285,7 @@ def volume_context(series: Series, atr_values: np.ndarray) -> VolumeContext:
         ma_ratio=ma_ratio,
         anomalous_bars=anomalous_bars(series, atr_values),
         taker_buy_mean=taker_mean,
+        bars_window=absorption_window(series.interval),
     )
 
 
@@ -239,10 +294,6 @@ TAKER_NEUTRAL = 0.50
 
 #: Выше этого доля считается перевесом покупателя, а не шумом вокруг нейтрали.
 TAKER_PRESSURE = 0.55
-
-#: Окно, на котором меряется поглощение. То же, что у аномальных баров.
-ABSORPTION_WINDOW = 30
-
 
 #: Во сколько раз объём должен превысить базу, чтобы считаться всплеском.
 LEAD_VOLUME_MULTIPLE = 3.0
@@ -317,9 +368,11 @@ def longest_streak(values: np.ndarray, threshold: float) -> int:
 
 
 def absorption(
-    series: Series, atr_values: np.ndarray, *, window: int = ABSORPTION_WINDOW
+    series: Series, atr_values: np.ndarray, *, window: int | None = None
 ) -> Absorption:
     """Поглощение по младшему ряду: бары набора и разрешение по тейкерам."""
+    if window is None:
+        window = absorption_window(series.interval)
     taker = series.taker_buy_ratio[-window:]
     lead_bars, lead_state = volume_leads_price(series, atr_values, window=window)
     volumes = series.quote_volume
@@ -343,7 +396,7 @@ def absorption(
     )
 
 
-def _candles(count: int) -> str:
+def candles(count: int) -> str:
     """«1 свечу», «2 свечи», «5 свечей» — иначе выдача читается как машинная."""
     tail = abs(count) % 10
     hundred = abs(count) % 100
@@ -358,7 +411,7 @@ def volume_leads_price(
     series: Series,
     atr_values: np.ndarray,
     *,
-    window: int = ABSORPTION_WINDOW,
+    window: int | None = None,
     volume_multiple: float = LEAD_VOLUME_MULTIPLE,
     move_atr: float = LEAD_MOVE_ATR,
 ) -> tuple[int | None, str]:
@@ -389,6 +442,8 @@ def volume_leads_price(
     считались бы от разных величин, и сравнивать их стало бы нельзя.
     """
     volumes = series.quote_volume
+    if window is None:
+        window = absorption_window(series.interval)
     if len(volumes) < window + 20:
         return None, "n/a (истории меньше окна)"
 
@@ -402,7 +457,10 @@ def volume_leads_price(
         mean, atr_value = rolling[i], atr_values[i] if i < len(atr_values) else np.nan
         if np.isnan(mean) or np.isnan(atr_value) or mean <= 0 or atr_value <= 0:
             continue
-        quiet = abs(closes[i] - opens[i]) < QUIET_BAR_ATR * atr_value
+        quiet = quiet_bar(
+            abs(closes[i] - opens[i]), atr_value, opens[i],
+            move_atr_fraction=QUIET_BAR_ATR,
+        )
         if first_volume is None and quiet and volumes[i] >= volume_multiple * mean:
             first_volume = i
         if first_move is None and abs(closes[i] - opens[i]) >= move_atr * atr_value:
@@ -414,11 +472,11 @@ def volume_leads_price(
         return None, "всплеск объёма был движением цены, а не набором"
     if first_move is None:
         waited = len(volumes) - 1 - first_volume
-        return waited, f"всплеск объёма {_candles(waited)} назад, движения ещё не было"
+        return waited, f"всплеск объёма {candles(waited)} назад, движения ещё не было"
 
     lead = first_move - first_volume
     if lead > 0:
-        return lead, f"объём опередил цену на {_candles(lead)}"
+        return lead, f"объём опередил цену на {candles(lead)}"
     if lead == 0:
         return 0, "объём и движение одной свечой"
-    return lead, f"объём пришёл на {_candles(-lead)} ПОЗЖЕ движения"
+    return lead, f"объём пришёл на {candles(-lead)} ПОЗЖЕ движения"

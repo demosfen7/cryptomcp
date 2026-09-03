@@ -31,6 +31,7 @@ from .volume import (
     TAKER_PRESSURE,
     Absorption,
     baseline_series,
+    candles,
 )
 
 #: Ближе этого расстояния уровень считается «под ценой», и показывается
@@ -362,8 +363,12 @@ def render_squeeze_metrics(view: TimeframeView) -> str:
         + ("  (слабая база)" if volume.weak_basis else ""),
         f"   MA20/MA100       {volume.ma_ratio:.2f}x  → "
         + ("затухание" if volume.ma_ratio < 1 else "рост"),
-        f"   аномальные бары  {volume.anomalous_bars} за 30 свечей "
-        f"(объём ≥3x при |Δцены| <0.5 ATR)",
+        # База здесь ДРУГАЯ, чем строкой выше: там сезонная, здесь скользящая
+        # двадцатка. Разница вещественная — у ASTER 18.08 одна и та же свеча
+        # давала 7.14x и 4.40x, — поэтому база подписана у каждого числа.
+        f"   бары набора      {volume.anomalous_bars} за "
+        f"{candles(volume.bars_window)} "
+        f"(объём ≥3x к MA20 при тихом теле: <0.5 ATR или <0.3%)",
         f"   taker buy доля   {volume.taker_buy_mean:.2f} средняя за 30 (нейтраль 0.50)",
         "",
         "3. Диапазон",
@@ -664,9 +669,9 @@ def render_absorption(data: Absorption | None, *, skipped: str | None = None) ->
     # «3+ подряд» — та граница, ниже которой серия неотличима от выброса.
     streak = f"{data.taker_streak} подряд" if data.taker_streak else "нет"
     return "\n".join([
-        f"\n\n6. Поглощение (ряд {data.interval}, окно {data.window} свечей)",
+        f"\n\n6. Поглощение (ряд {data.interval}, окно {candles(data.window)})",
         f"   бары набора      {data.bars} "
-        f"(объём ≥3x при |Δцены| <0.5 ATR)",
+        f"(объём ≥3x к MA20 при тихом теле: <0.5 ATR или <0.3%)",
         f"   takerB           средняя {data.taker_mean:.2f} · "
         f"максимум {data.taker_max:.2f} · "
         f"выше {TAKER_PRESSURE:.2f}: {data.taker_above} свечей",
