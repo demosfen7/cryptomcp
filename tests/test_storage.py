@@ -208,7 +208,8 @@ class TestOhlcv:
 class FakeView:
     """Минимальное представление, какого хватает журналу скана."""
 
-    def __init__(self, interval="4h", closed_through_ms=1000, index=0.42):
+    def __init__(self, interval="4h", closed_through_ms=1000, index=0.42,
+                 shock=None):
         self.interval = interval
         self.squeeze_index = index
         self.components = {"volatility": 0.5, "range": 0.1}
@@ -222,6 +223,8 @@ class FakeView:
         self.ema_state, self.structure = "above", "HH/HL"
         self.bbw = type("M", (), {"pct_rank": 12.0})()
         self.volume = type("V", (), {"ratio": 1.2, "taker_buy_mean": 0.51})()
+        # Шока может не быть вовсе — сжатия нет или оно короче порога.
+        self.shock = shock
         self.meta = {"closed_through_ms": closed_through_ms}
 
 
@@ -258,6 +261,32 @@ class TestScanLog:
                                 FakeView(interval=tf, closed_through_ms=5000),
                                 formula_version="v2")
         assert con.execute("SELECT COUNT(*) c FROM scan_log").fetchone()["c"] == 2
+
+
+class TestScanLogShockColumns:
+    """Признаки §4.26 пишутся с первого дня, как и признаки накопления."""
+
+    def test_shock_columns_written(self, con):
+        from cryptomcp.analysis import Shock
+
+        shock = Shock(bars_ago=9, range_atr=4.0, range_share=0.94, volume_ratio=5.6)
+        storage.record_scan(con, "HOMEUSDT", "futures", FakeView(shock=shock),
+                            formula_version="v4")
+
+        row = con.execute("SELECT * FROM scan_log").fetchone()
+        assert row["shock_atr"] == pytest.approx(4.0)
+        assert row["shock_share"] == pytest.approx(0.94)
+        assert row["shock_volume"] == pytest.approx(5.6)
+        assert row["shock_bars_ago"] == 9
+
+    def test_no_squeeze_leaves_shock_empty(self, con):
+        """Пусто значит «сжатия нет», и это не то же самое, что ноль."""
+        storage.record_scan(con, "BTCUSDT", "futures", FakeView(),
+                            formula_version="v4")
+
+        row = con.execute("SELECT * FROM scan_log").fetchone()
+        assert row["shock_atr"] is None
+        assert row["shock_bars_ago"] is None
 
 
 class TestOutcomeQueries:

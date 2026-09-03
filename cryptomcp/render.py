@@ -15,10 +15,10 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
-from .analysis import TimeframeView
+from .analysis import SHOCK_RANGE_ATR, SHOCK_VOLUME_MULTIPLE, TimeframeView
 from .derivatives import Funding, OpenInterest, side_of_flow
 from .errors import ErrorKind, ToolError
 from .indicators import Metric
@@ -187,11 +187,16 @@ def render_snapshot(
         # (порог ширины диапазона), а не перцентиль BBW. Раньше оба числа стояли
         # в одной фразе через запятую и читались как одно.
         squeeze += f" · узк {view.narrow_bars}"
+        # Событие внутри окна сжатия печатается рядом с длительностью, потому
+        # что оно эту длительность и обесценивает (§4.26).
+        if view.shock is not None and view.shock.loud:
+            squeeze += f" · ШОК {view.shock.range_atr:.1f} ATR"
         volume = f"{view.volume.ratio:.2f}x" + ("~" if view.volume.weak_basis else "")
         lines.append(
             f"{interval:<5}{view.ema_state:<8}{view.structure:<9}"
             f"{view.position_in_range:>5.2f}{view.rsi_value:>6.1f}"
-            f"{view.atr_pct:>6.2f}%{volume:>8}{view.volume.taker_buy_mean:>8.2f}  {squeeze}"
+            f"{view.atr_pct:>6.2f}%{volume:>8}"
+            f"{view.volume.taker_buy_mean:>8.2f}  {squeeze}"
         )
 
     lines.append("")
@@ -212,7 +217,8 @@ def render_snapshot(
     lines.append("EMA — цена против EMA50/EMA200; структ — два последних swing-экстремума")
     lines.append(
         "узк N — свечей подряд с шириной диапазона(20) ниже 20-го перцентиля "
-        "СВОЕЙ истории"
+        "СВОЕЙ истории; ШОК — бар внутри этого окна размахом от 3 ATR при "
+        "объёме от 3x, то есть сжатие держит внутри себя событие"
     )
 
     anchor = views.get("4h") or next(iter(views.values()))
@@ -383,6 +389,24 @@ def render_squeeze_metrics(view: TimeframeView) -> str:
         ),
         "",
     ]
+    # Длительность сжатия меряет не то, что кажется, если внутри окна стоит
+    # бар размахом почти во весь диапазон (§4.26). Вывод не делается: событие
+    # в узком диапазоне бывает и истощением, и перезарядкой.
+    if view.shock is not None:
+        shock = view.shock
+        share = f"{shock.range_share * 100:.0f}% ширины"
+        if shock.loud:
+            note = (
+                f"   шок внутри       бар {shock.range_atr:.1f} ATR = {share}, "
+                f"объём {shock.volume_ratio:.1f}x, {candles(shock.bars_ago)} назад "
+                f"— СОБЫТИЕ внутри сжатия"
+            )
+        else:
+            note = (
+                f"   шок внутри       нет: максимум {shock.range_atr:.1f} ATR "
+                f"({share}) при объёме {shock.volume_ratio:.1f}x"
+            )
+        lines.insert(len(lines) - 1, note)
 
     if view.profile:
         inside = "ВНУТРИ" if view.profile.contains(view.price) else "вне"
@@ -490,6 +514,22 @@ def _cell(value: Any, spec: str = "") -> str:
     if value is None:
         return "—"
     return f"{value:{spec}}" if spec else f"{value}"
+
+
+def _shock(row: Mapping[str, Any]) -> str:
+    """Размах события внутри сжатия — или прочерк.
+
+    Печатается только событие: размах от 3 ATR при объёме от 3x. Самый широкий
+    бар тихого диапазона в колонке не нужен — в узком диапазоне он есть всегда
+    и ни о чём не говорит (§4.26). Пустая ячейка здесь значит «сжатия нет или
+    оно тихое», и это разные вещи, но обе — не событие.
+    """
+    atr_value, volume = row.get("shock_atr"), row.get("shock_volume")
+    if atr_value is None or volume is None:
+        return "—"
+    if atr_value < SHOCK_RANGE_ATR or volume < SHOCK_VOLUME_MULTIPLE:
+        return "—"
+    return f"{atr_value:.1f}"
 
 
 def _price(value: Any) -> str:
@@ -606,8 +646,8 @@ def render_scan_history(
     lines = [
         f"{symbol} · {tf} · формула {version} · записей {len(rows)}, свежие сверху",
         f"{'закрыта':<17}{'индекс':>7}{header}{'BBW':>6}{'диап':>8}{'узк':>5}"
-        f"{'объём':>8}{'погл':>6}{'клст':>6}{'tkМакс':>8}{'лид':>6}"
-        f"{'фанд%':>9}{'цена':>13}",
+        f"{'объём':>8}{'шок':>6}{'погл':>6}{'клст':>6}{'tkМакс':>8}"
+        f"{'лид':>6}{'фанд%':>9}{'цена':>13}",
     ]
 
     for row in rows:
@@ -633,6 +673,7 @@ def render_scan_history(
             f"{f'{width:.2f}%' if width is not None else 'n/a':>8}"
             f"{row.get('narrow_bars') if row.get('narrow_bars') is not None else '—':>5}"
             f"{f'{volume:.2f}x' if volume is not None else 'n/a':>8}"
+            f"{_shock(row):>6}"
             f"{_cell(row.get('absorption_bars')):>6}"
             f"{_cell(row.get('absorption_clusters')):>6}"
             f"{_cell(row.get('taker_max'), '.2f'):>8}"
@@ -648,6 +689,8 @@ def render_scan_history(
         lines.append(f"\nпоток по OI за сутки (последняя запись): {reading}")
     lines += [
         "",
+        "шок — размах в ATR самого широкого бара ВНУТРИ окна сжатия; "
+        "печатается только событие: от 3 ATR при объёме от 3x",
         "погл — бары набора на младшем ряду · клст — кластеры набора "
         "(серия свечей, за которую цена никуда не ушла) · tkМакс — максимум "
         "доли тейкер-покупок · лид — на сколько свечей объём опередил цену",
@@ -738,8 +781,8 @@ def render_screen(
 
     head.append(
         f"{'символ':<14}{'индекс':>7}{'BBW':>6}{'диап':>8}{'узк':>5}{'объём':>8}"
-        f"{'погл':>6}{'клст':>6}{'tkМакс':>8}{'лид':>6}{'фанд%':>9}"
-        f"  поток по OI за сутки"
+        f"{'шок':>6}{'погл':>6}{'клст':>6}{'tkМакс':>8}{'лид':>6}"
+        f"{'фанд%':>9}  поток по OI за сутки"
     )
     lines = list(head)
     for row in rows:
@@ -754,6 +797,7 @@ def render_screen(
             f"{f'{width:.2f}%' if width is not None else 'n/a':>8}"
             f"{_cell(row.get('narrow_bars')):>5}"
             f"{f'{volume:.2f}x' if volume is not None else 'n/a':>8}"
+            f"{_shock(row):>6}"
             f"{_cell(row.get('absorption_bars')):>6}"
             f"{_cell(row.get('absorption_clusters')):>6}"
             f"{_cell(row.get('taker_max'), '.2f'):>8}"
@@ -769,6 +813,8 @@ def render_screen(
             sorted({utc(int(ms) + 1)[:16] for ms in stamps})
         ))
     lines += [
+        "шок — размах в ATR самого широкого бара ВНУТРИ окна сжатия; "
+        "печатается только событие: от 3 ATR при объёме от 3x",
         "погл — бары набора на младшем ряду · клст — кластеры набора "
         "(серия свечей, за которую цена никуда не ушла) · tkМакс — максимум "
         "доли тейкер-покупок · лид — на сколько свечей объём опередил цену",

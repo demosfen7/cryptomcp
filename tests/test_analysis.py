@@ -294,3 +294,94 @@ class TestAccumulationInterval:
         from cryptomcp.analysis import accumulation_interval
 
         assert accumulation_interval("1m") == "1m"
+
+
+class TestShockInside:
+    """Событие ищется ВНУТРИ окна сжатия, а не перед его началом.
+
+    Кейс HOME 03.09.2026: сжатие началось 28.08, двенадцать свечей ДО начала
+    были тихими, а обвал случился на 33-й свече из 33 — в середине. Правило
+    «шок перед началом» по универсуму не сработало ни разу из девяти монет со
+    сжатием; правило «шок внутри» на HOME срабатывает.
+    """
+
+    def series(self, tail):
+        """tail: список (размах в долях цены, объём). Цена стоит на 100."""
+        from cryptomcp.series import INTERVAL_MS, build_series
+
+        step = INTERVAL_MS["4h"]
+        raw = []
+        for i, (span, volume) in enumerate(tail):
+            high, low = 100.0 + span * 50.0, 100.0 - span * 50.0
+            raw.append([
+                i * step, "100.0", f"{high}", f"{low}", "100.0", "1.0",
+                (i + 1) * step - 1, f"{volume}", 10, "0.5", f"{volume / 2}", "0",
+            ])
+        series = build_series(raw, "TESTUSDT", "4h", len(tail) * step + 10_000,
+                              grace_ms=0)
+        return series, np.full(len(tail), 1.0)   # ATR = 1.0 при цене 100
+
+    def test_no_squeeze_no_question(self):
+        from cryptomcp.analysis import shock_inside
+
+        series, atr_values = self.series([(0.01, 100.0)] * 40)
+        assert shock_inside(
+            series, atr_values, narrow_bars=4, range_width=0.05
+        ) is None
+
+    def test_event_inside_is_loud(self):
+        from cryptomcp.analysis import shock_inside
+
+        tail = [(0.01, 100.0)] * 40
+        tail[-10] = (0.05, 500.0)   # размах 5 ATR при объёме 5x
+        series, atr_values = self.series(tail)
+
+        shock = shock_inside(series, atr_values, narrow_bars=20, range_width=0.06)
+        assert shock.loud
+        assert shock.bars_ago == 9
+        assert shock.range_atr == pytest.approx(5.0)
+        # База объёма — та же скользящая двадцатка, что у баров набора, и она
+        # включает сам бар: 500 / ((19 × 100 + 500) / 20).
+        assert shock.volume_ratio == pytest.approx(500 / 120)
+
+    def test_wide_bar_without_volume_is_not_an_event(self):
+        """Размах без объёма — это не событие, а просто широкая свеча."""
+        from cryptomcp.analysis import shock_inside
+
+        tail = [(0.01, 100.0)] * 40
+        tail[-10] = (0.05, 100.0)
+        series, atr_values = self.series(tail)
+
+        shock = shock_inside(series, atr_values, narrow_bars=20, range_width=0.06)
+        assert not shock.loud
+
+    def test_quiet_squeeze_reports_its_widest_bar(self):
+        """Тихое сжатие не молчит: оно показывает свой максимум и он мал.
+
+        Отдельного состояния «шока не было» не нужно — это видно по числам,
+        а различать «не мерили» и «мерили, тихо» важнее.
+        """
+        from cryptomcp.analysis import shock_inside
+
+        series, atr_values = self.series([(0.01, 100.0)] * 40)
+        shock = shock_inside(series, atr_values, narrow_bars=20, range_width=0.06)
+        assert shock is not None
+        assert not shock.loud
+        assert shock.range_atr == pytest.approx(1.0)
+
+    def test_atr_is_taken_before_the_bar(self):
+        """ATR на самом баре уже включает его размах и занижает отношение.
+
+        Проверяется рядом, где волатильность подскакивает ВМЕСТЕ с событием:
+        если брать ATR той же свечи, отношение упало бы вдвое.
+        """
+        from cryptomcp.analysis import shock_inside
+
+        tail = [(0.01, 100.0)] * 40
+        tail[-5] = (0.04, 400.0)
+        series, _ = self.series(tail)
+        atr_values = np.full(len(tail), 1.0)
+        atr_values[-5] = 2.0      # ATR на самой свече раздут событием
+
+        shock = shock_inside(series, atr_values, narrow_bars=20, range_width=0.06)
+        assert shock.range_atr == pytest.approx(4.0)   # 4.0 / 1.0, а не / 2.0

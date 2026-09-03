@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+import pandas as pd
 
 from .config import Config
 from .indicators import (
@@ -123,6 +124,113 @@ def percentile_base(values: np.ndarray, interval: str) -> tuple[np.ndarray, floa
     return history, span_days
 
 
+#: Ниже этой длительности вопрос «чем сжатие началось» не стоит: диапазон ещё
+#: не сложился, и любой размашистый бар внутри — это просто соседний бар.
+SHOCK_MIN_NARROW_BARS = 5
+
+#: Событием бар считается по размаху И по объёму сразу. Замер, из которого
+#: взяты пороги (226 монет, 4h, 03.09.2026): среди одиннадцати монет со
+#: сжатием от пяти свечей доля ширины диапазона не отбирает ничего — «бар
+#: шире 40% диапазона» верно для десяти из одиннадцати, потому что в узком
+#: диапазоне широчайший бар и обязан занимать заметную его часть. Размах от
+#: 3 ATR вместе с объёмом от 3x оставляет три монеты из одиннадцати, и HOME —
+#: кейс, ради которого признак заводился, — среди них.
+#:
+#: Меряется РАЗМАХ, а не тело, хотя в присланной формуле стояло тело: у HOME
+#: событийный бар имел размах 9.18% при теле +0.34%, то есть по телу не
+#: сработало бы вовсе. Событие в узком диапазоне обычно выглядит как выброс с
+#: возвратом, и тело у него мало по построению.
+SHOCK_RANGE_ATR = 3.0
+SHOCK_VOLUME_MULTIPLE = 3.0
+
+
+@dataclass(frozen=True)
+class Shock:
+    """Самый размашистый бар ВНУТРИ окна сжатия.
+
+    Проверять надо именно внутри, а не перед началом. Кейс HOME 03.09.2026:
+    заказчик прочитал сжатие как «истощение после обвала», но обвал 02.09
+    случился на 33-й свече из 33, то есть В СЕРЕДИНЕ сжатия, а двенадцать
+    свечей ПЕРЕД его началом были тихими (объём 0.37–1.11x, тела до 0.8 ATR).
+    Правило «шок перед началом» по универсуму не сработало ни разу из девяти
+    монет со сжатием; правило «шок внутри» на HOME срабатывает.
+
+    Смысл признака: «узк 33» означает 33 свечи узкого диапазона, но если одна
+    из них размахом почти во весь этот диапазон, то длительность меряет не то,
+    что кажется. Вывода код не делает — печатает и пишет в журнал (ТЗ §1.1).
+    """
+
+    #: Сколько свечей назад стоит этот бар.
+    bars_ago: int
+    #: Размах бара в ATR, посчитанном ДО него: иначе сам бар раздувает базу.
+    range_atr: float
+    #: Доля текущей ширины диапазона(20), которую занимает размах бара.
+    range_share: float
+    volume_ratio: float
+
+    @property
+    def loud(self) -> bool:
+        """Событие, а не просто самый широкий бар тихого диапазона."""
+        return (
+            self.range_atr >= SHOCK_RANGE_ATR
+            and self.volume_ratio >= SHOCK_VOLUME_MULTIPLE
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "bars_ago": self.bars_ago,
+            "range_atr": round(self.range_atr, 2),
+            "range_share": round(self.range_share, 3),
+            "volume_ratio": round(self.volume_ratio, 2),
+            "loud": self.loud,
+        }
+
+
+def shock_inside(
+    series: Series,
+    atr_values: np.ndarray,
+    *,
+    narrow_bars: int,
+    range_width: float,
+) -> Shock | None:
+    """Самый размашистый бар внутри окна сжатия, или None.
+
+    None означает «вопрос не стоит»: сжатия нет или оно короче
+    SHOCK_MIN_NARROW_BARS. Тихое сжатие возвращает бар с малым размахом —
+    отсутствие события видно по его же числам, отдельного состояния для этого
+    не нужно.
+    """
+    if narrow_bars < SHOCK_MIN_NARROW_BARS:
+        return None
+    high, low = series.high, series.low
+    volumes = series.quote_volume
+    rolling = pd.Series(volumes).rolling(20).mean().to_numpy()
+    start = max(1, len(high) - narrow_bars)
+    price = float(series.close[-1])
+    width_price = range_width * price if price else float("nan")
+
+    best: Shock | None = None
+    for i in range(start, len(high)):
+        # ATR берётся ДО бара: ATR(14) на самом баре уже включает его размах и
+        # занижает отношение — тем сильнее, чем крупнее событие.
+        base = atr_values[i - 1]
+        if np.isnan(base) or base <= 0:
+            continue
+        span = high[i] - low[i]
+        mean = rolling[i]
+        candidate = Shock(
+            bars_ago=len(high) - 1 - i,
+            range_atr=span / base,
+            range_share=span / width_price if width_price else float("nan"),
+            volume_ratio=(
+                volumes[i] / mean if not np.isnan(mean) and mean > 0 else float("nan")
+            ),
+        )
+        if best is None or candidate.range_atr > best.range_atr:
+            best = candidate
+    return best
+
+
 @dataclass
 class TimeframeView:
     """Полная картина по одному таймфрейму."""
@@ -156,6 +264,8 @@ class TimeframeView:
     volume: VolumeContext
     profile: VolumeProfile | None
     divergence: str | None
+    #: Самый размашистый бар внутри окна сжатия; None — сжатия нет.
+    shock: Shock | None = None
 
     levels: list[Level] = field(default_factory=list)
     pivots_weekly: Pivots | None = None
@@ -188,6 +298,7 @@ class TimeframeView:
                 ),
                 "width_percentile": self.range_metric.to_dict(),
                 "bars_below_threshold": self.narrow_bars,
+                "shock_inside": self.shock.to_dict() if self.shock else None,
             },
             "volume": self.volume.to_dict(),
             "divergence": self.divergence,
@@ -412,6 +523,10 @@ def analyse_timeframe(
     rsi_values = rsi(close, 14)
     swings = swing_points(high, low, 2, 2)
 
+    narrow_bars = (
+        consecutive_below(width_series, threshold) if threshold == threshold else 0
+    )
+
     view = TimeframeView(
         interval=series.interval,
         price=price,
@@ -430,13 +545,13 @@ def analyse_timeframe(
         range_width_atr=(range_width * price / atr_value) if atr_value else float("nan"),
         range_threshold=threshold,
         range_metric=range_metric,
-        narrow_bars=(
-            consecutive_below(width_series, threshold)
-            if threshold == threshold else 0
-        ),
+        narrow_bars=narrow_bars,
         volume=volume_context(series, atr_values),
         profile=profile,
         divergence=rsi_divergence(series, rsi_values, config.divergence_window),
+        shock=shock_inside(
+            series, atr_values, narrow_bars=narrow_bars, range_width=range_width
+        ),
         levels=cluster_levels(swings, tolerance=LEVEL_TOLERANCE_ATR * atr_value),
         pivots_weekly=weekly_pivots,
         meta=series.meta(),

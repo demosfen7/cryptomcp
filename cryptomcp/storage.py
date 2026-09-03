@@ -112,6 +112,11 @@ CREATE TABLE IF NOT EXISTS scan_log (
     ema_state         TEXT,
     structure         TEXT,
     closed_through_ms INTEGER,
+    -- Самый размашистый бар ВНУТРИ окна сжатия (§4.26).
+    shock_atr         REAL,
+    shock_share       REAL,
+    shock_volume      REAL,
+    shock_bars_ago    INTEGER,
     -- Признаки накопления. Считаются на МЛАДШЕМ ряду (§4.19) и пишутся с
     -- первого дня: через два месяца вопрос будет «работает ли накопление», и
     -- ответить на него можно только по журналу.
@@ -252,6 +257,10 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("scan_log", "absorption_clusters", "INTEGER"),
     ("scan_log", "cluster_longest", "INTEGER"),
     ("scan_log", "wick_streak", "INTEGER"),
+    ("scan_log", "shock_atr", "REAL"),
+    ("scan_log", "shock_share", "REAL"),
+    ("scan_log", "shock_volume", "REAL"),
+    ("scan_log", "shock_bars_ago", "INTEGER"),
 )
 
 
@@ -401,6 +410,13 @@ def price_extremes(
     }
 
 
+def _round(value: float | None, digits: int) -> float | None:
+    """NaN — это «не посчитано», и в базе ему место в NULL, а не в числе."""
+    if value is None or value != value:
+        return None
+    return round(float(value), digits)
+
+
 def record_scan(
     con: sqlite3.Connection,
     symbol: str,
@@ -417,6 +433,7 @@ def record_scan(
     два месяца вопрос будет не «работает ли индекс», а «какая из пяти групп
     в нём работает» — и ответить на него можно только по разложению.
     """
+    shock = getattr(view, "shock", None)
     payload = (
         ts_ms if ts_ms is not None else int(dt.datetime.now(dt.UTC).timestamp() * 1000),
         symbol,
@@ -441,13 +458,18 @@ def record_scan(
         view.ema_state,
         view.structure,
         view.meta.get("closed_through_ms"),
+        _round(shock.range_atr, 2) if shock else None,
+        _round(shock.range_share, 4) if shock else None,
+        _round(shock.volume_ratio, 3) if shock else None,
+        shock.bars_ago if shock else None,
     )
     columns = [
         "ts_ms", "symbol", "source", "tf", "formula_version", "squeeze_index",
         "components", "excluded", "price", "range_low", "range_high",
         "range_width_pct", "narrow_bars", "atr_pct", "rsi", "bbw_pct_rank",
         "volume_ratio", "taker_buy_mean", "ema_state", "structure",
-        "closed_through_ms",
+        "closed_through_ms", "shock_atr", "shock_share",
+        "shock_volume", "shock_bars_ago",
     ]
     values = list(payload)
     # Признаки накопления приходят готовыми словарём: они считаются по ДРУГОМУ

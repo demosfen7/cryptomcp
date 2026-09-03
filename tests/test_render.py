@@ -380,3 +380,58 @@ class TestEmptyScreenReason:
             filtered=122, logged=130, matched=0,
         )
         assert "ни одна не прошла фильтры" in text
+
+
+class TestLadderColumns:
+    """Лестница снапшота показывает то, что видно только в сравнении строк."""
+
+    def ladder(self, **kw):
+        from cryptomcp.render import render_snapshot
+        from cryptomcp.symbols import SymbolInfo
+        from tests.test_analysis import view as make_view
+
+        info = SymbolInfo(
+            symbol="TESTUSDT", base="TEST", quote="USDT", tick_size=0.001,
+            price_precision=3, contract_type="PERPETUAL", status="TRADING",
+        )
+        return render_snapshot(
+            info, kw["views"], live_price=100.0, change_24h=1.0,
+            quote_volume_24h=1e7, now_ms=1_788_000_000_000,
+            order=tuple(kw["views"]),
+        ), make_view
+
+    def test_shock_marks_the_squeeze_cell(self):
+        from cryptomcp.analysis import Shock
+        from tests.test_analysis import view as make_view
+
+        loud = Shock(bars_ago=9, range_atr=4.0, range_share=0.94, volume_ratio=5.6)
+        quiet = Shock(bars_ago=2, range_atr=1.3, range_share=0.34, volume_ratio=1.5)
+
+        text, _ = self.ladder(views={"4h": make_view(interval="4h", shock=loud)})
+        assert "ШОК 4.0 ATR" in text
+
+        text, _ = self.ladder(views={"4h": make_view(interval="4h", shock=quiet)})
+        # «ШОК» есть и в легенде под лестницей, поэтому проверяется ячейка.
+        assert "ШОК 1.3" not in text
+        ladder_row = next(line for line in text.splitlines() if line.startswith("4h "))
+        assert "ШОК" not in ladder_row
+
+
+class TestShockCell:
+    """В таблице скана печатается только событие, а не самый широкий бар."""
+
+    def test_event_printed(self):
+        from cryptomcp.render import _shock
+
+        assert _shock({"shock_atr": 4.0, "shock_volume": 5.6}) == "4.0"
+
+    def test_wide_but_quiet_is_a_dash(self):
+        from cryptomcp.render import _shock
+
+        assert _shock({"shock_atr": 4.0, "shock_volume": 1.2}) == "—"
+        assert _shock({"shock_atr": 1.3, "shock_volume": 5.6}) == "—"
+
+    def test_missing_is_a_dash(self):
+        from cryptomcp.render import _shock
+
+        assert _shock({}) == "—"
