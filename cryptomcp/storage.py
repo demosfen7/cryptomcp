@@ -112,6 +112,10 @@ CREATE TABLE IF NOT EXISTS scan_log (
     ema_state         TEXT,
     structure         TEXT,
     closed_through_ms INTEGER,
+    -- Затухание объёма на СВОЁМ ТФ: расхождение между таймфреймами и есть
+    -- ранний признак набора, но сравнивать строки можно только имея число
+    -- в каждой из них (§4.26).
+    ma_ratio          REAL,
     -- Самый размашистый бар ВНУТРИ окна сжатия (§4.26).
     shock_atr         REAL,
     shock_share       REAL,
@@ -257,6 +261,7 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("scan_log", "absorption_clusters", "INTEGER"),
     ("scan_log", "cluster_longest", "INTEGER"),
     ("scan_log", "wick_streak", "INTEGER"),
+    ("scan_log", "ma_ratio", "REAL"),
     ("scan_log", "shock_atr", "REAL"),
     ("scan_log", "shock_share", "REAL"),
     ("scan_log", "shock_volume", "REAL"),
@@ -458,6 +463,7 @@ def record_scan(
         view.ema_state,
         view.structure,
         view.meta.get("closed_through_ms"),
+        _round(view.volume.ma_ratio, 4),
         _round(shock.range_atr, 2) if shock else None,
         _round(shock.range_share, 4) if shock else None,
         _round(shock.volume_ratio, 3) if shock else None,
@@ -468,7 +474,7 @@ def record_scan(
         "components", "excluded", "price", "range_low", "range_high",
         "range_width_pct", "narrow_bars", "atr_pct", "rsi", "bbw_pct_rank",
         "volume_ratio", "taker_buy_mean", "ema_state", "structure",
-        "closed_through_ms", "shock_atr", "shock_share",
+        "closed_through_ms", "ma_ratio", "shock_atr", "shock_share",
         "shock_volume", "shock_bars_ago",
     ]
     values = list(payload)

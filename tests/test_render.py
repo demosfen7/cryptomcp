@@ -400,6 +400,27 @@ class TestLadderColumns:
             order=tuple(kw["views"]),
         ), make_view
 
+    def test_ma_ratio_shows_the_divergence_between_timeframes(self):
+        """Кейс ASTER 19.08.2026: дневная 0.24x при часовой 1.45x."""
+        from cryptomcp.volume import VolumeContext
+        from tests.test_analysis import view as make_view
+
+        def with_ma(interval, ratio):
+            return make_view(
+                interval=interval,
+                volume=VolumeContext(
+                    ratio=1.0, basis="сезонный слот", samples=60, ma_ratio=ratio,
+                    anomalous_bars=0, taker_buy_mean=0.5,
+                ),
+            )
+
+        views = {"1d": with_ma("1d", 0.24), "1h": with_ma("1h", 1.45)}
+        text, _ = self.ladder(views=views)
+
+        assert "MA20/100" in text
+        assert "0.24x" in text
+        assert "1.45x" in text
+
     def test_shock_marks_the_squeeze_cell(self):
         from cryptomcp.analysis import Shock
         from tests.test_analysis import view as make_view

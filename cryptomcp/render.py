@@ -166,7 +166,7 @@ def render_snapshot(
     lines.append("")
     lines.append(
         f"{'ТФ':<5}{'EMA':<8}{'структ':<9}{'поз':>5}{'RSI':>6}{'ATR%':>7}"
-        f"{'объём':>8}{'takerB':>8}  сжатие"
+        f"{'объём':>8}{'MA20/100':>10}{'takerB':>8}  сжатие"
     )
 
     skipped = skipped or {}
@@ -192,10 +192,16 @@ def render_snapshot(
         if view.shock is not None and view.shock.loud:
             squeeze += f" · ШОК {view.shock.range_atr:.1f} ATR"
         volume = f"{view.volume.ratio:.2f}x" + ("~" if view.volume.weak_basis else "")
+        # Затухание длинного объёма при оживающем коротком видно только в
+        # сравнении строк лестницы, поэтому колонка стоит здесь, а не в L2.
+        ma_ratio = (
+            f"{view.volume.ma_ratio:.2f}x"
+            if view.volume.ma_ratio == view.volume.ma_ratio else "n/a"
+        )
         lines.append(
             f"{interval:<5}{view.ema_state:<8}{view.structure:<9}"
             f"{view.position_in_range:>5.2f}{view.rsi_value:>6.1f}"
-            f"{view.atr_pct:>6.2f}%{volume:>8}"
+            f"{view.atr_pct:>6.2f}%{volume:>8}{ma_ratio:>10}"
             f"{view.volume.taker_buy_mean:>8.2f}  {squeeze}"
         )
 
@@ -215,6 +221,11 @@ def render_snapshot(
         lines.append("пропуски в истории: " + " · ".join(gaps) + " — метрики на них смещены")
     lines.append("объём — к уровню последних свечей с поправкой на слот суток; ~ слабая база")
     lines.append("EMA — цена против EMA50/EMA200; структ — два последних swing-экстремума")
+    lines.append(
+        "MA20/100 — объём последних 20 свечей к последним 100 на ЭТОМ ТФ: "
+        "расхождение между строками (длинный мёртв, короткий оживает) и есть "
+        "самый ранний признак набора"
+    )
     lines.append(
         "узк N — свечей подряд с шириной диапазона(20) ниже 20-го перцентиля "
         "СВОЕЙ истории; ШОК — бар внутри этого окна размахом от 3 ATR при "
@@ -646,7 +657,7 @@ def render_scan_history(
     lines = [
         f"{symbol} · {tf} · формула {version} · записей {len(rows)}, свежие сверху",
         f"{'закрыта':<17}{'индекс':>7}{header}{'BBW':>6}{'диап':>8}{'узк':>5}"
-        f"{'объём':>8}{'шок':>6}{'погл':>6}{'клст':>6}{'tkМакс':>8}"
+        f"{'объём':>8}{'МА':>7}{'шок':>6}{'погл':>6}{'клст':>6}{'tkМакс':>8}"
         f"{'лид':>6}{'фанд%':>9}{'цена':>13}",
     ]
 
@@ -673,6 +684,7 @@ def render_scan_history(
             f"{f'{width:.2f}%' if width is not None else 'n/a':>8}"
             f"{row.get('narrow_bars') if row.get('narrow_bars') is not None else '—':>5}"
             f"{f'{volume:.2f}x' if volume is not None else 'n/a':>8}"
+            f"{_cell(row.get('ma_ratio'), '.2f'):>7}"
             f"{_shock(row):>6}"
             f"{_cell(row.get('absorption_bars')):>6}"
             f"{_cell(row.get('absorption_clusters')):>6}"
@@ -689,8 +701,9 @@ def render_scan_history(
         lines.append(f"\nпоток по OI за сутки (последняя запись): {reading}")
     lines += [
         "",
-        "шок — размах в ATR самого широкого бара ВНУТРИ окна сжатия; "
-        "печатается только событие: от 3 ATR при объёме от 3x",
+        "МА — объём MA20/MA100 на этом ТФ · шок — размах в ATR самого "
+        "широкого бара ВНУТРИ окна сжатия; печатается только событие: от "
+        "3 ATR при объёме от 3x",
         "погл — бары набора на младшем ряду · клст — кластеры набора "
         "(серия свечей, за которую цена никуда не ушла) · tkМакс — максимум "
         "доли тейкер-покупок · лид — на сколько свечей объём опередил цену",
@@ -781,7 +794,7 @@ def render_screen(
 
     head.append(
         f"{'символ':<14}{'индекс':>7}{'BBW':>6}{'диап':>8}{'узк':>5}{'объём':>8}"
-        f"{'шок':>6}{'погл':>6}{'клст':>6}{'tkМакс':>8}{'лид':>6}"
+        f"{'МА':>7}{'шок':>6}{'погл':>6}{'клст':>6}{'tkМакс':>8}{'лид':>6}"
         f"{'фанд%':>9}  поток по OI за сутки"
     )
     lines = list(head)
@@ -797,6 +810,7 @@ def render_screen(
             f"{f'{width:.2f}%' if width is not None else 'n/a':>8}"
             f"{_cell(row.get('narrow_bars')):>5}"
             f"{f'{volume:.2f}x' if volume is not None else 'n/a':>8}"
+            f"{_cell(row.get('ma_ratio'), '.2f'):>7}"
             f"{_shock(row):>6}"
             f"{_cell(row.get('absorption_bars')):>6}"
             f"{_cell(row.get('absorption_clusters')):>6}"
@@ -813,8 +827,9 @@ def render_screen(
             sorted({utc(int(ms) + 1)[:16] for ms in stamps})
         ))
     lines += [
-        "шок — размах в ATR самого широкого бара ВНУТРИ окна сжатия; "
-        "печатается только событие: от 3 ATR при объёме от 3x",
+        "МА — объём MA20/MA100 на этом ТФ · шок — размах в ATR самого "
+        "широкого бара ВНУТРИ окна сжатия; печатается только событие: от "
+        "3 ATR при объёме от 3x",
         "погл — бары набора на младшем ряду · клст — кластеры набора "
         "(серия свечей, за которую цена никуда не ушла) · tkМакс — максимум "
         "доли тейкер-покупок · лид — на сколько свечей объём опередил цену",

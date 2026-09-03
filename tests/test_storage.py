@@ -222,7 +222,9 @@ class FakeView:
         self.rsi_value = 55.0
         self.ema_state, self.structure = "above", "HH/HL"
         self.bbw = type("M", (), {"pct_rank": 12.0})()
-        self.volume = type("V", (), {"ratio": 1.2, "taker_buy_mean": 0.51})()
+        self.volume = type(
+            "V", (), {"ratio": 1.2, "taker_buy_mean": 0.51, "ma_ratio": 0.63}
+        )()
         # Шока может не быть вовсе — сжатия нет или оно короче порога.
         self.shock = shock
         self.meta = {"closed_through_ms": closed_through_ms}
@@ -274,6 +276,7 @@ class TestScanLogShockColumns:
                             formula_version="v4")
 
         row = con.execute("SELECT * FROM scan_log").fetchone()
+        assert row["ma_ratio"] == pytest.approx(0.63)
         assert row["shock_atr"] == pytest.approx(4.0)
         assert row["shock_share"] == pytest.approx(0.94)
         assert row["shock_volume"] == pytest.approx(5.6)
@@ -287,6 +290,7 @@ class TestScanLogShockColumns:
         row = con.execute("SELECT * FROM scan_log").fetchone()
         assert row["shock_atr"] is None
         assert row["shock_bars_ago"] is None
+        assert row["ma_ratio"] == pytest.approx(0.63)
 
 
 class TestOutcomeQueries:
