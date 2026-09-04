@@ -471,3 +471,49 @@ class TestShockCell:
         from cryptomcp.render import _shock
 
         assert _shock({}) == "—"
+
+
+class TestTwinMarketColumns:
+    """Величины соседнего рынка: печатаются, когда есть, и не выдумываются."""
+
+    @staticmethod
+    def render(rows):
+        from cryptomcp.render import render_scan_history
+
+        return render_scan_history("HOMEUSDT", "4h", rows, "v4")
+
+    def row(self, **extra):
+        base = {
+            "ts_ms": 1_788_480_000_000,
+            "closed_through_ms": 1_788_479_999_999,
+            "symbol": "HOMEUSDT",
+            "source": "spot",
+            "squeeze_index": 0.68,
+            "components": "{}",
+            "range_width_pct": 10.24,
+            "narrow_bars": 17,
+            "price": 0.00615,
+        }
+        base.update(extra)
+        return base
+
+    def test_columns_appear_with_the_second_market(self):
+        text = self.render([self.row(
+            twin_market="futures", twin_index=0.66,
+            twin_range_width_pct=8.85, twin_narrow_bars=36,
+        )])
+
+        assert "инд²" in text and "диап²" in text and "узк²" in text
+        assert "8.85%" in text
+        assert "соседнем рынке (перп)" in text
+
+    def test_without_the_second_market_columns_do_not_appear(self):
+        """Столбец прочерков сообщал бы «совпало», а верно «не мерили»."""
+        text = self.render([self.row()])
+
+        assert "узк²" not in text
+
+    def test_market_of_the_row_is_in_the_header(self):
+        text = self.render([self.row()])
+
+        assert "рынок: спот" in text

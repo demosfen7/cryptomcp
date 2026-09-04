@@ -198,6 +198,12 @@ INTERVAL_S = _env_int("COLLECTOR_INTERVAL_S", 3600)
 #: случай к деривативам, где глубину определяет биржа своими 30 сутками.
 FUNDING_BACKFILL_DAYS = _env_float("COLLECTOR_FUNDING_DAYS", 365.0)
 
+#: Скольким кандидатам считается соседний рынок (§4.32). Ровно тем, кто
+#: претендует на эпизод: это 15 символов на таймфрейм, а не 120, и потому
+#: свойство «основной проход не делает запросов к бирже» остаётся в силе —
+#: запросы делает короткий второй проход, а не скан универсума.
+TWIN_LIMIT = _env_int("SCAN_TWIN_LIMIT", 15)
+
 #: Границы ранга для списка наблюдения. Вход выше выхода — гистерезис: при
 #: одинаковых порогах монеты у границы входили бы и выходили каждый прогон.
 WATCH_ENTER_RANK = _env_int("WATCH_ENTER_RANK", 15)
@@ -622,6 +628,63 @@ def run_scan(con: sqlite3.Connection) -> int:
     return written
 
 
+async def scan_twin(
+    clients: dict[str, BinanceClient],
+    con: sqlite3.Connection,
+    *,
+    timeframes: tuple[str, ...] = WATCH_TIMEFRAMES,
+    limit: int = TWIN_LIMIT,
+) -> int:
+    """Посчитать те же величины на соседнем рынке для верхушки списка.
+
+    **Зачем.** Архив хранит один ряд на символ, и `archive_plan` предпочитает
+    спотовый — история глубже. Перпетуал при этом ценово производен от спота,
+    но не равен ему: замер 03.09.2026 на HOMEUSDT 4h дал `узк 17` по споту
+    против `36` по перпу на одной и той же свече, то есть вдвое. Пока в
+    выдаче стояла одна величина, разница была невидима.
+
+    **Справка, а не фильтр.** Величина соседнего рынка не участвует ни в
+    ранге, ни в решении открыть эпизод. Гипотеза «открывать, только если
+    сжатие подтвердилось на обоих» не проверена, и вводить её сейчас значило
+    бы угадывать. Решить, какой рынок предсказательнее, можно будет по
+    `outcomes`, накопленным по обеим величинам.
+
+    **Ряд берётся одним запросом.** Каноническое окно на 4h и 1d (611 и 361
+    свеча) помещается в одну страницу обоих рынков. Если окно в страницу не
+    влезло, символ пропускается: короткая база дала бы перцентиль, не
+    сравнимый с основным — то же расхождение, ради устранения которого весь
+    этот проход и заводится.
+    """
+    written = 0
+    for tf in timeframes:
+        window = required_candles(tf) + WARMUP
+        for row in storage.latest_scan(con, tf)[:limit]:
+            symbol = row["symbol"]
+            twin = SPOT.name if row["source"] == FUTURES.name else FUTURES.name
+            client = clients[twin]
+            if window > client.market.max_limit:
+                log.debug("%s %s: окно %d не влезает в страницу %s",
+                          symbol, tf, window, twin)
+                continue
+            try:
+                raw = await client.klines(symbol, tf, limit=window)
+                series = build_series(raw, symbol, tf, await client.now_ms())
+            except ToolError as error:
+                # Четверть перпов не имеет спотовой пары, и наоборот — это
+                # штатный ответ биржи, а не сбой прогона.
+                log.debug("%s %s (%s): %s", symbol, tf, twin, error.message)
+                continue
+            if len(series) < MIN_CANDLES:
+                continue
+            storage.record_twin(
+                con, int(row["id"]), market=twin,
+                view=analyse_timeframe(series, config),
+            )
+            written += 1
+    con.commit()
+    return written
+
+
 def settle_outcomes(con: sqlite3.Connection, now_ms: int | None = None) -> int:
     """Досчитать исходы у записей скана, чей горизонт истёк.
 
@@ -975,6 +1038,9 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
         # стоят копейки и идут последними — после того как архив пополнен.
         started = time.monotonic()
         scanned = run_scan(con)
+        # Соседний рынок — сразу после скана и до списка наблюдения: величина
+        # справочная, но попасть она должна на ту же строку журнала.
+        twins = await scan_twin({SPOT.name: spot, FUTURES.name: client}, con)
         settled = settle_outcomes(con)
         changes = update_watchlist(con)
         storage.record_run(
@@ -982,7 +1048,10 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
             seconds=time.monotonic() - started,
         )
         con.commit()
-        log.info("скан: новых записей %d, посчитано исходов %d", scanned, settled)
+        log.info(
+            "скан: новых записей %d, соседний рынок посчитан у %d, исходов %d",
+            scanned, twins, settled,
+        )
         log.info(
             "watchlist: вошло %d, вышло %d, подтверждено %d",
             len(changes["entered"]), len(changes["exited"]), len(changes["promoted"]),

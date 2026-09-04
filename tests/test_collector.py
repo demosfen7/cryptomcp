@@ -468,6 +468,111 @@ class TestScanAndOutcomes:
         assert second == 0
 
 
+class TestScanTwin:
+    """Соседний рынок: справка по верхушке списка, а не второй скан всего.
+
+    Замер, ради которого проход заведён: HOMEUSDT 4h, свеча закрытия 03.09
+    20:00 UTC — `узк 17` по споту и `36` по перпу, вдвое. Пока в журнале
+    стояла одна величина, разница была невидима.
+    """
+
+    STEP = 4 * 3_600_000
+
+    def scan(self, con, symbol, index, source="spot"):
+        con.execute(
+            "INSERT INTO scan_log (ts_ms, symbol, source, tf, formula_version, "
+            "squeeze_index, closed_through_ms) VALUES (?, ?, ?, '4h', ?, ?, ?)",
+            (NOW, symbol, source, SQUEEZE_FORMULA_VERSION, index, NOW - 1),
+        )
+        con.commit()
+
+    def twins(self, con):
+        return {
+            row["symbol"]: dict(row)
+            for row in con.execute(
+                "SELECT symbol, twin_market, twin_narrow_bars, twin_index "
+                "FROM scan_log"
+            )
+        }
+
+    @pytest.mark.asyncio
+    async def test_only_the_top_is_measured(self, con):
+        """Пятнадцать символов на ТФ, а не сто двадцать: запросы не бесплатны."""
+        from cryptomcp.collector import scan_twin
+
+        for i, index in enumerate((0.9, 0.8, 0.7)):
+            self.scan(con, f"C{i}USDT", index)
+        client = FakeKlineClient(NOW - 3000 * self.STEP, NOW, self.STEP, page=1500)
+
+        written = await scan_twin(
+            {"spot": client, "futures": client}, con, timeframes=("4h",), limit=2
+        )
+
+        assert written == 2
+        measured = {s: r for s, r in self.twins(con).items() if r["twin_market"]}
+        assert set(measured) == {"C0USDT", "C1USDT"}, "мерился только верх списка"
+
+    @pytest.mark.asyncio
+    async def test_twin_of_spot_is_the_perpetual(self, con):
+        from cryptomcp.collector import scan_twin
+
+        self.scan(con, "HOMEUSDT", 0.9, source="spot")
+        client = FakeKlineClient(NOW - 3000 * self.STEP, NOW, self.STEP, page=1500)
+
+        await scan_twin(
+            {"spot": client, "futures": client}, con, timeframes=("4h",), limit=5
+        )
+
+        assert self.twins(con)["HOMEUSDT"]["twin_market"] == "futures"
+
+    @pytest.mark.asyncio
+    async def test_twin_of_futures_is_spot(self, con):
+        from cryptomcp.collector import scan_twin
+
+        self.scan(con, "UBUSDT", 0.9, source="futures")
+        client = FakeKlineClient(NOW - 3000 * self.STEP, NOW, self.STEP, page=1500)
+
+        await scan_twin(
+            {"spot": client, "futures": client}, con, timeframes=("4h",), limit=5
+        )
+
+        assert self.twins(con)["UBUSDT"]["twin_market"] == "spot"
+
+    @pytest.mark.asyncio
+    async def test_missing_pair_is_not_a_failure(self, con):
+        """Четверть перпов не имеет спотовой пары — это ответ биржи, не сбой."""
+        from cryptomcp.collector import scan_twin
+
+        self.scan(con, "НЕТУUSDT", 0.9)
+
+        class NoPair(FakeKlineClient):
+            async def klines(self, *args, **kwargs):
+                raise unknown_symbol("НЕТУUSDT")
+
+        client = NoPair(NOW - 3000 * self.STEP, NOW, self.STEP, page=1500)
+
+        written = await scan_twin(
+            {"spot": client, "futures": client}, con, timeframes=("4h",), limit=5
+        )
+
+        assert written == 0
+        assert self.twins(con)["НЕТУUSDT"]["twin_market"] is None
+
+    @pytest.mark.asyncio
+    async def test_short_page_is_skipped_rather_than_shortened(self, con):
+        """Урезанное окно дало бы перцентиль, не сравнимый с основным."""
+        from cryptomcp.collector import scan_twin
+
+        self.scan(con, "C0USDT", 0.9)
+        client = FakeKlineClient(NOW - 3000 * self.STEP, NOW, self.STEP, page=100)
+
+        written = await scan_twin(
+            {"spot": client, "futures": client}, con, timeframes=("4h",), limit=5
+        )
+
+        assert written == 0
+
+
 class TestWatchlist:
     """Отбор рангом с гистерезисом: порога, который можно было бы взять, нет."""
 

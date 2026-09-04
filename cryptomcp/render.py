@@ -543,6 +543,23 @@ def _shock(row: Mapping[str, Any]) -> str:
     return f"{atr_value:.1f}"
 
 
+def _twin(row: Mapping[str, Any]) -> str:
+    """Индекс, ширина и длительность на соседнем рынке — три колонки.
+
+    Пусто у пар, которым соседний рынок не считался (он считается по верхушке
+    списка) и у которых его нет вовсе — четверть перпетуалов не имеет
+    спотовой пары. Прочерк тут значит «не мерили», а не «совпало».
+    """
+    index = row.get("twin_index")
+    width = row.get("twin_range_width_pct")
+    bars = row.get("twin_narrow_bars")
+    return (
+        f"{f'{index:.2f}' if index is not None else '—':>7}"
+        f"{f'{width:.2f}%' if width is not None else '—':>8}"
+        f"{bars if bars is not None else '—':>6}"
+    )
+
+
 def _price(value: Any) -> str:
     """Цена без потери разряда и без выдуманной точности.
 
@@ -597,7 +614,7 @@ def render_watchlist(
         f"эпизодов: {len(episodes)}",
         f"{'символ':<14}{'ТФ':>4}{'рынок':>7}{'статус':>11}{'ранг':>10}"
         f"{'инд':>7}{'Δинд':>7}"
-        f"{'накопл':>8}{'узк':>5}{'вход':>13}{'сейчас':>9}{'дней':>6}  кем"
+        f"{'накопл':>8}{'узк':>5}{'узк²':>6}{'вход':>13}{'сейчас':>9}{'дней':>6}  кем"
         + ("  ·  чем кончилось" if closed else ""),
     ]
 
@@ -633,6 +650,7 @@ def render_watchlist(
             f"{f'{index_now:.2f}' if index_now is not None else '—':>7}{delta:>7}"
             f"{f'{accumulation:.2f}' if accumulation is not None else 'n/a':>8}"
             f"{narrow if narrow is not None else '—':>5}"
+            f"{_cell(scan.get('twin_narrow_bars')):>6}"
             f"{_price(price_in):>13}{move:>9}"
             f"{(until - row['entered_at']) / 86_400_000:>6.1f}  {row['entered_by']}"
         )
@@ -655,6 +673,9 @@ def render_watchlist(
         "рынок — ряд, по которому монета отобрана: архив предпочитает спот "
         "(история глубже), и числа эпизода относятся именно к нему; "
         "сверять их через get_squeeze_metrics нужно с тем же market",
+        "узк² — та же длительность на соседнем рынке (у спотовой записи это "
+        "перп, у фьючерсной — спот): на HOMEUSDT 4h вышло 17 против 36 на "
+        "одной свече. Справка; ни в ранг, ни в отбор не входит",
         "накопл — метрика накопления; колонка заведена, метрика ещё не считается",
         "кем — источник: scanner отбирает рангом, manual заводится руками и "
         "рангом не снимается (только руками или по сроку в 30 суток)",
@@ -681,6 +702,11 @@ def render_scan_history(
         )
 
     header = "".join(f"{short:>7}" for _, short in INDEX_GROUPS)
+    # Колонки соседнего рынка печатаются, только если он считался: считается
+    # он по верхушке списка, и у остальных пар прочерк означал бы не «совпало»,
+    # а «не мерили» — лишний столбец прочерков читателю ничего не говорит.
+    twin = any(row.get("twin_index") is not None for row in rows)
+    twin_head = f"{'инд²':>7}{'диап²':>8}{'узк²':>6}" if twin else ""
     markets = " / ".join(
         dict.fromkeys(market_short(row.get("source")) for row in rows)
     )
@@ -688,7 +714,7 @@ def render_scan_history(
         f"{symbol} · {tf} · рынок: {markets} · формула {version} · "
         f"записей {len(rows)}, свежие сверху",
         f"{'закрыта':<17}{'индекс':>7}{header}{'BBW':>6}{'диап':>8}{'узк':>5}"
-        f"{'объём':>8}{'МА':>7}{'шок':>6}{'погл':>6}{'клст':>6}{'tkМакс':>8}"
+        f"{twin_head}{'объём':>8}{'МА':>7}{'шок':>6}{'погл':>6}{'клст':>6}{'tkМакс':>8}"
         f"{'лид':>6}{'фанд%':>9}{'цена':>13}",
     ]
 
@@ -714,6 +740,7 @@ def render_scan_history(
             f"{f'{bbw:.0f}' if bbw is not None else 'n/a':>6}"
             f"{f'{width:.2f}%' if width is not None else 'n/a':>8}"
             f"{row.get('narrow_bars') if row.get('narrow_bars') is not None else '—':>5}"
+            f"{_twin(row) if twin else ''}"
             f"{f'{volume:.2f}x' if volume is not None else 'n/a':>8}"
             f"{_cell(row.get('ma_ratio'), '.2f'):>7}"
             f"{_shock(row):>6}"
@@ -723,6 +750,18 @@ def render_scan_history(
             f"{_cell(row.get('volume_lead'), '+d'):>6}"
             f"{_cell(row.get('funding_annual'), '+.0f'):>9}"
             f"{_price(row.get('price')):>13}"
+        )
+
+    if twin:
+        markets_twin = " / ".join(
+            dict.fromkeys(
+                market_short(row.get("twin_market"))
+                for row in rows if row.get("twin_index") is not None
+            )
+        )
+        lines.append(
+            f"\n² — то же на соседнем рынке ({markets_twin}); справка, "
+            "в индекс и в отбор не входит"
         )
 
     reading = next(

@@ -137,7 +137,19 @@ CREATE TABLE IF NOT EXISTS scan_log (
     -- Кластеры набора: серия важнее одиночного бара (§4.25).
     absorption_clusters INTEGER,
     cluster_longest     INTEGER,
-    wick_streak         INTEGER
+    wick_streak         INTEGER,
+    -- Те же величины на СОСЕДНЕМ рынке (§4.32). Считаются только по коротким
+    -- спискам кандидатов и ни на что не влияют: печатать, не фильтровать.
+    -- Замер на HOMEUSDT 4h: узк 17 по споту против 36 по перпу на одной
+    -- свече — расхождение вдвое, и решать, какой рынок предсказательнее,
+    -- можно будет только по outcomes, накопленным по обеим величинам.
+    twin_market         TEXT,
+    twin_index          REAL,
+    twin_range_width_pct REAL,
+    twin_narrow_bars    INTEGER,
+    -- Своё «закрыты по»: у рынков разная свежесть последней свечи, и
+    -- сравнивать величины, снятые с разных свечей, нельзя.
+    twin_closed_through_ms INTEGER
 );
 
 -- Одна строка на закрытую свечу И версию формулы. Сканер ходит раз в час, а
@@ -255,6 +267,11 @@ def connect(path: str = DEFAULT_PATH, *, read_only: bool = False) -> sqlite3.Con
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("watchlist", "rank_at_entry", "INTEGER"),
     ("watchlist", "market", "TEXT"),
+    ("scan_log", "twin_market", "TEXT"),
+    ("scan_log", "twin_index", "REAL"),
+    ("scan_log", "twin_range_width_pct", "REAL"),
+    ("scan_log", "twin_narrow_bars", "INTEGER"),
+    ("scan_log", "twin_closed_through_ms", "INTEGER"),
     ("scan_log", "absorption_tf", "TEXT"),
     ("scan_log", "absorption_bars", "INTEGER"),
     ("scan_log", "taker_max", "REAL"),
@@ -549,6 +566,31 @@ def earlier_versions(con: sqlite3.Connection, tf: str) -> list[str]:
         (tf, SQUEEZE_FORMULA_VERSION),
     ).fetchall()
     return [row[0] for row in rows]
+
+
+def record_twin(
+    con: sqlite3.Connection, scan_id: int, *, market: str, view: Any
+) -> None:
+    """Дописать в готовую строку скана те же величины с соседнего рынка.
+
+    Отдельной операцией, а не полем `record_scan`: основной проход идёт по
+    архиву и не делает ни одного запроса к бирже, а соседний рынок в архиве не
+    лежит вовсе — за ним нужен запрос. Связывать их в одну запись значило бы
+    поставить дешёвый проход в зависимость от дорогого.
+    """
+    con.execute(
+        "UPDATE scan_log SET twin_market = ?, twin_index = ?, "
+        "twin_range_width_pct = ?, twin_narrow_bars = ?, "
+        "twin_closed_through_ms = ? WHERE id = ?",
+        (
+            market,
+            view.squeeze_index,
+            round(view.range_width * 100, 4),
+            view.narrow_bars,
+            view.meta.get("closed_through_ms"),
+            scan_id,
+        ),
+    )
 
 
 def latest_scan(
