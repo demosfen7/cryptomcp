@@ -79,6 +79,21 @@ def render_metric(metric: Metric, *, precision: int = 4) -> str:
     return f"{value}  → {tail}{flag}"
 
 
+def usdt(value: float) -> str:
+    """Сумма в USDT коротко: 2.10B, 341M, 12.4K.
+
+    Печатается вместе с множителями, а не вместо них: множитель отвечает
+    «много это или мало», абсолют — «сколько». Без абсолюта неразличимы
+    «объём ниже среднего» и «оборота нет вовсе».
+    """
+    if value != value:
+        return "n/a"
+    for scale, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(value) >= scale:
+            return f"{value / scale:.2f}{suffix}"
+    return f"{value:.0f}"
+
+
 def _distance(target: float, price: float, atr_value: float, precision: int) -> str:
     pct = (target - price) / price * 100.0 if price else float("nan")
     atr_units = (target - price) / atr_value if atr_value else float("nan")
@@ -387,6 +402,18 @@ def render_squeeze_metrics(view: TimeframeView) -> str:
         f"{candles(volume.bars_window)} "
         f"(объём ≥3x к MA20 при тихом теле: <0.5 ATR или <0.3%)",
         f"   taker buy доля   {volume.taker_buy_mean:.2f} средняя за 30 (нейтраль 0.50)",
+        # Абсолют рядом с множителями: на вопрос «сколько куплено и продано за
+        # период» ни одно отношение не отвечает, а перекос в долях, печатаемый
+        # до сотых, на окне в три недели округляется до величины самого
+        # перекоса.
+        f"   оборот окна      {usdt(volume.quote_total)} USDT за "
+        f"{candles(volume.bars_window)} · "
+        f"{usdt(volume.quote_total / volume.bars_window)} на свечу · "
+        f"куплено по рынку {usdt(volume.taker_buy_quote_total)}"
+        + (
+            f" ({volume.taker_buy_quote_total / volume.quote_total * 100:.0f}%)"
+            if volume.quote_total else ""
+        ),
         "",
         "3. Диапазон",
         f"   ширина(20)       {view.range_width * 100:.2f}% = "
@@ -482,12 +509,16 @@ def render_klines(
         f"последние {len(tail)} ЗАКРЫТЫХ свечей · "
         f"время UTC · объём в USDT",
         f"{'время':<17}{'open':>12}{'high':>12}{'low':>12}{'close':>12}"
-        f"{'тело%':>8}{'верх%':>7}{'низ%':>7}{'объём':>8}{'takerB':>7}",
+        f"{'тело%':>8}{'верх%':>7}{'низ%':>7}{'объём':>8}{'оборот':>9}"
+        f"{'куплено':>9}{'сделок':>8}{'takerB':>7}",
     ]
 
     opens, highs, lows, closes = (
         tail.col("open"), tail.high, tail.low, tail.close
     )
+    quotes = tail.quote_volume
+    taker_quote = tail.col("taker_buy_quote")
+    trades = tail.col("trades")
     for i in range(len(tail)):
         span = highs[i] - lows[i]
         body = (closes[i] - opens[i]) / opens[i] * 100 if opens[i] else 0.0
@@ -503,7 +534,9 @@ def render_klines(
             f"{format_price(highs[i], precision):>12}"
             f"{format_price(lows[i], precision):>12}"
             f"{format_price(closes[i], precision):>12}"
-            f"{body:>+8.2f}{upper:>7.0f}{lower:>7.0f}{volume:>8}{taker[i]:>7.2f}"
+            f"{body:>+8.2f}{upper:>7.0f}{lower:>7.0f}{volume:>8}"
+            f"{usdt(float(quotes[i])):>9}{usdt(float(taker_quote[i])):>9}"
+            f"{int(trades[i]):>8}{taker[i]:>7.2f}"
         )
 
     lines.append("")
@@ -514,6 +547,11 @@ def render_klines(
     lines.append(
         "объём — к той же базе, что в колонке «объём» снапшота: уровень 20 предыдущих "
         "свечей × сезонность слота суток; ~ слабая база. От limit не зависит."
+    )
+    lines.append(
+        "оборот — весь оборот свечи в USDT, куплено — из него по рынку в покупку "
+        "(taker buy), сделок — их число. Множитель отвечает «много это или мало», "
+        "абсолют — «сколько»; одно другое не заменяет."
     )
     lines.append(f"база последней свечи: {baseline.basis}")
     return "\n".join(lines)

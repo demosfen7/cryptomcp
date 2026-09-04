@@ -85,6 +85,14 @@ class VolumeContext:
     #: Окно, на котором считались бары набора. Зависит от таймфрейма
     #: (absorption_window), поэтому печатается вместе с числом.
     bars_window: int = ABSORPTION_WINDOW_MIN
+    #: Абсолютный оборот того же окна в USDT и из него — купленное по рынку.
+    #:
+    #: Множители отвечают на вопрос «много это или мало», абсолют — на вопрос
+    #: «сколько», и одно другое не заменяет. Без абсолюта неразличимы «объём
+    #: ниже среднего» и «оборота нет вовсе»: у монеты с 30K в сутки и у монеты
+    #: с 30M затухание до 0.35x выглядит одинаково.
+    quote_total: float = float("nan")
+    taker_buy_quote_total: float = float("nan")
 
     @property
     def weak_basis(self) -> bool:
@@ -108,6 +116,14 @@ class VolumeContext:
             "weak_basis": self.weak_basis,
             "ma20_over_ma100": round(self.ma_ratio, 3),
             "anomalous_bars": self.anomalous_bars,
+            "quote_total": (
+                round(self.quote_total, 2)
+                if self.quote_total == self.quote_total else None
+            ),
+            "taker_buy_quote_total": (
+                round(self.taker_buy_quote_total, 2)
+                if self.taker_buy_quote_total == self.taker_buy_quote_total else None
+            ),
             "anomalous_bars_window": self.bars_window,
             "taker_buy_mean_30": round(self.taker_buy_mean, 3),
         }
@@ -278,6 +294,10 @@ def volume_context(series: Series, atr_values: np.ndarray) -> VolumeContext:
     taker = series.taker_buy_ratio[-30:]
     taker_mean = float(np.nanmean(taker)) if len(taker) else float("nan")
 
+    window = absorption_window(series.interval)
+    quote_window = volumes[-window:]
+    taker_quote = series.col("taker_buy_quote")[-window:]
+
     return VolumeContext(
         ratio=ratio,
         basis=basis,
@@ -285,7 +305,11 @@ def volume_context(series: Series, atr_values: np.ndarray) -> VolumeContext:
         ma_ratio=ma_ratio,
         anomalous_bars=anomalous_bars(series, atr_values),
         taker_buy_mean=taker_mean,
-        bars_window=absorption_window(series.interval),
+        bars_window=window,
+        quote_total=float(np.nansum(quote_window)) if len(quote_window) else float("nan"),
+        taker_buy_quote_total=(
+            float(np.nansum(taker_quote)) if len(taker_quote) else float("nan")
+        ),
     )
 
 

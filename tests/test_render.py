@@ -49,12 +49,20 @@ def series_4h(days: int = 40):
 
 
 def volume_cells(text: str) -> list[str]:
-    """Колонка «объём» из строк со свечами."""
-    return [
-        line.split()[-2]
-        for line in text.splitlines()
-        if line and line[0].isdigit()
-    ]
+    """Колонка «объём» из строк со свечами.
+
+    Ячейка ищется по виду, а не по позиции: колонок в таблице прибавляется
+    (абсолютный оборот, куплено по рынку, число сделок), и счёт с конца
+    ломался бы при каждой такой правке. Множитель — единственная ячейка,
+    оканчивающаяся на «x».
+    """
+    cells = []
+    for line in text.splitlines():
+        if not line or not line[0].isdigit():
+            continue
+        found = [t for t in line.split() if t.rstrip("~").endswith("x")]
+        cells.append(found[-1] if found else "n/a")
+    return cells
 
 
 def view(**overrides) -> TimeframeView:
@@ -525,3 +533,51 @@ class TestTwinMarketColumns:
         text = self.render([self.row()])
 
         assert "рынок: спот" in text
+
+
+class TestAbsoluteTurnover:
+    """Множитель отвечает «много это или мало», абсолют — «сколько».
+
+    До этой правки абсолютных сумм не печатал ни один инструмент, хотя
+    заголовок колонки в get_klines говорил «объём в USDT». Из-за этого
+    неразличимы «объём ниже среднего» и «оборота нет вовсе»: затухание до
+    0.35x выглядит одинаково у монеты с 30K оборота и у монеты с 30M.
+    """
+
+    def test_short_form_by_scale(self):
+        from cryptomcp.render import usdt
+
+        assert usdt(2_100_000_000) == "2.10B"
+        assert usdt(341_000_000) == "341.00M"
+        assert usdt(12_400) == "12.40K"
+        assert usdt(920) == "920"
+
+    def test_missing_value_is_not_a_zero(self):
+        from cryptomcp.render import usdt
+
+        assert usdt(float("nan")) == "n/a"
+
+    def test_klines_print_absolute_columns(self):
+        text = render_klines(series_4h(), INFO, 5)
+
+        assert "оборот" in text and "куплено" in text and "сделок" in text
+
+    def test_multiplier_column_survives(self):
+        """Абсолют добавлен рядом с множителем, а не вместо него."""
+        assert volume_cells(render_klines(series_4h(), INFO, 5))[-1].endswith("x")
+
+    def test_metrics_print_window_turnover(self):
+        from cryptomcp.render import render_squeeze_metrics
+        from cryptomcp.volume import VolumeContext
+
+        volume = VolumeContext(
+            1.0, "медиана последних 20", 250, 0.6, 3, 0.55,
+            bars_window=30, quote_total=110_270_000.0,
+            taker_buy_quote_total=52_520_000.0,
+        )
+        text = render_squeeze_metrics(view(volume=volume))
+
+        assert "оборот окна" in text
+        assert "110.27M USDT за 30 свечей" in text
+        assert "3.68M на свечу" in text
+        assert "куплено по рынку 52.52M (48%)" in text
