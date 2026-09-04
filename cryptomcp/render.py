@@ -736,7 +736,7 @@ def render_scan_history(
         f"{symbol} · {tf} · рынок: {markets} · формула {version} · "
         f"записей {len(rows)}, свежие сверху",
         f"{'закрыта':<17}{'индекс':>7}{header}{'BBW':>6}{'диап':>8}{'узк':>5}"
-        f"{'сут':>6}{twin_head}{'объём':>8}{'МА':>7}{'шок':>6}{'погл':>6}{'клст':>6}{'tkМакс':>8}"
+        f"{'сут':>6}{'Δ24ч':>8}{twin_head}{'объём':>8}{'МА':>7}{'шок':>6}{'погл':>6}{'клст':>6}{'tkМакс':>8}"
         f"{'лид':>6}{'фанд%':>9}{'цена':>13}",
     ]
 
@@ -763,6 +763,7 @@ def render_scan_history(
             f"{f'{width:.2f}%' if width is not None else 'n/a':>8}"
             f"{row.get('narrow_bars') if row.get('narrow_bars') is not None else '—':>5}"
             f"{_days(row.get('narrow_bars'), tf):>6}"
+            f"{_cell(row.get('change_24h_pct'), '+.1f'):>8}"
             f"{_twin(row) if twin else ''}"
             f"{f'{volume:.2f}x' if volume is not None else 'n/a':>8}"
             f"{_cell(row.get('ma_ratio'), '.2f'):>7}"
@@ -805,6 +806,8 @@ def render_scan_history(
         "запись одна на закрытую свечу, поэтому шаг строк равен таймфрейму",
         "рынок — ряд, по которому считалась строка; чтобы сверить её с "
         "get_squeeze_metrics, вызывать его с тем же market",
+        "Δ24ч — ход цены за сутки по закрытым свечам; при |Δ24ч| выше 15% "
+        "эпизод не открывается, но строка журнала пишется всё равно",
     ]
     return "\n".join(lines)
 

@@ -574,27 +574,129 @@ class TestScanTwin:
 
 
 class TestWatchlist:
-    """Отбор рангом с гистерезисом: порога, который можно было бы взять, нет."""
+    """Отбор рангом с гистерезисом плюс трое ворот на вход (§4.35).
+
+    Набор ведётся только на дневке, поэтому и заготовка рынка — дневная.
+    Свечей сжатия у заготовки десять, то есть десять суток: выше пола в семь.
+    """
 
     NOW = 1_788_000_000_000
-    STEP = 4 * 3_600_000
+    STEP = 86_400_000
+    TF = "1d"
 
-    def scan(self, con, symbol, index, ts, price=100.0, low=95.0, high=105.0):
+    def scan(self, con, symbol, index, ts, price=100.0, low=95.0, high=105.0,
+             tf=None, narrow_bars=10, change=1.0):
         con.execute(
             "INSERT OR REPLACE INTO scan_log (ts_ms, symbol, source, tf, "
             "formula_version, squeeze_index, price, range_low, range_high, "
-            "closed_through_ms) VALUES (?, ?, 'spot', '4h', ?, ?, ?, ?, ?, ?)",
-            (ts, symbol, SQUEEZE_FORMULA_VERSION, index, price, low, high, ts),
+            "closed_through_ms, narrow_bars, change_24h_pct) "
+            "VALUES (?, ?, 'spot', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, symbol, tf or self.TF, SQUEEZE_FORMULA_VERSION, index, price,
+             low, high, ts, narrow_bars, change),
         )
 
-    def market(self, con, ts, count=50, overrides=None, price=100.0):
+    def market(self, con, ts, count=50, overrides=None, price=100.0, **fields):
         overrides = overrides or {}
         for i in range(count):
             symbol = f"C{i:02d}USDT"
             self.scan(con, symbol, overrides.get(symbol, 0.60 - i * 0.01), ts,
                       price=price if symbol not in overrides else overrides.get(
-                          f"{symbol}_price", price))
+                          f"{symbol}_price", price), **fields)
         con.commit()
+
+    def test_short_squeeze_does_not_open_an_episode(self, con):
+        """Сканер ищет недельные базы: полтора дня к задаче не относятся.
+
+        В списке от 03.09 было 32 эпизода из 40 без единой свечи сжатия —
+        длительность была колонкой, а не воротами.
+        """
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW, narrow_bars=6)
+        changes = update_watchlist(con, self.NOW)
+
+        assert changes["entered"] == []
+        assert storage.open_episodes(con) == []
+
+    def test_seven_days_is_enough(self, con):
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW, narrow_bars=7)
+
+        assert update_watchlist(con, self.NOW)["entered"] != []
+
+    def test_coin_in_motion_is_rejected(self, con):
+        """Шаг 1 протокола: монета в движении не кандидат на накопление."""
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW, change=22.0)
+        changes = update_watchlist(con, self.NOW)
+
+        assert changes["entered"] == []
+
+    def test_motion_is_symmetric(self, con):
+        """Обвал — такое же движение, как рост."""
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW, change=-22.0)
+
+        assert update_watchlist(con, self.NOW)["entered"] == []
+
+    def test_unknown_change_does_not_block_entry(self, con):
+        """У записей прошлых версий поля нет; отказ по пустому полю — не отказ."""
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW, change=None)
+
+        assert update_watchlist(con, self.NOW)["entered"] != []
+
+    def test_index_floor_is_off_by_default(self, con):
+        """Порог индекса заведён, но значение выбирается замером, не сегодня."""
+        from cryptomcp.collector import WATCH_MIN_INDEX
+
+        assert WATCH_MIN_INDEX == 0.0
+
+    def test_index_floor_filters_when_set(self, con, monkeypatch):
+        from cryptomcp import collector
+
+        monkeypatch.setattr(collector, "WATCH_MIN_INDEX", 0.55)
+        self.market(con, self.NOW)
+        changes = collector.update_watchlist(con, self.NOW)
+
+        assert changes["entered"] != []
+        assert all(
+            con.execute(
+                "SELECT squeeze_index FROM watchlist WHERE symbol = ?",
+                (entry["symbol"],),
+            ).fetchone()["squeeze_index"] >= 0.55
+            for entry in changes["entered"]
+        )
+
+    def test_four_hours_no_longer_opens_episodes(self, con):
+        """Скан по 4h идёт и пишется, но эпизодов там больше не открывает."""
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW, tf="4h", narrow_bars=60)
+        changes = update_watchlist(con, self.NOW)
+
+        assert changes["entered"] == []
+        assert con.execute("SELECT COUNT(*) c FROM scan_log").fetchone()["c"] == 50
+
+    def test_open_four_hour_episode_still_lives_out_its_life(self, con):
+        """Уже открытые эпизоды 4h обязаны дожить, а не зависнуть навсегда."""
+        from cryptomcp.collector import update_watchlist
+
+        storage.open_episode(
+            con, "C00USDT", "4h", entered_at=self.NOW, entered_by="scanner",
+            scan={"squeeze_index": 0.6, "price": 100.0,
+                  "range_low": 95.0, "range_high": 105.0, "source": "spot"},
+            rank=1,
+        )
+        con.commit()
+        self.market(con, self.NOW + self.STEP, tf="4h", price=200.0)
+        changes = update_watchlist(con, self.NOW + self.STEP)
+
+        assert [e["reason"] for e in changes["exited"]] == ["пробой"]
 
     def test_market_of_the_episode_is_remembered(self, con):
         """Эпизод описывает тот ряд, по которому отобран, — спотовый или перп.
@@ -651,8 +753,8 @@ class TestWatchlist:
         self.market(con, self.NOW + self.STEP, overrides={"C00USDT": 0.001})
         changes = update_watchlist(con, self.NOW + self.STEP)
 
-        assert {"symbol": "C00USDT", "tf": "4h", "market": "spot",
-                "reason": "выпала по рангу", "narrow_bars": None} in changes["exited"]
+        assert {"symbol": "C00USDT", "tf": "1d", "market": "spot",
+                "reason": "выпала по рангу", "narrow_bars": 10} in changes["exited"]
         assert "C00USDT" not in {e["symbol"] for e in storage.open_episodes(con)}
 
     def test_breakout_wins_over_rank(self, con):
@@ -666,8 +768,8 @@ class TestWatchlist:
         con.commit()
         changes = update_watchlist(con, self.NOW + self.STEP)
 
-        assert {"symbol": "C00USDT", "tf": "4h", "market": "spot",
-                "reason": "пробой", "narrow_bars": None} in changes["exited"]
+        assert {"symbol": "C00USDT", "tf": "1d", "market": "spot",
+                "reason": "пробой", "narrow_bars": 10} in changes["exited"]
         row = con.execute(
             "SELECT status FROM watchlist WHERE symbol = 'C00USDT'"
         ).fetchone()
@@ -682,15 +784,15 @@ class TestWatchlist:
         self.market(con, later)
         changes = update_watchlist(con, later)
 
-        assert {"symbol": "C00USDT", "tf": "4h", "market": "spot",
-                "reason": "истёк срок", "narrow_bars": None} in changes["exited"]
+        assert {"symbol": "C00USDT", "tf": "1d", "market": "spot",
+                "reason": "истёк срок", "narrow_bars": 10} in changes["exited"]
 
     def test_manual_entry_survives_low_rank(self, con):
         """Сканер видит только то, что умеет измерять."""
         from cryptomcp.collector import add_to_watchlist, update_watchlist
 
         self.market(con, self.NOW)
-        add_to_watchlist(con, "C49USDT", "4h", self.NOW)
+        add_to_watchlist(con, "C49USDT", "1d", self.NOW)
         update_watchlist(con, self.NOW + self.STEP)
 
         row = con.execute(
@@ -703,7 +805,7 @@ class TestWatchlist:
         from cryptomcp.collector import add_to_watchlist, update_watchlist
 
         self.market(con, self.NOW)
-        add_to_watchlist(con, "C49USDT", "4h", self.NOW)
+        add_to_watchlist(con, "C49USDT", "1d", self.NOW)
         self.market(con, self.NOW + self.STEP)
         self.scan(con, "C49USDT", 0.11, self.NOW + self.STEP, price=200.0)
         con.commit()

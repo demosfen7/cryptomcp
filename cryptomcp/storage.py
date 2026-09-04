@@ -149,7 +149,11 @@ CREATE TABLE IF NOT EXISTS scan_log (
     twin_narrow_bars    INTEGER,
     -- Своё «закрыты по»: у рынков разная свежесть последней свечи, и
     -- сравнивать величины, снятые с разных свечей, нельзя.
-    twin_closed_through_ms INTEGER
+    twin_closed_through_ms INTEGER,
+    -- Ход цены за сутки по закрытым свечам. Пишется ВСЕГДА, в том числе у
+    -- монет, которые из-за него в список не попали (§4.35): иначе через два
+    -- месяца нечем будет проверить, верен ли сам порог.
+    change_24h_pct    REAL
 );
 
 -- Одна строка на закрытую свечу И версию формулы. Сканер ходит раз в час, а
@@ -272,6 +276,7 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("scan_log", "twin_range_width_pct", "REAL"),
     ("scan_log", "twin_narrow_bars", "INTEGER"),
     ("scan_log", "twin_closed_through_ms", "INTEGER"),
+    ("scan_log", "change_24h_pct", "REAL"),
     ("scan_log", "absorption_tf", "TEXT"),
     ("scan_log", "absorption_bars", "INTEGER"),
     ("scan_log", "taker_max", "REAL"),
@@ -492,6 +497,7 @@ def record_scan(
         _round(shock.range_share, 4) if shock else None,
         _round(shock.volume_ratio, 3) if shock else None,
         shock.bars_ago if shock else None,
+        _round(view.change_24h, 4),
     )
     columns = [
         "ts_ms", "symbol", "source", "tf", "formula_version", "squeeze_index",
@@ -499,7 +505,7 @@ def record_scan(
         "range_width_pct", "narrow_bars", "atr_pct", "rsi", "bbw_pct_rank",
         "volume_ratio", "taker_buy_mean", "ema_state", "structure",
         "closed_through_ms", "ma_ratio", "shock_atr", "shock_share",
-        "shock_volume", "shock_bars_ago",
+        "shock_volume", "shock_bars_ago", "change_24h_pct",
     ]
     values = list(payload)
     # Признаки накопления приходят готовыми словарём: они считаются по ДРУГОМУ
@@ -712,6 +718,21 @@ def screen_scan(
             -(r["squeeze_index"] or 0),
         ))
     return rows
+
+
+def open_timeframes(con: sqlite3.Connection) -> list[str]:
+    """Таймфреймы, на которых есть незакрытые эпизоды.
+
+    Нужен на переходе: список перестал открывать эпизоды на 4h (§4.35), но
+    уже открытые обязаны дожить своим чередом — по пробою, сроку или рангу.
+    Иначе они зависли бы в выдаче навсегда, потому что цикл обслуживания
+    ходит только по таймфреймам, на которых ведётся набор.
+    """
+    return [
+        row["tf"] for row in con.execute(
+            "SELECT DISTINCT tf FROM watchlist WHERE exited_at IS NULL ORDER BY tf"
+        )
+    ]
 
 
 def open_episodes(con: sqlite3.Connection, tf: str | None = None) -> list[dict[str, Any]]:

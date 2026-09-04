@@ -218,6 +218,7 @@ class FakeView:
         self.range_low, self.range_high = 95.0, 105.0
         self.range_width = 0.1
         self.narrow_bars = 3
+        self.change_24h = 1.5
         self.atr_pct = 2.0
         self.rsi_value = 55.0
         self.ema_state, self.structure = "above", "HH/HL"

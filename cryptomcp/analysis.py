@@ -75,6 +75,27 @@ def required_candles(interval: str) -> int:
     return max(PERCENTILE_WINDOW + 1, by_span + 1)
 
 
+def change_over_day(close: np.ndarray, interval: str) -> float:
+    """Ход цены за сутки по ЗАКРЫТЫМ свечам, в процентах.
+
+    Считается по ряду, а не по тикеру биржи, ровно по той же причине, по
+    которой так считается всё остальное: тикер живой, а решение принимается по
+    закрытым свечам, и смешение этих двух величин уже давало расхождения.
+
+    На таймфреймах крупнее суток возвращается n/a: «за сутки» там не
+    определено, а подставить недельную свечу значило бы назвать сутками неделю.
+    """
+    from .series import interval_ms
+
+    step = interval_ms(interval)
+    if step > 86_400_000:
+        return float("nan")
+    bars = max(1, round(86_400_000 / step))
+    if len(close) <= bars or not close[-bars - 1]:
+        return float("nan")
+    return (float(close[-1]) / float(close[-bars - 1]) - 1.0) * 100.0
+
+
 def canonical_span_days(interval: str) -> float:
     """Календарная длина полного канонического окна этого таймфрейма.
 
@@ -309,6 +330,10 @@ class TimeframeView:
     #: порога. Это длительность СЖАТИЯ, а не возраст текущего диапазона:
     #: у широкого диапазона здесь ноль, и это верное значение, а не сбой.
     narrow_bars: int
+    #: Ход цены за сутки по закрытым свечам, в процентах. Нужен отбору в
+    #: список: монета в движении не кандидат на накопление, и шаг 1 протокола
+    #: исключает её первой же проверкой.
+    change_24h: float
     #: Та же длительность в сутках. Свечи разных ТФ несопоставимы: «узк 19» на
     #: 4h выглядит внушительнее, чем «узк 7» на 1d, хотя это 3.2 суток против
     #: семи. В общем списке, где строки обоих ТФ стоят рядом, счётчик без
@@ -342,6 +367,10 @@ class TimeframeView:
             "position_in_range": round(self.position_in_range, 3),
             "rsi": round(self.rsi_value, 1),
             "atr_pct": round(self.atr_pct, 3),
+            "change_24h": (
+                round(self.change_24h, 3)
+                if self.change_24h == self.change_24h else None
+            ),
             "bbw": self.bbw.to_dict(),
             "atr_percentile": self.atr_metric.to_dict(),
             "atr_declining_bars": self.atr_declining_bars,
@@ -625,6 +654,7 @@ def analyse_timeframe(
         range_width_atr=(range_width * price / atr_value) if atr_value else float("nan"),
         range_threshold=threshold,
         range_metric=range_metric,
+        change_24h=change_over_day(close, series.interval),
         narrow_bars=narrow_bars,
         narrow_days=narrow_days,
         narrow_metric=narrow_metric,
