@@ -29,7 +29,7 @@ import os
 import sqlite3
 
 from . import storage
-from .analysis import required_candles
+from .analysis import WARMUP, required_candles
 from .errors import insufficient_history
 from .fetcher import CandleFetcher
 from .series import Series, build_series, series_from_records
@@ -40,9 +40,9 @@ log = logging.getLogger("cryptomcp.reader")
 #: сборщика набирается одна-две, но после его простоя может и десяток.
 TAIL_LIMIT = 200
 
-#: Запас к каноническому окну: индикаторам нужен разогрев, а EMA200 — двести
-#: свечей до первого значения.
-WARMUP = 250
+#: WARMUP объявлен в `analysis` — там же, где считаются индикаторы, которым он
+#: и нужен, — и импортирован выше. Здесь он остаётся видимым под прежним
+#: именем: на `reader.WARMUP` ссылается сборщик.
 
 
 def archive_path() -> str | None:

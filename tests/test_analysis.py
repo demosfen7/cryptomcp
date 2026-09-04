@@ -239,6 +239,98 @@ class TestConfig:
         assert config.atr_decline_bars == 10
 
 
+class TestDurationSpanBar:
+    """Требование к охвату не должно быть константой таймфрейма (§4.34).
+
+    Правило «180 суток охвата» задумано как «у ЭТОЙ монеты достаточно
+    истории». На 1d так и есть: окно 611 суток, порог отбраковывает реальные
+    символы. На 4h окно даёт 102 суток у ВСЕХ монет разом — там голый порог в
+    180 превращался в безусловный отказ и проверял параметр системы вместо
+    свойства монеты. Замер 04.09.2026: база была у 0 из 30 самых оборотистых
+    перпетуалов.
+    """
+
+    def test_daily_keeps_the_configured_bar(self):
+        from cryptomcp.analysis import duration_span_bar
+
+        assert duration_span_bar("1d", 180.0) == 180.0
+
+    def test_four_hours_collapses_to_its_own_window(self):
+        from cryptomcp.analysis import canonical_span_days, duration_span_bar
+
+        bar = duration_span_bar("4h", 180.0)
+
+        assert bar < 180.0, "иначе правило снова станет тавтологическим «нет»"
+        assert bar == pytest.approx(canonical_span_days("4h") - 4 / 24)
+
+    def test_bar_is_reachable_by_a_series_from_the_exchange(self):
+        """Ряд с биржи короче архивного на одну незакрытую свечу.
+
+        Планка ровно в окно отвергала бы его по разнице в четыре часа — тот
+        же безусловный отказ, только по офф-бай-ван.
+        """
+        from cryptomcp.analysis import (
+            WARMUP,
+            duration_span_bar,
+            required_candles,
+        )
+
+        for tf, step_days in (("4h", 4 / 24), ("1d", 1.0)):
+            from_exchange = (required_candles(tf) + WARMUP - 1) * step_days
+            assert from_exchange >= duration_span_bar(tf, 180.0), tf
+
+    def test_bar_never_exceeds_the_window_on_any_timeframe(self):
+        """Инвариант: планка достижима на каждом ТФ, а не только на дневке."""
+        from cryptomcp.analysis import canonical_span_days, duration_span_bar
+
+        for tf in ("1w", "1d", "4h", "1h", "15m", "5m"):
+            assert duration_span_bar(tf, 180.0) <= canonical_span_days(tf)
+
+    def test_truncated_series_is_still_rejected(self):
+        """Свежий листинг правило ловит по-прежнему — ради него оно и есть."""
+        from cryptomcp.analysis import duration_span_bar
+
+        bar = duration_span_bar("4h", 180.0)
+
+        assert bar > 30.0, "трёхдневный ряд обязан не проходить"
+
+
+class TestSpanRulesAreNotTautologies:
+    """Проверка того же класса ошибки в остальных правилах, заданных в сутках.
+
+    `required_candles` выводится ИЗ `MIN_PERCENTILE_SPAN_DAYS`, поэтому база
+    перцентиля на 4h, 1h, 15m и 5m укладывается в требование ровно впритык:
+    60.0 суток при требуемых 60.0, запас нулевой. Сегодня это верно, но любая
+    правка окна или округления в `required_candles` молча обнулит перцентили
+    на всех младших ТФ разом — тест фиксирует границу, чтобы это заметили.
+    """
+
+    def test_canonical_base_satisfies_the_span_rule(self):
+        import numpy as np
+
+        from cryptomcp.analysis import percentile_base, required_candles
+        from cryptomcp.indicators import MIN_PERCENTILE_SPAN_DAYS
+
+        for tf in ("1w", "1d", "4h", "1h", "15m", "5m"):
+            values = np.arange(float(required_candles(tf) + 250))
+            _, span = percentile_base(values, tf)
+            assert span >= MIN_PERCENTILE_SPAN_DAYS, tf
+
+    def test_lower_timeframes_pass_with_zero_margin(self):
+        import numpy as np
+
+        from cryptomcp.analysis import percentile_base, required_candles
+        from cryptomcp.indicators import MIN_PERCENTILE_SPAN_DAYS
+
+        for tf in ("4h", "1h", "15m", "5m"):
+            values = np.arange(float(required_candles(tf) + 250))
+            _, span = percentile_base(values, tf)
+            assert span == MIN_PERCENTILE_SPAN_DAYS, (
+                f"{tf}: запас перестал быть нулевым — проверьте, не изменилось "
+                "ли окно; правило и окно завязаны на одну константу"
+            )
+
+
 class TestPercentileBase:
     """База перцентиля обрезается по времени, а не по числу свечей.
 
