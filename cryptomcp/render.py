@@ -23,7 +23,7 @@ from .derivatives import Funding, OpenInterest, side_of_flow
 from .errors import ErrorKind, ToolError
 from .indicators import Metric
 from .levels import Level, Pivots
-from .markets import FUTURES, Market
+from .markets import FUTURES, Market, market_short
 from .series import Series
 from .symbols import SymbolInfo, format_price
 from .volume import (
@@ -595,7 +595,8 @@ def render_watchlist(
     closed = any(row.get("exited_at") for row in episodes)
     lines = [
         f"эпизодов: {len(episodes)}",
-        f"{'символ':<14}{'ТФ':>4}{'статус':>11}{'ранг':>10}{'инд':>7}{'Δинд':>7}"
+        f"{'символ':<14}{'ТФ':>4}{'рынок':>7}{'статус':>11}{'ранг':>10}"
+        f"{'инд':>7}{'Δинд':>7}"
         f"{'накопл':>8}{'узк':>5}{'вход':>13}{'сейчас':>9}{'дней':>6}  кем"
         + ("  ·  чем кончилось" if closed else ""),
     ]
@@ -625,7 +626,9 @@ def render_watchlist(
         narrow = scan.get("narrow_bars")
 
         line = (
-            f"{row['symbol']:<14}{row['tf']:>4}{row['status']:>11}"
+            f"{row['symbol']:<14}{row['tf']:>4}"
+            f"{market_short(row.get('market') or scan.get('source')):>7}"
+            f"{row['status']:>11}"
             f"{_pair(row.get('rank_at_entry'), row.get('last_rank')):>10}"
             f"{f'{index_now:.2f}' if index_now is not None else '—':>7}{delta:>7}"
             f"{f'{accumulation:.2f}' if accumulation is not None else 'n/a':>8}"
@@ -649,6 +652,9 @@ def render_watchlist(
         "ранг и Δинд — «при входе → сейчас»; инд — squeeze_index последнего скана",
         "узк — свечей подряд с шириной диапазона(20) ниже 20-го перцентиля "
         "своей истории",
+        "рынок — ряд, по которому монета отобрана: архив предпочитает спот "
+        "(история глубже), и числа эпизода относятся именно к нему; "
+        "сверять их через get_squeeze_metrics нужно с тем же market",
         "накопл — метрика накопления; колонка заведена, метрика ещё не считается",
         "кем — источник: scanner отбирает рангом, manual заводится руками и "
         "рангом не снимается (только руками или по сроку в 30 суток)",
@@ -675,8 +681,12 @@ def render_scan_history(
         )
 
     header = "".join(f"{short:>7}" for _, short in INDEX_GROUPS)
+    markets = " / ".join(
+        dict.fromkeys(market_short(row.get("source")) for row in rows)
+    )
     lines = [
-        f"{symbol} · {tf} · формула {version} · записей {len(rows)}, свежие сверху",
+        f"{symbol} · {tf} · рынок: {markets} · формула {version} · "
+        f"записей {len(rows)}, свежие сверху",
         f"{'закрыта':<17}{'индекс':>7}{header}{'BBW':>6}{'диап':>8}{'узк':>5}"
         f"{'объём':>8}{'МА':>7}{'шок':>6}{'погл':>6}{'клст':>6}{'tkМакс':>8}"
         f"{'лид':>6}{'фанд%':>9}{'цена':>13}",
@@ -731,6 +741,8 @@ def render_scan_history(
         "группы — вклад в индекс до взвешивания; «—» значит базы не хватило "
         "и группа исключена из формулы с перенормировкой весов",
         "запись одна на закрытую свечу, поэтому шаг строк равен таймфрейму",
+        "рынок — ряд, по которому считалась строка; чтобы сверить её с "
+        "get_squeeze_metrics, вызывать его с тем же market",
     ]
     return "\n".join(lines)
 

@@ -70,34 +70,46 @@ class TestRender:
 
     def test_all_three_sections(self):
         text = render_watchlist_delta({
-            "entered": [("ONDOUSDT", "4h", 2)],
-            "promoted": [("HBARUSDT", "1d", 7)],
-            "exited": [("WLDUSDT", "4h", "пробой")],
+            "entered": [("ONDOUSDT", "4h", 2, "futures")],
+            "promoted": [("HBARUSDT", "1d", 7, "futures")],
+            "exited": [("WLDUSDT", "4h", "пробой", "spot")],
         }, now_ms=1_756_800_000_000)
 
         assert "Вошли (1)" in text
-        assert ">ONDOUSDT</a> 4h · ранг 2" in text
+        assert ">ONDOUSDT</a> 4h перп · ранг 2" in text
         assert "Подтверждены (1)" in text
-        assert ">HBARUSDT</a> 1d · ранг 7" in text
+        assert ">HBARUSDT</a> 1d перп · ранг 7" in text
         assert "Вышли (1)" in text
-        assert ">WLDUSDT</a> 4h · пробой" in text
+        assert ">WLDUSDT</a> 4h спот · пробой" in text
 
     def test_symbol_is_a_link_to_the_same_timeframe(self):
         """Смысл ссылки — открыть тот же контракт и тот же таймфрейм."""
-        text = render_watchlist_delta({"entered": [("ONDOUSDT", "4h", 2)]})
+        text = render_watchlist_delta({"entered": [("ONDOUSDT", "4h", 2, "futures")]})
 
         assert '<a href="https://www.tradingview.com/chart/?' in text
         assert "symbol=BINANCE%3AONDOUSDT.P" in text
         assert "interval=240" in text
 
+    def test_link_follows_the_market_of_the_episode(self):
+        """Отобрали по споту — вести на спот: ряды расходятся вдвое."""
+        text = render_watchlist_delta({"entered": [("HOMEUSDT", "4h", 2, "spot")]})
+
+        assert "symbol=BINANCE%3AHOMEUSDT&" in text
+        assert ".P" not in text
+        assert "4h спот" in text
+
     def test_outside_text_is_escaped(self):
         """Причина выхода приходит извне: угловая скобка не должна стать тегом."""
-        text = render_watchlist_delta({"exited": [("WLDUSDT", "4h", "цена < уровня")]})
+        text = render_watchlist_delta(
+            {"exited": [("WLDUSDT", "4h", "цена < уровня", "spot")]}
+        )
 
         assert "цена &lt; уровня" in text
 
     def test_only_filled_sections_appear(self):
-        text = render_watchlist_delta({"exited": [("WLDUSDT", "4h", "истёк срок")]})
+        text = render_watchlist_delta(
+            {"exited": [("WLDUSDT", "4h", "истёк срок", "spot")]}
+        )
 
         assert "Вышли" in text
         assert "Вошли" not in text
@@ -105,12 +117,21 @@ class TestRender:
 
 
 class TestTradingViewUrl:
-    """Промах в символе тихо открывает соседний рынок — это стоит теста."""
+    """Промах в рынке тихо открывает соседний график — это стоит теста."""
 
-    def test_perpetual_suffix(self):
-        url = tradingview_url("ONDOUSDT")
+    def test_perpetual_gets_the_suffix(self):
+        url = tradingview_url("ONDOUSDT", market="futures")
 
         assert "symbol=BINANCE%3AONDOUSDT.P" in url
+
+    def test_spot_has_no_suffix(self):
+        assert "symbol=BINANCE%3AONDOUSDT&" in tradingview_url(
+            "ONDOUSDT", "4h", "spot"
+        )
+
+    def test_unknown_market_goes_to_spot(self):
+        """У старых эпизодов рынка нет; спотовый тикер есть у любой пары."""
+        assert ".P" not in tradingview_url("ONDOUSDT", "4h", None)
 
     def test_known_timeframes(self):
         assert "interval=240" in tradingview_url("ONDOUSDT", "4h")
@@ -222,7 +243,9 @@ class TestNotifyWatchlist:
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:abc")
         monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1")
 
-        assert await notify_watchlist({"entered": [("CAKEUSDT", "4h", 3)]}) is True
+        assert await notify_watchlist(
+            {"entered": [("CAKEUSDT", "4h", 3, "spot")]}
+        ) is True
         text = transport.calls[0]["json"]["text"]
         assert "CAKEUSDT" in text
         assert "tradingview.com" in text
@@ -233,5 +256,7 @@ class TestNotifyWatchlist:
         monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
         monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
 
-        assert await notify_watchlist({"entered": [("CAKEUSDT", "4h", 3)]}) is False
+        assert await notify_watchlist(
+            {"entered": [("CAKEUSDT", "4h", 3, "spot")]}
+        ) is False
         assert transport.calls == []

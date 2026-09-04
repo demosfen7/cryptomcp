@@ -185,7 +185,13 @@ CREATE TABLE IF NOT EXISTS watchlist (
     last_rank          INTEGER,
     last_index         REAL,
     exited_at          INTEGER,
-    exit_reason        TEXT
+    exit_reason        TEXT,
+    -- Рынок ряда, по которому монета отобрана. Архив предпочитает спот
+    -- (archive_plan: история глубже), а инструменты сервера по умолчанию
+    -- показывают перпетуал — и на HOMEUSDT это оказались разные величины:
+    -- узк 17 против 36 на одной свече. Пока рынок не хранился, список
+    -- выглядел фьючерсным, не будучи им на четырёх строках из пяти.
+    market             TEXT
 );
 
 -- Открытый эпизод на пару может быть только один; закрытых — сколько угодно.
@@ -248,6 +254,7 @@ def connect(path: str = DEFAULT_PATH, *, read_only: bool = False) -> sqlite3.Con
 #: таблицу нельзя: в ней лежат эпизоды, ради истории которых она и заведена.
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("watchlist", "rank_at_entry", "INTEGER"),
+    ("watchlist", "market", "TEXT"),
     ("scan_log", "absorption_tf", "TEXT"),
     ("scan_log", "absorption_bars", "INTEGER"),
     ("scan_log", "taker_max", "REAL"),
@@ -729,24 +736,30 @@ def open_episode(
     entered_by: str,
     scan: dict[str, Any] | None = None,
     rank: int | None = None,
+    market: str | None = None,
 ) -> int:
     """Завести эпизод наблюдения.
 
     Границы диапазона запоминаются на входе и потом не пересчитываются: пробой
     определяется относительно того, что было в момент попадания в список, а не
     относительно уехавшего вместе с ценой диапазона.
+
+    Рынок берётся из самой записи скана: эпизод описывает тот ряд, по которому
+    отобран, и потом это уже не восстановить — источник архива у символа
+    может смениться, а числа эпизода останутся от прежнего.
     """
     scan = scan or {}
     cursor = con.execute(
         "INSERT OR IGNORE INTO watchlist (symbol, tf, status, entered_at, entered_by, "
         "squeeze_index, rank_at_entry, price_at_entry, range_low, range_high, "
-        "last_rank, last_index) "
-        "VALUES (?, ?, 'candidate', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "last_rank, last_index, market) "
+        "VALUES (?, ?, 'candidate', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             symbol, tf, entered_at, entered_by,
             scan.get("squeeze_index"), rank, scan.get("price"),
             scan.get("range_low"), scan.get("range_high"),
             rank, scan.get("squeeze_index"),
+            market or scan.get("source"),
         ),
     )
     return int(cursor.lastrowid or 0) if cursor.rowcount else 0

@@ -13,7 +13,7 @@ import pytest
 from cryptomcp import storage
 from cryptomcp.analysis import required_candles
 from cryptomcp.reader import WARMUP, ArchiveReader
-from cryptomcp.series import build_series
+from cryptomcp.series import build_series, series_from_records
 
 NOW = 1_788_000_000_000
 HOUR = 3_600_000
@@ -101,6 +101,54 @@ class TestCanonicalWindow:
 
     def test_four_hours_is_the_crossover(self):
         assert required_candles("4h") == 361
+
+
+class TestSameMarketSameNumbers:
+    """Приёмочная проверка П1 в правильной формулировке.
+
+    Расхождение, из-за которого проверка заводилась, оказалось не двумя
+    вычислителями перцентиля, а двумя рынками: `run_scan` считает по тому
+    ряду, что лежит в архиве (`archive_plan` предпочитает спот — история
+    глубже), а инструменты сервера по умолчанию показывают перпетуал. Замер
+    03.09.2026 на HOMEUSDT 4h, свеча закрытия 20:00 UTC: журнал 10.24% и
+    узк 17, `get_squeeze_metrics` по фьючерсу 8.85% и узк 36, по споту —
+    ровно журнальные 10.24% и 17, совпадение по всем пятнадцати числам.
+    Обратный случай UBUSDT 1d (архив с фьючерсов) совпал с фьючерсной
+    выдачей так же точно.
+
+    Отсюда формулировка: сверять журнал нужно с метриками ТОГО ЖЕ рынка.
+    Сравнение с рынком по умолчанию будет красным всегда — и не из-за бага.
+    """
+
+    def _scan_series(self, con, symbol="CAKEUSDT", tf="4h"):
+        """Ряд так, как его берёт run_scan: из архива, без оглядки на рынок."""
+        records = storage.load_candles(con, symbol, tf, required_candles(tf) + WARMUP)
+        return series_from_records(records, symbol, tf)
+
+    @pytest.mark.asyncio
+    async def test_same_market_gives_the_same_series(self, con, archive):
+        # as_of_ms — не деталь теста, а способ проверки: живой вызов дописывает
+        # к архиву свежий хвост с биржи, и сравнивать с журналом надо на
+        # закрытой свече, а не «сейчас против сейчас».
+        path = archive(source="spot")
+        reader = ArchiveReader(FakeFetcher(FakeClient(4 * HOUR, NOW)), "spot", path)
+
+        served = await reader.get("CAKEUSDT", "4h", as_of_ms=NOW + 4 * HOUR)
+        scanned = self._scan_series(con)
+
+        assert len(served) == len(scanned)
+        assert list(served.df["close"]) == list(scanned.df["close"])
+
+    @pytest.mark.asyncio
+    async def test_other_market_is_another_series_entirely(self, con, archive):
+        """Не «немного другой перцентиль», а другие свечи — и другой узк."""
+        path = archive(source="spot")
+        reader = ArchiveReader(FakeFetcher(FakeClient(4 * HOUR, NOW)), "futures", path)
+
+        served = await reader.get("CAKEUSDT", "4h", as_of_ms=NOW + 4 * HOUR)
+        scanned = self._scan_series(con)
+
+        assert list(served.df["close"]) != list(scanned.df["close"])
 
 
 class TestSourceIsolation:

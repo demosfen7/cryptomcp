@@ -491,6 +491,21 @@ class TestWatchlist:
                           f"{symbol}_price", price))
         con.commit()
 
+    def test_market_of_the_episode_is_remembered(self, con):
+        """Эпизод описывает тот ряд, по которому отобран, — спотовый или перп.
+
+        Без этого поля список выглядел фьючерсным, не будучи им: архив
+        предпочитает спот, и на HOMEUSDT 4h ряды разошлись вдвое — узк 17
+        против 36 на одной и той же свече.
+        """
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW)
+        changes = update_watchlist(con, self.NOW)
+
+        assert {row["market"] for row in storage.open_episodes(con)} == {"spot"}
+        assert {entry[3] for entry in changes["entered"]} == {"spot"}
+
     def test_top_by_rank_enters_as_candidate(self, con):
         from cryptomcp.collector import WATCH_ENTER_RANK, update_watchlist
 
@@ -531,7 +546,7 @@ class TestWatchlist:
         self.market(con, self.NOW + self.STEP, overrides={"C00USDT": 0.001})
         changes = update_watchlist(con, self.NOW + self.STEP)
 
-        assert ("C00USDT", "4h", "выпала по рангу") in changes["exited"]
+        assert ("C00USDT", "4h", "выпала по рангу", "spot") in changes["exited"]
         assert "C00USDT" not in {e["symbol"] for e in storage.open_episodes(con)}
 
     def test_breakout_wins_over_rank(self, con):
@@ -545,7 +560,7 @@ class TestWatchlist:
         con.commit()
         changes = update_watchlist(con, self.NOW + self.STEP)
 
-        assert ("C00USDT", "4h", "пробой") in changes["exited"]
+        assert ("C00USDT", "4h", "пробой", "spot") in changes["exited"]
         row = con.execute(
             "SELECT status FROM watchlist WHERE symbol = 'C00USDT'"
         ).fetchone()
@@ -560,7 +575,7 @@ class TestWatchlist:
         self.market(con, later)
         changes = update_watchlist(con, later)
 
-        assert ("C00USDT", "4h", "истёк срок") in changes["exited"]
+        assert ("C00USDT", "4h", "истёк срок", "spot") in changes["exited"]
 
     def test_manual_entry_survives_low_rank(self, con):
         """Сканер видит только то, что умеет измерять."""

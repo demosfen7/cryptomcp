@@ -26,6 +26,8 @@ from urllib.parse import quote
 
 import httpx
 
+from .markets import MARKETS, market_short
+
 log = logging.getLogger("cryptomcp.notify")
 
 #: Потолок длины сообщения у Telegram — 4096 символов. Берём с запасом под
@@ -47,13 +49,18 @@ TIMEOUT_S = 10.0
 #: числах, — цена ошибки там 400 и полностью потерянное уведомление.
 PARSE_MODE = "HTML"
 
-#: Как символ Binance называется на TradingView. Список наблюдения ведётся по
-#: USDⓈ-M перпетуалам, а у них на TradingView к тикеру дописывается «.P»:
-#: BINANCE:ONDOUSDT — это спот, BINANCE:ONDOUSDT.P — тот самый контракт,
-#: который сканирует сборщик. Без суффикса открывался бы соседний рынок с
-#: другими объёмами и другим экстремумом.
+#: Как символ Binance называется на TradingView. Суффикс «.P» — перпетуал,
+#: без суффикса — спот: BINANCE:ONDOUSDT и BINANCE:ONDOUSDT.P это два разных
+#: графика с разными экстремумами. Рынок берётся из самой записи, а не
+#: назначается константой: архив предпочитает спот (там глубже история), и на
+#: HOMEUSDT 4h ряды разошлись вдвое — узк 17 по споту против 36 по фьючерсу на
+#: одной и той же свече. Ссылка обязана вести туда, где монету отобрали.
 TV_EXCHANGE = "BINANCE"
-TV_PERP_SUFFIX = ".P"
+
+#: Суффикс тикера берётся из описания рынка, а не задаётся здесь второй раз:
+#: `.P` уже объявлен в markets.FUTURES. Неизвестный рынок (пустое поле у
+#: старых эпизодов) ведёт на спотовый тикер — он существует у любой пары, а
+#: перпетуала может не быть вовсе.
 
 #: Таймфрейм в параметрах TradingView: минуты числом, дневки и старше — буквой.
 #: Чего нет в таблице, то и не передаём — график откроется на своём умолчании,
@@ -61,19 +68,23 @@ TV_PERP_SUFFIX = ".P"
 TV_INTERVALS = {"1h": "60", "4h": "240", "1d": "D", "1w": "W"}
 
 
-def tradingview_url(symbol: str, tf: str | None = None) -> str:
-    """Ссылка на график перпетуала, по возможности сразу в нужном таймфрейме."""
-    query = f"symbol={quote(f'{TV_EXCHANGE}:{symbol}{TV_PERP_SUFFIX}')}"
+def tradingview_url(
+    symbol: str, tf: str | None = None, market: str | None = None
+) -> str:
+    """Ссылка на график того рынка, по которому монета отобрана."""
+    described = MARKETS.get(market or "")
+    suffix = described.suffix if described else ""
+    query = f"symbol={quote(f'{TV_EXCHANGE}:{symbol}{suffix}')}"
     interval = TV_INTERVALS.get((tf or "").lower())
     if interval:
         query += f"&interval={interval}"
     return f"https://www.tradingview.com/chart/?{query}"
 
 
-def _link(symbol: str, tf: str | None = None) -> str:
+def _link(symbol: str, tf: str | None = None, market: str | None = None) -> str:
     """Символ как ссылка на график. Экранируется и текст, и адрес."""
     return (
-        f'<a href="{html.escape(tradingview_url(symbol, tf), quote=True)}">'
+        f'<a href="{html.escape(tradingview_url(symbol, tf, market), quote=True)}">'
         f"{html.escape(str(symbol))}</a>"
     )
 
@@ -174,10 +185,13 @@ def render_watchlist_delta(
     Порядок разделов — по убыванию новизны: вход это новость, подтверждение
     ранга — уточнение, выход — закрытие темы.
 
-    Символ — ссылка на график TradingView в том же таймфрейме, в котором он
-    попал в список: иначе между «пришло уведомление» и «вижу свечи» стоит
-    ручной поиск тикера, а в момент входа ценна как раз скорость. Результат —
-    HTML, и уходит он только через `Telegram.send` с parse_mode=HTML.
+    Символ — ссылка на график TradingView в том же таймфрейме и на том же
+    рынке, на которых он попал в список: иначе между «пришло уведомление» и
+    «вижу свечи» стоит ручной поиск тикера, а в момент входа ценна как раз
+    скорость. Рынок печатается и словом — «перп» или «спот»: на HOMEUSDT ряды
+    разошлись вдвое (узк 17 против 36), и молча выдавать один за другой
+    нельзя. Результат — HTML, и уходит он только через `Telegram.send` с
+    parse_mode=HTML.
     """
     entered = changes.get("entered") or []
     promoted = changes.get("promoted") or []
@@ -191,15 +205,22 @@ def render_watchlist_delta(
     lines = [f"Список наблюдения · {stamp} UTC"]
     if entered:
         lines.append(f"\nВошли ({len(entered)})")
-        lines += [f"  + {_link(s, tf)} {tf} · ранг {rank}" for s, tf, rank in entered]
+        lines += [
+            f"  + {_link(s, tf, market)} {tf} {market_short(market)} · ранг {rank}"
+            for s, tf, rank, market in entered
+        ]
     if promoted:
         lines.append(f"\nПодтверждены ({len(promoted)})")
-        lines += [f"  ↑ {_link(s, tf)} {tf} · ранг {rank}" for s, tf, rank in promoted]
+        lines += [
+            f"  ↑ {_link(s, tf, market)} {tf} {market_short(market)} · ранг {rank}"
+            for s, tf, rank, market in promoted
+        ]
     if exited:
         lines.append(f"\nВышли ({len(exited)})")
         lines += [
-            f"  − {_link(s, tf)} {tf} · {html.escape(str(reason))}"
-            for s, tf, reason in exited
+            f"  − {_link(s, tf, market)} {tf} {market_short(market)} · "
+            f"{html.escape(str(reason))}"
+            for s, tf, reason, market in exited
         ]
     return "\n".join(lines)
 

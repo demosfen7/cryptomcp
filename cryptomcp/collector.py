@@ -700,13 +700,16 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
             scan = by_symbol.get(symbol)
             position = rank.get(symbol)
             manual = episode["entered_by"] == "manual"
+            # Рынок эпизода, а не текущий источник архива: числа эпизода
+            # посчитаны по тому ряду, с которым он открывался.
+            market = episode["market"] or (scan or {}).get("source")
 
             if scan and _broke_out(episode, scan):
                 storage.close_episode(
                     con, episode["id"], status="broken_out",
                     reason="пробой диапазона входа", ts_ms=now_ms,
                 )
-                changes["exited"].append((symbol, tf, "пробой"))
+                changes["exited"].append((symbol, tf, "пробой", market))
                 continue
 
             if now_ms - episode["entered_at"] > WATCH_MAX_DAYS * 86_400_000:
@@ -714,7 +717,7 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
                     con, episode["id"], status="expired",
                     reason=f"{WATCH_MAX_DAYS} суток без развязки", ts_ms=now_ms,
                 )
-                changes["exited"].append((symbol, tf, "истёк срок"))
+                changes["exited"].append((symbol, tf, "истёк срок", market))
                 continue
 
             if not manual and (position is None or position > WATCH_EXIT_RANK):
@@ -726,7 +729,7 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
                     ),
                     ts_ms=now_ms,
                 )
-                changes["exited"].append((symbol, tf, "выпала по рангу"))
+                changes["exited"].append((symbol, tf, "выпала по рангу", market))
                 continue
 
             promote = (
@@ -739,7 +742,7 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
                 index=scan["squeeze_index"] if scan else None, promote=promote,
             )
             if promote:
-                changes["promoted"].append((symbol, tf, position))
+                changes["promoted"].append((symbol, tf, position, market))
 
         for position, row in enumerate(rows[:WATCH_ENTER_RANK], start=1):
             episode_id = storage.open_episode(
@@ -747,7 +750,7 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
                 entered_by="scanner", scan=row, rank=position,
             )
             if episode_id:
-                changes["entered"].append((row["symbol"], tf, position))
+                changes["entered"].append((row["symbol"], tf, position, row["source"]))
 
     con.commit()
     return changes
@@ -775,6 +778,7 @@ def add_to_watchlist(
     episode_id = storage.open_episode(
         con, symbol.upper(), tf, entered_at=now_ms, entered_by="manual",
         scan=rows.get(symbol.upper(), {}),
+        market=storage.archive_source(con, symbol.upper()),
     )
     con.commit()
     return episode_id
@@ -983,9 +987,9 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
             "watchlist: вошло %d, вышло %d, подтверждено %d",
             len(changes["entered"]), len(changes["exited"]), len(changes["promoted"]),
         )
-        for symbol, tf, extra in changes["entered"]:
+        for symbol, tf, extra, _ in changes["entered"]:
             log.info("  + %s %s (ранг %s)", symbol, tf, extra)
-        for symbol, tf, reason in changes["exited"]:
+        for symbol, tf, reason, _ in changes["exited"]:
             log.info("  - %s %s (%s)", symbol, tf, reason)
 
         # Только после commit: доставка не должна стоить данных. Молчащий

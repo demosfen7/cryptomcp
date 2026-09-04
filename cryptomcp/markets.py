@@ -51,6 +51,9 @@ class Market:
     ticker_all_weight: int
     #: Как рынок называется в выдаче и что дописывается к символу.
     label: str
+    #: То же имя в одну колонку таблицы: «USDⓈ-M perp» в строку списка не
+    #: влезает, а знать рынок построчно обязательно — ряды у них разные.
+    short: str
     suffix: str
     has_derivatives: bool
     klines_weight: Callable[[int], int] = field(compare=False)
@@ -69,6 +72,7 @@ FUTURES = Market(
     ticker_one_weight=1,
     ticker_all_weight=40,
     label="USDⓈ-M perp",
+    short="перп",
     suffix=".P",
     has_derivatives=True,
     klines_weight=futures_klines_weight,
@@ -84,9 +88,22 @@ SPOT = Market(
     ticker_one_weight=2,
     ticker_all_weight=80,
     label="спот",
+    short="спот",
     suffix="",
     has_derivatives=False,
     klines_weight=_spot_klines_weight,
 )
 
 MARKETS: dict[str, Market] = {FUTURES.name: FUTURES, SPOT.name: SPOT}
+
+
+def market_short(name: str | None) -> str:
+    """Рынок одним словом для таблиц и уведомлений.
+
+    Пустое значение — не спот и не фьючерс, а «неизвестно»: так выглядят
+    эпизоды, открытые до того, как рынок начали хранить. Подставлять им
+    умолчание нельзя — именно молчаливое умолчание и выдавало спотовые числа
+    за фьючерсные.
+    """
+    market = MARKETS.get(name or "")
+    return market.short if market else "?"
