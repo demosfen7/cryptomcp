@@ -17,14 +17,35 @@ import yaml
 #: явно — см. PLAN §5.
 DEFAULT_TIMEFRAMES = ("1w", "1d", "4h", "1h", "15m")
 
-#: Веса групп признаков из ТЗ §4.3. Сумма — единица.
+#: Веса групп признаков. Сумма — единица.
+#:
+#: Против ТЗ §4.3 изменены дважды. `value_area` (0.10) и `divergence` (0.10)
+#: убраны из свёртки в §4.33: первая обнулялась ровно тогда, когда цена
+#: подходила к границе диапазона, и давала максимум за широкий профиль;
+#: вторая была плоской единицей у пяти монет подряд, потому что RSI выходит
+#: из перепроданности механически. Обе остались в выдаче справкой.
+#:
+#: Освободившиеся 0.20 целиком ушли в `duration`: длительность сжатия была
+#: единственной метрикой, меряющей время, и на индекс не влияла вовсе — HOME
+#: с 33 свечами подряд и ZAMA с нулём стояли в списке рядом.
+#:
+#: Веса стартовые и не откалиброваны, как и прежние. Менять их следует по
+#: `outcomes`, а не по впечатлению.
 DEFAULT_WEIGHTS: dict[str, float] = {
     "volatility": 0.35,
     "range": 0.25,
     "volume": 0.20,
-    "value_area": 0.10,
-    "divergence": 0.10,
+    "duration": 0.20,
 }
+
+#: Сколько ЗАВЕРШЁННЫХ серий сжатия нужно, чтобы сравнивать с ними текущую.
+#: Правило «60 наблюдений» здесь не годится: единица наблюдения не свеча, а
+#: серия, их на порядок меньше. Замер 04.09.2026 на каноническом окне: на 4h
+#: у пяти проверенных монет 4–12 завершённых серий, на 1d — 5–14.
+DEFAULT_DURATION_MIN_STREAKS = 10
+
+#: Календарный охват ряда, ниже которого длительность не с чем сравнивать.
+DEFAULT_DURATION_MIN_SPAN_DAYS = 180.0
 
 #: Перцентиль ширины диапазона, ниже которого он считается узким.
 #:
@@ -53,6 +74,10 @@ class Config:
     range_percentile: float = DEFAULT_RANGE_PERCENTILE
     bbw_percentile: float = DEFAULT_BBW_PERCENTILE
     atr_decline_bars: int = DEFAULT_ATR_DECLINE_BARS
+    #: База группы «длительность»: сколько завершённых серий и какой охват
+    #: нужен, чтобы текущую серию было с чем сравнивать (§4.33).
+    duration_min_streaks: int = DEFAULT_DURATION_MIN_STREAKS
+    duration_min_span_days: float = DEFAULT_DURATION_MIN_SPAN_DAYS
     #: Порог значимости изменения OI для классификации (PLAN §4.12).
     oi_change_threshold: float = 0.01
     #: Окно объёмного профиля в свечах. ТЗ §4.2 предписывает 100–200.
@@ -79,6 +104,7 @@ class Config:
         config.weights.update(data.get("weights", {}))
         for key in ("bbw_percentile", "range_percentile", "atr_decline_bars",
                     "oi_change_threshold",
+                    "duration_min_streaks", "duration_min_span_days",
                     "volume_profile_window", "divergence_window", "journal_path"):
             if key in data:
                 setattr(config, key, data[key])

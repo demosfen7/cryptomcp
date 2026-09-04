@@ -147,6 +147,26 @@ def donchian_width(high: np.ndarray, low: np.ndarray, period: int, close: np.nda
     return out
 
 
+def completed_streaks(values: np.ndarray, threshold: float) -> list[int]:
+    """Длины ЗАВЕРШЁННЫХ серий значений ниже порога, слева направо.
+
+    Текущая серия в список не входит: с ней сравнивают, а сравнивать величину
+    с распределением, в которое она сама включена, значит занижать её ранг.
+    Пропуск (NaN на прогреве индикатора) серию рвёт — так же, как её рвёт
+    значение выше порога в `consecutive_below`.
+    """
+    lengths: list[int] = []
+    run = 0
+    for value in values:
+        if not np.isnan(value) and value < threshold:
+            run += 1
+            continue
+        if run:
+            lengths.append(run)
+        run = 0
+    return lengths
+
+
 def consecutive_below(values: np.ndarray, threshold: float) -> int:
     """Сколько последних значений подряд ниже порога (длительность сжатия)."""
     count = 0

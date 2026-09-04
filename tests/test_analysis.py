@@ -10,8 +10,8 @@ from cryptomcp.analysis import (
     compute_squeeze_index,
     ema_state,
     position_in_range,
+    score_duration,
     score_range,
-    score_value_area,
     score_volatility,
 )
 from cryptomcp.config import DEFAULT_WEIGHTS, Config
@@ -33,6 +33,9 @@ def view(**overrides) -> TimeframeView:
         range_metric=Metric("диапазон(20)", 10.0, unit="%", pct_rank=15.0,
                             n_obs=360, span_days=90),
         narrow_bars=20,
+        narrow_days=3.3,
+        narrow_metric=Metric("длительность сжатия", 20.0, unit=" св.",
+                             pct_rank=80.0, n_obs=12, span_days=610),
         volume=VolumeContext(0.7, "медиана слота", 250, 0.6, 3, 0.55),
         profile=VolumeProfile(100.0, 95.0, 105.0, 1e6, 60),
         divergence="бычья",
@@ -128,32 +131,47 @@ class TestComponentScores:
                       span_days=1)
         assert score_range(view(range_metric=weak), config) is None
 
-    def test_value_area_zero_when_price_outside(self):
-        v = view(price=200.0, profile=VolumeProfile(100.0, 95.0, 105.0, 1e6, 60))
-        assert score_value_area(v) == 0.0
+    def test_duration_is_the_percentile_of_the_current_streak(self):
+        """80-й перцентиль среди завершённых серий — это 0.80 группы."""
+        assert score_duration(view()) == pytest.approx(0.80)
 
-    def test_value_area_max_at_poc(self):
-        v = view(price=100.0, profile=VolumeProfile(100.0, 95.0, 105.0, 1e6, 60))
-        assert score_value_area(v) == pytest.approx(1.0)
+    def test_duration_excluded_without_enough_streaks(self):
+        """Ноль означал бы «сжатие короткое», а верно «не с чем сравнить».
 
-    def test_value_area_none_without_profile(self):
-        assert score_value_area(view(profile=None)) is None
+        Свежие листинги — целевая категория сканера, и обнулять им группу
+        значило бы систематически задвигать вниз именно их.
+        """
+        thin = Metric("длительность сжатия", 20.0, unit=" св.", pct_rank=None,
+                      n_obs=4, span_days=610)
+        assert score_duration(view(narrow_metric=thin)) is None
 
 
 class TestSqueezeIndex:
     def test_all_groups_present(self):
         index, components, excluded = compute_squeeze_index(view(), Config())
         assert excluded == []
-        assert len(components) == 5
+        assert len(components) == 4
         assert 0.0 <= index <= 1.0
 
     def test_weights_match_specification(self):
-        """Веса из ТЗ §4.3 и их сумма."""
+        """Профиль и дивергенция из свёртки убраны, их вес ушёл в длительность."""
         assert DEFAULT_WEIGHTS == {
-            "volatility": 0.35, "range": 0.25, "volume": 0.20,
-            "value_area": 0.10, "divergence": 0.10,
+            "volatility": 0.35, "range": 0.25, "volume": 0.20, "duration": 0.20,
         }
         assert sum(DEFAULT_WEIGHTS.values()) == pytest.approx(1.0)
+
+    def test_profile_and_divergence_do_not_enter_the_index(self):
+        """Справка в выдаче — да, вклад в индекс — нет.
+
+        Профиль обнулялся ровно тогда, когда цена подходила к границе
+        диапазона, и давал максимум за широкий профиль; дивергенция была
+        плоской единицей у пяти монет подряд. Вместе это давало «бесплатный
+        пол» 0.33, с которого до топ-15 оставалось добрать 0.22 из 0.60.
+        """
+        _, components, excluded = compute_squeeze_index(view(), Config())
+
+        assert "value_area" not in components and "value_area" not in excluded
+        assert "divergence" not in components and "divergence" not in excluded
 
     def test_missing_group_is_excluded_not_zeroed(self):
         """Неизмеримая группа исключается с перенормировкой весов.
@@ -161,12 +179,14 @@ class TestSqueezeIndex:
         Подстановка нуля означала бы «признака нет», хотя на деле его не
         удалось измерить, и тихо занижала бы индекс.
         """
+        thin = Metric("длительность сжатия", 20.0, unit=" св.", pct_rank=None,
+                      n_obs=4, span_days=610)
         full = compute_squeeze_index(view(), Config())[0]
-        without_profile = compute_squeeze_index(view(profile=None), Config())
+        without_duration = compute_squeeze_index(view(narrow_metric=thin), Config())
 
-        index, components, excluded = without_profile
-        assert excluded == ["value_area"]
-        assert "value_area" not in components
+        index, components, excluded = without_duration
+        assert excluded == ["duration"]
+        assert "duration" not in components
         # При исключении сильной группы индекс не обязан падать — он
         # пересчитывается по оставшимся, а не штрафуется.
         assert index > full * 0.9
@@ -174,7 +194,7 @@ class TestSqueezeIndex:
     def test_zeroing_would_have_lowered_index(self):
         """Контрольный расчёт: чем перенормировка отличается от обнуления."""
         config = Config()
-        v = view(profile=None)
+        v = view(narrow_metric=Metric("длительность сжатия", 20.0, pct_rank=None))
         index, components, _ = compute_squeeze_index(v, config)
 
         zeroed = sum(config.weights[k] * components.get(k, 0.0) for k in config.weights)
@@ -188,12 +208,14 @@ class TestSqueezeIndex:
             volume=VolumeContext(float("nan"), "нет", 0, float("nan"), 0, float("nan")),
             profile=None,
             divergence=None,
+            narrow_metric=Metric("длительность сжатия", 0.0, pct_rank=None),
         )
         index, components, excluded = compute_squeeze_index(v, Config())
-        # Дивергенция всегда измерима: её отсутствие — это ноль, а не пропуск.
-        assert components == {"divergence": 0.0}
-        assert index == pytest.approx(0.0)
-        assert set(excluded) == {"volatility", "range", "volume", "value_area"}
+        # Ни одной измеримой группы — индекса нет вовсе. Ноль означал бы
+        # «признаков нет», а верно «нечем мерить».
+        assert components == {}
+        assert index is None
+        assert set(excluded) == {"volatility", "range", "volume", "duration"}
 
     def test_volume_excluded_when_basis_too_thin(self):
         """На 5m и 1m наблюдений на слот единицы — группа не скорится."""

@@ -609,7 +609,7 @@ class TestWatchlist:
         changes = update_watchlist(con, self.NOW)
 
         assert {row["market"] for row in storage.open_episodes(con)} == {"spot"}
-        assert {entry[3] for entry in changes["entered"]} == {"spot"}
+        assert {entry["market"] for entry in changes["entered"]} == {"spot"}
 
     def test_top_by_rank_enters_as_candidate(self, con):
         from cryptomcp.collector import WATCH_ENTER_RANK, update_watchlist
@@ -651,7 +651,8 @@ class TestWatchlist:
         self.market(con, self.NOW + self.STEP, overrides={"C00USDT": 0.001})
         changes = update_watchlist(con, self.NOW + self.STEP)
 
-        assert ("C00USDT", "4h", "выпала по рангу", "spot") in changes["exited"]
+        assert {"symbol": "C00USDT", "tf": "4h", "market": "spot",
+                "reason": "выпала по рангу", "narrow_bars": None} in changes["exited"]
         assert "C00USDT" not in {e["symbol"] for e in storage.open_episodes(con)}
 
     def test_breakout_wins_over_rank(self, con):
@@ -665,7 +666,8 @@ class TestWatchlist:
         con.commit()
         changes = update_watchlist(con, self.NOW + self.STEP)
 
-        assert ("C00USDT", "4h", "пробой", "spot") in changes["exited"]
+        assert {"symbol": "C00USDT", "tf": "4h", "market": "spot",
+                "reason": "пробой", "narrow_bars": None} in changes["exited"]
         row = con.execute(
             "SELECT status FROM watchlist WHERE symbol = 'C00USDT'"
         ).fetchone()
@@ -680,7 +682,8 @@ class TestWatchlist:
         self.market(con, later)
         changes = update_watchlist(con, later)
 
-        assert ("C00USDT", "4h", "истёк срок", "spot") in changes["exited"]
+        assert {"symbol": "C00USDT", "tf": "4h", "market": "spot",
+                "reason": "истёк срок", "narrow_bars": None} in changes["exited"]
 
     def test_manual_entry_survives_low_rank(self, con):
         """Сканер видит только то, что умеет измерять."""

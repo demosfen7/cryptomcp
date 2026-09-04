@@ -186,7 +186,7 @@ def render_snapshot(
         # Длительность сжатия — отдельный признак ТЗ §4.2, и критерий у неё свой
         # (порог ширины диапазона), а не перцентиль BBW. Раньше оба числа стояли
         # в одной фразе через запятую и читались как одно.
-        squeeze += f" · узк {view.narrow_bars}"
+        squeeze += f" · узк {view.narrow_bars} ({view.narrow_days:.1f} сут)"
         # Событие внутри окна сжатия печатается рядом с длительностью, потому
         # что оно эту длительность и обесценивает (§4.26).
         if view.shock is not None and view.shock.loud:
@@ -392,11 +392,20 @@ def render_squeeze_metrics(view: TimeframeView) -> str:
         f"   ширина(20)       {view.range_width * 100:.2f}% = "
         f"{view.range_width_atr:.1f} ATR",
         f"   перцентиль       {render_metric(view.range_metric, precision=2)}",
-        f"   ниже порога      {view.narrow_bars} свечей подряд"
+        f"   ниже порога      {view.narrow_bars} свечей подряд "
+        f"= {view.narrow_days:.1f} сут"
         + (
             f"  (порог {view.range_threshold * 100:.1f}% — 20-й перцентиль "
             f"своей истории)"
             if view.range_threshold == view.range_threshold else ""
+        ),
+        # Длительность сама по себе несопоставима между парами: у монеты,
+        # которая никогда не стояла дольше двух суток, полтора дня — рекорд,
+        # а у BTC — шум. Поэтому рядом её перцентиль среди ЗАВЕРШЁННЫХ серий.
+        f"   длительность     {render_metric(view.narrow_metric, precision=0)}"
+        + (
+            f", завершённых серий {view.narrow_metric.n_obs}"
+            if view.narrow_metric.has_context else ""
         ),
         "",
     ]
@@ -511,12 +520,14 @@ def render_klines(
 
 
 #: Короткие имена групп индекса для табличной выдачи. Порядок — как в формуле.
+#: Группы свёртки и их подписи в таблицах. Профиль и дивергенция убраны
+#: вместе с их весами (§4.33): в выдаче они остались справкой, но колонки в
+#: журнале держать незачем — вклада в индекс у них больше нет.
 INDEX_GROUPS: tuple[tuple[str, str], ...] = (
     ("volatility", "vola"),
     ("range", "rang"),
     ("volume", "volu"),
-    ("value_area", "valu"),
-    ("divergence", "dive"),
+    ("duration", "длит"),
 )
 
 
@@ -541,6 +552,15 @@ def _shock(row: Mapping[str, Any]) -> str:
     if atr_value < SHOCK_RANGE_ATR or volume < SHOCK_VOLUME_MULTIPLE:
         return "—"
     return f"{atr_value:.1f}"
+
+
+def _days(bars: Any, tf: str) -> str:
+    """Свечи в сутки. «Узк 19» на 4h — это 3.2 суток, а «узк 7» на 1d — семь."""
+    if bars is None:
+        return "—"
+    from .series import interval_ms
+
+    return f"{int(bars) * interval_ms(tf) / 86_400_000:.1f}"
 
 
 def _twin(row: Mapping[str, Any]) -> str:
@@ -614,7 +634,7 @@ def render_watchlist(
         f"эпизодов: {len(episodes)}",
         f"{'символ':<14}{'ТФ':>4}{'рынок':>7}{'статус':>11}{'ранг':>10}"
         f"{'инд':>7}{'Δинд':>7}"
-        f"{'накопл':>8}{'узк':>5}{'узк²':>6}{'вход':>13}{'сейчас':>9}{'дней':>6}  кем"
+        f"{'накопл':>8}{'узк':>5}{'сут':>6}{'узк²':>6}{'вход':>13}{'сейчас':>9}{'дней':>6}  кем"
         + ("  ·  чем кончилось" if closed else ""),
     ]
 
@@ -650,6 +670,7 @@ def render_watchlist(
             f"{f'{index_now:.2f}' if index_now is not None else '—':>7}{delta:>7}"
             f"{f'{accumulation:.2f}' if accumulation is not None else 'n/a':>8}"
             f"{narrow if narrow is not None else '—':>5}"
+            f"{_days(narrow, row['tf']):>6}"
             f"{_cell(scan.get('twin_narrow_bars')):>6}"
             f"{_price(price_in):>13}{move:>9}"
             f"{(until - row['entered_at']) / 86_400_000:>6.1f}  {row['entered_by']}"
@@ -669,7 +690,8 @@ def render_watchlist(
         "",
         "ранг и Δинд — «при входе → сейчас»; инд — squeeze_index последнего скана",
         "узк — свечей подряд с шириной диапазона(20) ниже 20-го перцентиля "
-        "своей истории",
+        "своей истории; сут — та же длительность календарём, потому что "
+        "свечи 4h и 1d в одном списке несопоставимы",
         "рынок — ряд, по которому монета отобрана: архив предпочитает спот "
         "(история глубже), и числа эпизода относятся именно к нему; "
         "сверять их через get_squeeze_metrics нужно с тем же market",
@@ -714,7 +736,7 @@ def render_scan_history(
         f"{symbol} · {tf} · рынок: {markets} · формула {version} · "
         f"записей {len(rows)}, свежие сверху",
         f"{'закрыта':<17}{'индекс':>7}{header}{'BBW':>6}{'диап':>8}{'узк':>5}"
-        f"{twin_head}{'объём':>8}{'МА':>7}{'шок':>6}{'погл':>6}{'клст':>6}{'tkМакс':>8}"
+        f"{'сут':>6}{twin_head}{'объём':>8}{'МА':>7}{'шок':>6}{'погл':>6}{'клст':>6}{'tkМакс':>8}"
         f"{'лид':>6}{'фанд%':>9}{'цена':>13}",
     ]
 
@@ -740,6 +762,7 @@ def render_scan_history(
             f"{f'{bbw:.0f}' if bbw is not None else 'n/a':>6}"
             f"{f'{width:.2f}%' if width is not None else 'n/a':>8}"
             f"{row.get('narrow_bars') if row.get('narrow_bars') is not None else '—':>5}"
+            f"{_days(row.get('narrow_bars'), tf):>6}"
             f"{_twin(row) if twin else ''}"
             f"{f'{volume:.2f}x' if volume is not None else 'n/a':>8}"
             f"{_cell(row.get('ma_ratio'), '.2f'):>7}"

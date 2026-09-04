@@ -727,6 +727,21 @@ def settle_outcomes(con: sqlite3.Connection, now_ms: int | None = None) -> int:
     return settled
 
 
+def _delta_entry(
+    symbol: str, tf: str, market: str | None, scan: dict[str, Any] | None, **fields: Any
+) -> dict[str, Any]:
+    """Запись дельты списка наблюдения.
+
+    Словарь, а не кортеж: полей стало пять — символ, ТФ, рынок ряда, ранг или
+    причина выхода и длительность сжатия. На пятом поле позиционное чтение
+    начинает ошибаться молча.
+    """
+    return {
+        "symbol": symbol, "tf": tf, "market": market,
+        "narrow_bars": (scan or {}).get("narrow_bars"), **fields,
+    }
+
+
 def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict[str, list]:
     """Пересчитать состав списка наблюдения и вернуть дельту к прошлому прогону.
 
@@ -751,6 +766,9 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
     сработавшая, а не как «выпала по рангу».
     """
     now_ms = now_ms or int(dt.datetime.now(dt.UTC).timestamp() * 1000)
+    # Записи дельты — словари, а не кортежи: полей стало пять (рынок ряда и
+    # длительность сжатия добавились к символу, ТФ и рангу), и позиционное
+    # чтение на пятом поле начинает ошибаться молча.
     changes: dict[str, list] = {"entered": [], "exited": [], "promoted": []}
 
     for tf in WATCH_TIMEFRAMES:
@@ -772,7 +790,9 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
                     con, episode["id"], status="broken_out",
                     reason="пробой диапазона входа", ts_ms=now_ms,
                 )
-                changes["exited"].append((symbol, tf, "пробой", market))
+                changes["exited"].append(
+                    _delta_entry(symbol, tf, market, scan, reason="пробой")
+                )
                 continue
 
             if now_ms - episode["entered_at"] > WATCH_MAX_DAYS * 86_400_000:
@@ -780,7 +800,9 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
                     con, episode["id"], status="expired",
                     reason=f"{WATCH_MAX_DAYS} суток без развязки", ts_ms=now_ms,
                 )
-                changes["exited"].append((symbol, tf, "истёк срок", market))
+                changes["exited"].append(
+                    _delta_entry(symbol, tf, market, scan, reason="истёк срок")
+                )
                 continue
 
             if not manual and (position is None or position > WATCH_EXIT_RANK):
@@ -792,7 +814,9 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
                     ),
                     ts_ms=now_ms,
                 )
-                changes["exited"].append((symbol, tf, "выпала по рангу", market))
+                changes["exited"].append(
+                    _delta_entry(symbol, tf, market, scan, reason="выпала по рангу")
+                )
                 continue
 
             promote = (
@@ -805,7 +829,9 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
                 index=scan["squeeze_index"] if scan else None, promote=promote,
             )
             if promote:
-                changes["promoted"].append((symbol, tf, position, market))
+                changes["promoted"].append(
+                    _delta_entry(symbol, tf, market, scan, rank=position)
+                )
 
         for position, row in enumerate(rows[:WATCH_ENTER_RANK], start=1):
             episode_id = storage.open_episode(
@@ -813,7 +839,9 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
                 entered_by="scanner", scan=row, rank=position,
             )
             if episode_id:
-                changes["entered"].append((row["symbol"], tf, position, row["source"]))
+                changes["entered"].append(
+                    _delta_entry(row["symbol"], tf, row["source"], row, rank=position)
+                )
 
     con.commit()
     return changes
@@ -1056,10 +1084,15 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
             "watchlist: вошло %d, вышло %d, подтверждено %d",
             len(changes["entered"]), len(changes["exited"]), len(changes["promoted"]),
         )
-        for symbol, tf, extra, _ in changes["entered"]:
-            log.info("  + %s %s (ранг %s)", symbol, tf, extra)
-        for symbol, tf, reason, _ in changes["exited"]:
-            log.info("  - %s %s (%s)", symbol, tf, reason)
+        for entry in changes["entered"]:
+            log.info(
+                "  + %s %s (ранг %s, узк %s)",
+                entry["symbol"], entry["tf"], entry["rank"], entry["narrow_bars"],
+            )
+        for entry in changes["exited"]:
+            log.info(
+                "  - %s %s (%s)", entry["symbol"], entry["tf"], entry["reason"],
+            )
 
         # Только после commit: доставка не должна стоить данных. Молчащий
         # Telegram — потеря уведомления, молчащий сборщик — потеря часа

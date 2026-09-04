@@ -27,6 +27,7 @@ from urllib.parse import quote
 import httpx
 
 from .markets import MARKETS, market_short
+from .series import interval_ms
 
 log = logging.getLogger("cryptomcp.notify")
 
@@ -79,6 +80,26 @@ def tradingview_url(
     if interval:
         query += f"&interval={interval}"
     return f"https://www.tradingview.com/chart/?{query}"
+
+
+def _head(entry: dict) -> str:
+    """Начало строки: ссылка, таймфрейм, рынок."""
+    tf, market = entry.get("tf"), entry.get("market")
+    return f"{_link(entry['symbol'], tf, market)} {tf} {market_short(market)}"
+
+
+def _squeeze(entry: dict) -> str:
+    """Длительность сжатия свечами и календарём.
+
+    Календарь обязателен: «узк 19» на 4h выглядит внушительнее, чем «узк 7»
+    на 1d, хотя это 3.2 суток против семи, а в одном сообщении строки обоих
+    таймфреймов стоят рядом.
+    """
+    bars = entry.get("narrow_bars")
+    if bars is None:
+        return ""
+    days = int(bars) * interval_ms(entry["tf"]) / 86_400_000
+    return f" · узк {bars} ({days:.1f} сут)"
 
 
 def _link(symbol: str, tf: str | None = None, market: str | None = None) -> str:
@@ -185,6 +206,9 @@ def render_watchlist_delta(
     Порядок разделов — по убыванию новизны: вход это новость, подтверждение
     ранга — уточнение, выход — закрытие темы.
 
+    Записи дельты — словари: полей стало пять, и позиционное чтение кортежа
+    на пятом поле ошибается молча.
+
     Символ — ссылка на график TradingView в том же таймфрейме и на том же
     рынке, на которых он попал в список: иначе между «пришло уведомление» и
     «вижу свечи» стоит ручной поиск тикера, а в момент входа ценна как раз
@@ -205,22 +229,14 @@ def render_watchlist_delta(
     lines = [f"Список наблюдения · {stamp} UTC"]
     if entered:
         lines.append(f"\nВошли ({len(entered)})")
-        lines += [
-            f"  + {_link(s, tf, market)} {tf} {market_short(market)} · ранг {rank}"
-            for s, tf, rank, market in entered
-        ]
+        lines += [f"  + {_head(e)} · ранг {e['rank']}{_squeeze(e)}" for e in entered]
     if promoted:
         lines.append(f"\nПодтверждены ({len(promoted)})")
-        lines += [
-            f"  ↑ {_link(s, tf, market)} {tf} {market_short(market)} · ранг {rank}"
-            for s, tf, rank, market in promoted
-        ]
+        lines += [f"  ↑ {_head(e)} · ранг {e['rank']}{_squeeze(e)}" for e in promoted]
     if exited:
         lines.append(f"\nВышли ({len(exited)})")
         lines += [
-            f"  − {_link(s, tf, market)} {tf} {market_short(market)} · "
-            f"{html.escape(str(reason))}"
-            for s, tf, reason, market in exited
+            f"  − {_head(e)} · {html.escape(str(e['reason']))}" for e in exited
         ]
     return "\n".join(lines)
 

@@ -20,6 +20,7 @@ from .indicators import (
     Metric,
     atr,
     bollinger_width,
+    completed_streaks,
     consecutive_below,
     consecutive_declining,
     donchian_width,
@@ -260,6 +261,15 @@ class TimeframeView:
     #: порога. Это длительность СЖАТИЯ, а не возраст текущего диапазона:
     #: у широкого диапазона здесь ноль, и это верное значение, а не сбой.
     narrow_bars: int
+    #: Та же длительность в сутках. Свечи разных ТФ несопоставимы: «узк 19» на
+    #: 4h выглядит внушительнее, чем «узк 7» на 1d, хотя это 3.2 суток против
+    #: семи. В общем списке, где строки обоих ТФ стоят рядом, счётчик без
+    #: пересчёта в календарь читается неверно.
+    narrow_days: float
+    #: Длительность текущей серии с перцентилем среди ЗАВЕРШЁННЫХ серий этой
+    #: пары. Отдельная метрика, а не число: у монеты, которая никогда не
+    #: стояла дольше двух суток, полтора дня — это её максимум, а у BTC — шум.
+    narrow_metric: Metric
 
     volume: VolumeContext
     profile: VolumeProfile | None
@@ -298,6 +308,8 @@ class TimeframeView:
                 ),
                 "width_percentile": self.range_metric.to_dict(),
                 "bars_below_threshold": self.narrow_bars,
+                "days_below_threshold": round(self.narrow_days, 2),
+                "duration_percentile": self.narrow_metric.to_dict(),
                 "shock_inside": self.shock.to_dict() if self.shock else None,
             },
             "volume": self.volume.to_dict(),
@@ -420,23 +432,20 @@ def score_volume(view: TimeframeView) -> float | None:
     return _clamp(0.7 * decline + 0.3 * bars)
 
 
-def score_value_area(view: TimeframeView) -> float | None:
-    """Группа 4. Цена внутри Value Area и близко к POC."""
-    profile = view.profile
-    if profile is None:
+def score_duration(view: TimeframeView) -> float | None:
+    """Группа 4. Насколько длинна текущая серия сжатия ДЛЯ ЭТОЙ пары.
+
+    Перцентилем, а не отношением к константе: длина типичного сжатия у BTC и
+    у свежего листинга различается кратно — ровно как ширина диапазона, где
+    абсолютный порог уже один раз не сработал ни на одной монете.
+
+    Группа исключается, если завершённых серий или охвата не хватило. Ноль
+    означал бы «сжатие короткое», хотя его просто не с чем сравнить, — а
+    свежие листинги это как раз целевая категория сканера.
+    """
+    if not view.narrow_metric.has_context:
         return None
-    if not profile.contains(view.price):
-        return 0.0
-    half_width = (profile.value_area_high - profile.value_area_low) / 2.0
-    if half_width <= 0:
-        return 1.0
-    closeness = 1.0 - _clamp(abs(view.price - profile.poc) / half_width)
-    return _clamp(0.5 + 0.5 * closeness)
-
-
-def score_divergence(view: TimeframeView) -> float:
-    """Группа 5. Наличие дивергенции."""
-    return 1.0 if view.divergence else 0.0
+    return _clamp(view.narrow_metric.pct_rank / 100.0)
 
 
 def compute_squeeze_index(
@@ -446,13 +455,17 @@ def compute_squeeze_index(
 
     Группа без достаточной базы исключается, а не обнуляется: ноль означал бы
     «признака нет», хотя на деле его не удалось измерить.
+
+    Объёмный профиль и дивергенция RSI в свёртку не входят (§4.33). Обе
+    остались в выдаче справкой: профиль — разделом 4, дивергенция — разделом
+    5. Причина у них разная, а следствие было общее — «бесплатный пол»
+    индекса, с которого до топ-15 оставалось добрать 0.22 из 0.60.
     """
     raw: dict[str, float | None] = {
         "volatility": score_volatility(view, config),
         "range": score_range(view, config),
         "volume": score_volume(view),
-        "value_area": score_value_area(view),
-        "divergence": score_divergence(view),
+        "duration": score_duration(view),
     }
 
     available = {k: v for k, v in raw.items() if v is not None}
@@ -475,6 +488,8 @@ def analyse_timeframe(
     weekly_pivots: Pivots | None = None,
 ) -> TimeframeView:
     """Собрать полную картину по одному таймфрейму."""
+    from .series import interval_ms
+
     close, high, low = series.close, series.high, series.low
 
     atr_values = atr(high, low, close, 14)
@@ -526,6 +541,21 @@ def analyse_timeframe(
     narrow_bars = (
         consecutive_below(width_series, threshold) if threshold == threshold else 0
     )
+    step_days = interval_ms(series.interval) / 86_400_000
+    narrow_days = narrow_bars * step_days
+    # База длительности — завершённые серии по всему ряду, который дан
+    # анализу. Ряд один и тот же для всех метрик (§4.15): взять для этой
+    # группы более глубокий значило бы завести второй вход и второе
+    # расхождение между сканером и сервером — то самое, что чинилось в §4.31.
+    streaks = (
+        completed_streaks(width_series, threshold) if threshold == threshold else []
+    )
+    narrow_metric = with_percentile(
+        "длительность сжатия", float(narrow_bars),
+        np.asarray(streaks, dtype="float64"), len(width_series) * step_days,
+        unit=" св.", min_obs=config.duration_min_streaks,
+        min_span_days=config.duration_min_span_days,
+    )
 
     view = TimeframeView(
         interval=series.interval,
@@ -546,6 +576,8 @@ def analyse_timeframe(
         range_threshold=threshold,
         range_metric=range_metric,
         narrow_bars=narrow_bars,
+        narrow_days=narrow_days,
+        narrow_metric=narrow_metric,
         volume=volume_context(series, atr_values),
         profile=profile,
         divergence=rsi_divergence(series, rsi_values, config.divergence_window),

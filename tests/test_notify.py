@@ -23,6 +23,12 @@ from cryptomcp.notify import (
 EMPTY: dict[str, list] = {"entered": [], "exited": [], "promoted": []}
 
 
+def entry(symbol, tf, **fields) -> dict:
+    """Запись дельты. Словарь, а не кортеж: полей пять."""
+    return {"symbol": symbol, "tf": tf, "market": None,
+            "rank": None, "narrow_bars": None, **fields}
+
+
 class FakeResponse:
     def __init__(self, status_code: int, text: str = "") -> None:
         self.status_code = status_code
@@ -70,21 +76,25 @@ class TestRender:
 
     def test_all_three_sections(self):
         text = render_watchlist_delta({
-            "entered": [("ONDOUSDT", "4h", 2, "futures")],
-            "promoted": [("HBARUSDT", "1d", 7, "futures")],
-            "exited": [("WLDUSDT", "4h", "пробой", "spot")],
+            "entered": [entry("ONDOUSDT", "4h", rank=2, market="futures",
+                              narrow_bars=19)],
+            "promoted": [entry("HBARUSDT", "1d", rank=7, market="futures",
+                               narrow_bars=7)],
+            "exited": [entry("WLDUSDT", "4h", reason="пробой", market="spot")],
         }, now_ms=1_756_800_000_000)
 
         assert "Вошли (1)" in text
-        assert ">ONDOUSDT</a> 4h перп · ранг 2" in text
+        assert ">ONDOUSDT</a> 4h перп · ранг 2 · узк 19 (3.2 сут)" in text
         assert "Подтверждены (1)" in text
-        assert ">HBARUSDT</a> 1d перп · ранг 7" in text
+        assert ">HBARUSDT</a> 1d перп · ранг 7 · узк 7 (7.0 сут)" in text
         assert "Вышли (1)" in text
         assert ">WLDUSDT</a> 4h спот · пробой" in text
 
     def test_symbol_is_a_link_to_the_same_timeframe(self):
         """Смысл ссылки — открыть тот же контракт и тот же таймфрейм."""
-        text = render_watchlist_delta({"entered": [("ONDOUSDT", "4h", 2, "futures")]})
+        text = render_watchlist_delta(
+            {"entered": [entry("ONDOUSDT", "4h", rank=2, market="futures")]}
+        )
 
         assert '<a href="https://www.tradingview.com/chart/?' in text
         assert "symbol=BINANCE%3AONDOUSDT.P" in text
@@ -92,23 +102,37 @@ class TestRender:
 
     def test_link_follows_the_market_of_the_episode(self):
         """Отобрали по споту — вести на спот: ряды расходятся вдвое."""
-        text = render_watchlist_delta({"entered": [("HOMEUSDT", "4h", 2, "spot")]})
+        text = render_watchlist_delta(
+            {"entered": [entry("HOMEUSDT", "4h", rank=2, market="spot")]}
+        )
 
         assert "symbol=BINANCE%3AHOMEUSDT&" in text
         assert ".P" not in text
         assert "4h спот" in text
 
+    def test_duration_is_printed_in_days_too(self):
+        """«узк 19» на 4h выглядит внушительнее «узк 7» на 1d — а это 3.2 против 7."""
+        text = render_watchlist_delta({
+            "entered": [entry("A", "4h", rank=1, market="spot", narrow_bars=19),
+                        entry("B", "1d", rank=2, market="spot", narrow_bars=7)],
+        })
+
+        assert "узк 19 (3.2 сут)" in text
+        assert "узк 7 (7.0 сут)" in text
+
     def test_outside_text_is_escaped(self):
         """Причина выхода приходит извне: угловая скобка не должна стать тегом."""
         text = render_watchlist_delta(
-            {"exited": [("WLDUSDT", "4h", "цена < уровня", "spot")]}
+            {"exited": [entry("WLDUSDT", "4h", reason="цена < уровня",
+                              market="spot")]}
         )
 
         assert "цена &lt; уровня" in text
 
     def test_only_filled_sections_appear(self):
         text = render_watchlist_delta(
-            {"exited": [("WLDUSDT", "4h", "истёк срок", "spot")]}
+            {"exited": [entry("WLDUSDT", "4h", reason="истёк срок",
+                              market="spot")]}
         )
 
         assert "Вышли" in text
@@ -244,7 +268,7 @@ class TestNotifyWatchlist:
         monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1")
 
         assert await notify_watchlist(
-            {"entered": [("CAKEUSDT", "4h", 3, "spot")]}
+            {"entered": [entry("CAKEUSDT", "4h", rank=3, market="spot")]}
         ) is True
         text = transport.calls[0]["json"]["text"]
         assert "CAKEUSDT" in text
@@ -257,6 +281,6 @@ class TestNotifyWatchlist:
         monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
 
         assert await notify_watchlist(
-            {"entered": [("CAKEUSDT", "4h", 3, "spot")]}
+            {"entered": [entry("CAKEUSDT", "4h", rank=3, market="spot")]}
         ) is False
         assert transport.calls == []
