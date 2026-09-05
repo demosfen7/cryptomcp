@@ -91,6 +91,9 @@ def authorize(client: TestClient, client_id: str) -> tuple[str, str]:
     page = client.get(f"{login_url.path}?{login_url.query}")
     assert page.status_code == 200
     assert "Claude" in page.text
+    assert "form-action 'self' https://claude.ai" in page.headers[
+        "content-security-policy"
+    ]
 
     wrong = client.post(
         "/oauth/authorize",

@@ -20,6 +20,7 @@ import time
 from base64 import urlsafe_b64encode
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from mcp.server.auth.provider import (
     AccessToken,
@@ -276,6 +277,16 @@ class SQLiteOAuthProvider(
     ) -> HTMLResponse:
         client_name = html.escape(str(data.get("client_name") or "MCP-клиент"))
         error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
+        callback = urlsplit(str(data["redirect_uri"]))
+        if callback.scheme in {"http", "https"} and callback.hostname:
+            host = callback.hostname
+            if ":" in host:
+                host = f"[{host}]"
+            port = f":{callback.port}" if callback.port is not None else ""
+            callback_source = f"{callback.scheme}://{host}{port}"
+        else:
+            # AnyUrl уже проверил синтаксис scheme в authorization handler.
+            callback_source = f"{callback.scheme}:"
         content = f"""<!doctype html>
 <html lang="ru">
 <head>
@@ -324,7 +335,8 @@ class SQLiteOAuthProvider(
                 "Pragma": "no-cache",
                 "Content-Security-Policy": (
                     "default-src 'none'; style-src 'unsafe-inline'; "
-                    "form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+                    f"form-action 'self' {callback_source}; "
+                    "base-uri 'none'; frame-ancestors 'none'"
                 ),
                 "X-Content-Type-Options": "nosniff",
                 "Referrer-Policy": "no-referrer",
