@@ -23,10 +23,10 @@ RUN pip install --no-cache-dir "mcp>=2.1,<3" "httpx>=0.28" "pandas>=2.2" \
 COPY cryptomcp/ ./cryptomcp/
 COPY config.example.yaml ./config.yaml
 
-# Непривилегированный пользователь: контейнер не хранит секретов, но и root
-# внутри ему не нужен.
+# Непривилегированный пользователь: каталоги данных создаём в образе заранее,
+# иначе Docker сделает точку нового OAuth-тома владельцем root.
 RUN useradd --create-home --uid 10001 cryptomcp \
-    && mkdir -p /app/journal /app/data \
+    && mkdir -p /app/journal /app/data /app/oauth \
     && chown -R cryptomcp:cryptomcp /app
 USER cryptomcp
 
