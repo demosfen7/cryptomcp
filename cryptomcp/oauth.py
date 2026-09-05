@@ -17,6 +17,7 @@ import secrets
 import sqlite3
 import threading
 import time
+from base64 import urlsafe_b64encode
 from pathlib import Path
 from typing import Any
 
@@ -243,6 +244,28 @@ class SQLiteOAuthProvider(
             return None
         return json.loads(row["payload"]), float(row["expires_at"])
 
+    def _authorization_code_value(self, request_id: str) -> str:
+        """Стабильный код для безопасной повторной отправки одной формы.
+
+        Некоторые встроенные браузеры повторяют POST после callback-навигации.
+        Код выводится из случайного request id и секрета сервера, поэтому его
+        можно вернуть ещё раз, не сохраняя bearer-секрет открытым текстом.
+        """
+        digest = hmac.new(
+            self.login_secret.encode(),
+            f"cryptomcp-code:{request_id}".encode(),
+            hashlib.sha256,
+        ).digest()
+        return urlsafe_b64encode(digest).decode().rstrip("=")
+
+    def _authorization_redirect(self, request_id: str, data: dict[str, Any]) -> Response:
+        target = construct_redirect_uri(
+            data["redirect_uri"],
+            code=self._authorization_code_value(request_id),
+            state=data.get("state"),
+        )
+        return RedirectResponse(target, status_code=302, headers={"Cache-Control": "no-store"})
+
     def _render_login(
         self,
         request_id: str,
@@ -316,6 +339,8 @@ class SQLiteOAuthProvider(
             if loaded is None:
                 return HTMLResponse("Запрос авторизации истёк или недействителен.", 400)
             data, _ = loaded
+            if data.get("approved"):
+                return self._authorization_redirect(request_id, data)
             return self._render_login(request_id, data)
 
         form = await request.form()
@@ -354,13 +379,20 @@ class SQLiteOAuthProvider(
                 request_id, data, error="Неверный ключ доступа.", status_code=401
             )
 
-        code_value = secrets.token_urlsafe(32)
+        # Повторный POST той же формы должен повторить redirect, а не ломать
+        # уже одобренный flow. Сам authorization code всё равно одноразовый на
+        # /token и удаляется SDK/provider при обмене.
+        if data.get("approved"):
+            return self._authorization_redirect(request_id, data)
+
+        code_value = self._authorization_code_value(request_id)
+        code_expires_at = time.time() + AUTH_CODE_TTL_S
         code = AuthorizationCode(
             code=code_value,
             client_id=data["client_id"],
             redirect_uri=data["redirect_uri"],
             redirect_uri_provided_explicitly=data["redirect_uri_provided_explicitly"],
-            expires_at=time.time() + AUTH_CODE_TTL_S,
+            expires_at=code_expires_at,
             scopes=data["scopes"],
             code_challenge=data["code_challenge"],
             resource=data["resource"],
@@ -369,27 +401,34 @@ class SQLiteOAuthProvider(
 
         with self._lock, self._connect() as con:
             self._cleanup(con)
-            deleted = con.execute(
-                "DELETE FROM oauth_records WHERE kind = 'request' AND record_key = ?",
-                (_secret_key(request_id),),
-            ).rowcount
-            if deleted != 1:
+            request_key = _secret_key(request_id)
+            current = con.execute(
+                """
+                SELECT payload FROM oauth_records
+                WHERE kind = 'request' AND record_key = ?
+                """,
+                (request_key,),
+            ).fetchone()
+            if current is None:
                 return HTMLResponse("Запрос авторизации уже использован.", 400)
+            data["approved"] = True
+            self._put(
+                "request",
+                request_key,
+                self._dump(data),
+                expires_at=code_expires_at,
+                con=con,
+            )
             self._put(
                 "code",
                 _secret_key(code_value),
                 self._dump(code, exclude={"code"}),
                 expires_at=code.expires_at,
+                family_id=request_key,
                 con=con,
             )
 
-        target = construct_redirect_uri(
-            data["redirect_uri"],
-            code=code_value,
-            state=data.get("state"),
-            iss=self.issuer_url,
-        )
-        return RedirectResponse(target, status_code=302, headers={"Cache-Control": "no-store"})
+        return self._authorization_redirect(request_id, data)
 
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str
@@ -461,12 +500,25 @@ class SQLiteOAuthProvider(
     ) -> OAuthToken:
         with self._lock, self._connect() as con:
             self._cleanup(con)
-            deleted = con.execute(
-                "DELETE FROM oauth_records WHERE kind = 'code' AND record_key = ?",
-                (_secret_key(authorization_code.code),),
-            ).rowcount
-            if deleted != 1 or authorization_code.client_id != client.client_id:
+            code_key = _secret_key(authorization_code.code)
+            row = con.execute(
+                """
+                SELECT family_id FROM oauth_records
+                WHERE kind = 'code' AND record_key = ?
+                """,
+                (code_key,),
+            ).fetchone()
+            if row is None or authorization_code.client_id != client.client_id:
                 raise TokenError(error="invalid_grant", error_description="Код уже использован.")
+            con.execute(
+                "DELETE FROM oauth_records WHERE kind = 'code' AND record_key = ?",
+                (code_key,),
+            )
+            if row["family_id"]:
+                con.execute(
+                    "DELETE FROM oauth_records WHERE kind = 'request' AND record_key = ?",
+                    (row["family_id"],),
+                )
             return self._mint_tokens(
                 client_id=client.client_id,
                 scopes=authorization_code.scopes,

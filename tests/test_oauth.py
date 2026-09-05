@@ -107,7 +107,16 @@ def authorize(client: TestClient, client_id: str) -> tuple[str, str]:
     callback = urlsplit(approved.headers["location"])
     params = parse_qs(callback.query)
     assert params["state"] == ["client-state"]
-    assert params["iss"] == [BASE_URL]
+
+    # Встроенный callback-браузер может повторно отправить форму. Повтор должен
+    # вернуть тот же redirect, а не «запрос истёк».
+    repeated = client.post(
+        "/oauth/authorize",
+        data={"request": request_id, "access_key": LOGIN_SECRET},
+        follow_redirects=False,
+    )
+    assert repeated.status_code == 302
+    assert repeated.headers["location"] == approved.headers["location"]
     return params["code"][0], verifier
 
 
