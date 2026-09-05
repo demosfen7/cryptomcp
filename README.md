@@ -172,38 +172,41 @@ MCP_AUTH_TOKEN=$(openssl rand -hex 32) CRYPTOMCP_TRANSPORT=streamable-http pytho
 | `CRYPTOMCP_TRANSPORT` | `stdio` | `stdio` или `streamable-http` |
 | `CRYPTOMCP_PORT` | `8000` | Порт HTTP-режима |
 | `CRYPTOMCP_PUBLIC_HOST` | `0.0.0.0` | Домен за прокси (проверка заголовка Host) |
-| `MCP_AUTH_TOKEN` | — | Токен доступа. Без него сервер отвечает без аутентификации |
+| `MCP_AUTH_TOKEN` | — | Ключ владельца для OAuth-входа; также старый Bearer/x-api-key. Без него сервер открыт |
+| `MCP_OAUTH_DB` | `data/oauth.sqlite` | Отдельная база OAuth-клиентов и токенов |
+| `CRYPTOMCP_PUBLIC_URL` | из `CRYPTOMCP_PUBLIC_HOST` | Публичный origin для OAuth metadata и redirect |
 | `CRYPTOMCP_CONFIG` | — | Путь к YAML с порогами, см. `config.example.yaml` |
 | `CRYPTOMCP_LOG_LEVEL` | `INFO` | Уровень лога (всегда в stderr) |
 | `TELEGRAM_BOT_TOKEN` | — | Бот для уведомлений сборщика. Пусто — не шлёт |
 | `TELEGRAM_CHAT_ID` | — | Куда слать. У группы отрицательный, у супергруппы начинается на `-100` |
 
-`/health` открыт без токена, `/mcp` требует токен.
+`/health` и OAuth-эндпоинты открыты, `/mcp` требует access token. В контейнере
+OAuth-база лежит в отдельном именованном томе и переживает пересборку образа.
 
 ## Подключение
 
 Боевой сервер: **https://cryptomcp.aithinglab.com/mcp**
 
-Токен принимается двумя способами. Приоритетный — `Authorization: Bearer <токен>`.
-Запасной — `x-api-key: <токен>`, одним значением, без префикса.
-
-Второй нужен для custom connector на claude.ai: там имя `Authorization`
-зарезервировано под OAuth и вручную не задаётся.
+Основной способ — OAuth 2.1 authorization code с PKCE. Клиент сам находит
+protected-resource metadata, authorization server metadata и динамически
+регистрируется. В браузере открывается страница cryptomcp: в поле «Ключ
+доступа» вводится значение `MCP_AUTH_TOKEN`; сам ключ клиенту не передаётся.
 
 | Способ | Как настроить |
 |---|---|
-| Коннектор claude.ai | URL сервера, Header-Name `x-api-key`, значение — токен. Работает во всех чатах, в вебе и на телефоне |
-| Claude Code, этот проект | `.mcp.json` в корне (в git не попадает, содержит токен) |
-| Claude Code, глобально | `claude mcp add --transport http cryptomcp <URL> --header "Authorization: Bearer <токен>"` |
+| Коннектор claude.ai | Добавить только URL сервера, затем **Connect** и ввести ключ на OAuth-странице |
+| Claude Code, этот проект | Добавить HTTP URL без headers, затем выполнить `/mcp` и пройти вход в браузере |
+| Claude Code, глобально | `claude mcp add --transport http cryptomcp <URL>`, затем `/mcp` |
 | Локально без сервера | `python -m cryptomcp.server` — транспорт stdio, токен не нужен |
 
-Токен лежит в `.env` рядом с проектом и в секретах GitHub (`MCP_AUTH_TOKEN`).
-Смена: сгенерировать новый, `gh secret set MCP_AUTH_TOKEN`, запустить деплой,
-обновить значение в коннекторе и в `.mcp.json`.
+Старые подключения продолжают работать с `Authorization: Bearer <токен>` или
+`x-api-key: <токен>`. Это переходная совместимость, а не рекомендуемая новая
+настройка.
 
-OAuth не реализован. Для одного пользователя статического токена достаточно;
-если понадобится, SDK его поддерживает — нужны эндпоинты authorize, token и
-динамической регистрации плюс хранилище кодов.
+Ключ лежит в `.env` рядом с проектом и в секретах GitHub (`MCP_AUTH_TOKEN`).
+Смена: сгенерировать новый, `gh secret set MCP_AUTH_TOKEN`, запустить деплой и
+переподключить OAuth-клиенты. Уже выданные access/refresh-токены хранятся в
+OAuth-базе; отключение коннектора может отозвать всю связанную пару токенов.
 
 ---
 
@@ -222,7 +225,8 @@ journal.py     JSONL-лог каждого расчёта
 notify.py      уведомления в Telegram: отказ доставки не роняет прогон
 render.py      компактный текст для модели
 symbols.py     exchangeInfo, tickSize, точность цен
-app.py         Starlette-обвязка: health, Bearer и x-api-key
+app.py         Starlette-обвязка: health и совместимость старого x-api-key
+oauth.py       OAuth 2.1: вход владельца, DCR, PKCE, токены и SQLite-хранилище
 server.py      одиннадцать инструментов MCP
 ```
 

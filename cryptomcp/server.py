@@ -38,6 +38,7 @@ from .fetcher import CandleFetcher
 from .indicators import MIN_PERCENTILE_SPAN_DAYS, atr
 from .journal import Journal
 from .markets import MARKETS, Market
+from .oauth import OAUTH_SCOPE, SQLiteOAuthProvider
 from .reader import ArchiveReader, archive_path
 from .render import (
     closed_through,
@@ -83,6 +84,60 @@ WATCHLIST_STATUSES = (*storage.EPISODE_STATUSES, "manual", "removed")
 config = Config.load()
 journal = Journal(config.journal_path)
 
+
+def _oauth_from_environment() -> tuple[SQLiteOAuthProvider | None, Any | None]:
+    """Собрать OAuth только для процесса, которому передан боевой секрет.
+
+    stdio не использует HTTP-аутентификацию и в обычной локальной разработке
+    остаётся без OAuth и без побочных файлов на диске.
+    """
+    token = (os.environ.get("MCP_AUTH_TOKEN") or "").strip()
+    if not token:
+        return None, None
+
+    from mcp.server.auth.settings import (
+        AuthSettings,
+        ClientRegistrationOptions,
+        RevocationOptions,
+    )
+
+    public_url = (os.environ.get("CRYPTOMCP_PUBLIC_URL") or "").rstrip("/")
+    if not public_url:
+        public_host = os.environ.get("CRYPTOMCP_PUBLIC_HOST", "localhost")
+        port = int(os.environ.get("CRYPTOMCP_PORT", "8000"))
+        if public_host in {"0.0.0.0", "127.0.0.1", "localhost", "::1"}:
+            public_url = f"http://localhost:{port}"
+        else:
+            public_url = f"https://{public_host}"
+
+    resource_url = f"{public_url}/mcp"
+    provider = SQLiteOAuthProvider(
+        db_path=os.environ.get("MCP_OAUTH_DB", "data/oauth.sqlite"),
+        issuer_url=public_url,
+        resource_url=resource_url,
+        # Один и тот же секрет остаётся доступен как старый статический токен
+        # и вводится владельцем один раз на OAuth-странице.
+        login_secret=token,
+        static_token=token,
+    )
+    auth = AuthSettings(
+        # Передаём строки через модель AuthSettings: её конфигурация сохраняет
+        # пустой path без добавочного `/`, что важно для точного сравнения iss.
+        issuer_url=public_url,
+        resource_server_url=resource_url,
+        required_scopes=[OAUTH_SCOPE],
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True,
+            valid_scopes=[OAUTH_SCOPE],
+            default_scopes=[OAUTH_SCOPE],
+        ),
+        revocation_options=RevocationOptions(enabled=True),
+    )
+    return provider, auth
+
+
+_oauth_provider, _auth_settings = _oauth_from_environment()
+
 server = MCPServer(
     name="cryptomcp",
     version="0.1.0",
@@ -112,7 +167,14 @@ server = MCPServer(
         "Инструменты не предсказывают направление и не дают рекомендаций: "
         "squeeze_index измеряет готовность к движению, а не его сторону."
     ),
+    auth_server_provider=_oauth_provider,
+    auth=_auth_settings,
 )
+
+if _oauth_provider is not None:
+    server.custom_route("/oauth/authorize", methods=["GET", "POST"])(
+        _oauth_provider.authorization_page
+    )
 
 #: Клиент на рынок: у фьючерсов и спота разные хосты и раздельные пулы веса,
 #: поэтому и бюджеты должны быть разными объектами.

@@ -15,10 +15,12 @@ services:
       CRYPTOMCP_HOST: 0.0.0.0
       CRYPTOMCP_PORT: 8000
       CRYPTOMCP_PUBLIC_HOST: cryptomcp.aithinglab.com
+      CRYPTOMCP_PUBLIC_URL: https://cryptomcp.aithinglab.com
       CRYPTOMCP_LOG_LEVEL: INFO
       CRYPTOMCP_DB: /app/data/market.sqlite
-      # Токен приходит из .env рядом с этим файлом, в репозиторий не попадает.
+      # Ключ входа на OAuth-странице и совместимый статический токен.
       MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?нужен MCP_AUTH_TOKEN в .env}
+      MCP_OAUTH_DB: /app/oauth/oauth.sqlite
     volumes:
       # Журнал индекса (PLAN §4.11) должен переживать пересборку образа:
       # его ценность именно в накоплении, начатом с первого дня.
@@ -28,6 +30,8 @@ services:
       # нужен доступ к -wal и -shm; дисциплину «пишет один» держит код, а не
       # права доступа.
       - cryptomcp_data:/app/data
+      # Зарегистрированные OAuth-клиенты и refresh-токены переживают выкаты.
+      - cryptomcp_oauth:/app/oauth
     networks:
       - briefgenerator_internal
     logging:
@@ -86,6 +90,7 @@ services:
 volumes:
   cryptomcp_journal:
   cryptomcp_data:
+  cryptomcp_oauth:
 
 networks:
   briefgenerator_internal:
