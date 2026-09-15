@@ -84,11 +84,25 @@ class TestRender:
         }, now_ms=1_756_800_000_000)
 
         assert "Вошли (1)" in text
-        assert ">ONDOUSDT</a> 4h перп · ранг 2 · узк 19 (3.2 сут)" in text
+        assert "#ONDOUSDT 4h перп · ранг 2 · узк 19 (3.2 сут)" in text
         assert "Подтверждены (1)" in text
-        assert ">HBARUSDT</a> 1d перп · ранг 7 · узк 7 (7.0 сут)" in text
+        assert "#HBARUSDT 1d перп · ранг 7 · узк 7 (7.0 сут)" in text
         assert "Вышли (1)" in text
-        assert ">WLDUSDT</a> 4h спот · пробой" in text
+        assert "#WLDUSDT 4h спот · пробой" in text
+
+    def test_ticker_is_a_hashtag_not_a_link(self):
+        """Нажатие на тикер собирает по каналу всю историю этой монеты.
+
+        Обёрнутый в тег <a> хэштег перестаёт быть хэштегом, поэтому ссылка на
+        график уехала в конец строки отдельным словом, а не пропала.
+        """
+        text = render_watchlist_delta(
+            {"entered": [entry("ONDOUSDT", "4h", rank=2, market="futures")]}
+        )
+
+        assert "#ONDOUSDT" in text
+        assert ">ONDOUSDT</a>" not in text
+        assert ">график</a>" in text
 
     def test_symbol_is_a_link_to_the_same_timeframe(self):
         """Смысл ссылки — открыть тот же контракт и тот же таймфрейм."""

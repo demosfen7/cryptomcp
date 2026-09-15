@@ -505,7 +505,8 @@ class TestScanTwin:
         client = FakeKlineClient(NOW - 3000 * self.STEP, NOW, self.STEP, page=1500)
 
         written = await scan_twin(
-            {"spot": client, "futures": client}, con, timeframes=("4h",), limit=2
+            {"spot": client, "futures": client}, con, timeframes=("4h",), limit=2,
+            now_ms=NOW,
         )
 
         assert written == 2
@@ -520,7 +521,8 @@ class TestScanTwin:
         client = FakeKlineClient(NOW - 3000 * self.STEP, NOW, self.STEP, page=1500)
 
         await scan_twin(
-            {"spot": client, "futures": client}, con, timeframes=("4h",), limit=5
+            {"spot": client, "futures": client}, con, timeframes=("4h",), limit=5,
+            now_ms=NOW,
         )
 
         assert self.twins(con)["HOMEUSDT"]["twin_market"] == "futures"
@@ -533,7 +535,8 @@ class TestScanTwin:
         client = FakeKlineClient(NOW - 3000 * self.STEP, NOW, self.STEP, page=1500)
 
         await scan_twin(
-            {"spot": client, "futures": client}, con, timeframes=("4h",), limit=5
+            {"spot": client, "futures": client}, con, timeframes=("4h",), limit=5,
+            now_ms=NOW,
         )
 
         assert self.twins(con)["UBUSDT"]["twin_market"] == "spot"
@@ -756,6 +759,115 @@ class TestWatchlist:
         assert {"symbol": "C00USDT", "tf": "1d", "market": "spot",
                 "reason": "выпала по рангу", "narrow_bars": 10} in changes["exited"]
         assert "C00USDT" not in {e["symbol"] for e in storage.open_episodes(con)}
+
+    def test_a_coin_that_stopped_being_scanned_closes(self, con):
+        """Замер 14.09.2026: AIOTUSDT висел «active» шестые сутки.
+
+        Правило «выпала из универсума» было в коде с самого начала, но не
+        срабатывало никогда: ранг брался из последней строки журнала
+        независимо от её возраста, поэтому у переставшего сканироваться
+        символа он оставался прежним.
+        """
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW)
+        update_watchlist(con, self.NOW)
+        # Новых сканов нет ни по кому: сборщик до этих символов больше не
+        # доходит, а строки от NOW остались в журнале.
+        changes = update_watchlist(con, self.NOW + 3 * self.STEP)
+
+        assert storage.open_episodes(con) == []
+        assert {e["reason"] for e in changes["exited"]} == {"перестала обновляться"}
+        closed = storage.episodes(con, status="closed")
+        assert all("не обновлялись" in row["exit_reason"] for row in closed)
+
+    def test_a_frozen_row_does_not_hold_a_slot(self, con):
+        """Живой кандидат входит вместо замороженного лидера, а не после него."""
+        from cryptomcp.collector import WATCH_ENTER_RANK, update_watchlist
+
+        # Замороженный лидер: индекс выше всех, но свеча трёхдневной давности.
+        self.scan(con, "ЗАМЁРЗUSDT", 0.99, self.NOW - 3 * self.STEP)
+        self.market(con, self.NOW)
+        changes = update_watchlist(con, self.NOW)
+
+        entered = {e["symbol"] for e in changes["entered"]}
+        assert "ЗАМЁРЗUSDT" not in entered
+        assert len(entered) == WATCH_ENTER_RANK
+
+    def test_breakout_of_a_frozen_row_is_still_a_breakout(self, con):
+        """Пробой до заморозки — состоявшийся факт, а не «перестала обновляться».
+
+        Иначе журнал систематически терял бы именно сработавшие монеты:
+        выстрелила, вылетела из универсума по обороту — и записана выбывшей.
+        """
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW)
+        update_watchlist(con, self.NOW)
+        self.scan(con, "C00USDT", 0.50, self.NOW + self.STEP, price=200.0)
+        con.commit()
+        changes = update_watchlist(con, self.NOW + 4 * self.STEP)
+
+        exited = {e["symbol"]: e["reason"] for e in changes["exited"]}
+        assert exited["C00USDT"] == "пробой"
+
+    def test_confirmed_distribution_dismisses(self, con):
+        """Снятие с наблюдения по признаку, а не по рангу (§6.1).
+
+        OAX за шесть месяцев двадцать раз подряд дал один и тот же ответ, а
+        сканер держал бы монету в списке: «накопления нет» — пассивный ответ,
+        монета просто опускается в ранге.
+        """
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW)
+        update_watchlist(con, self.NOW)
+        self.market(con, self.NOW + self.STEP)
+        con.execute(
+            "UPDATE scan_log SET dist_verdict = 'confirmed' "
+            "WHERE symbol = 'C00USDT' AND ts_ms = ?", (self.NOW + self.STEP,)
+        )
+        con.commit()
+        changes = update_watchlist(con, self.NOW + self.STEP)
+
+        assert {"symbol": "C00USDT", "tf": "1d", "market": "spot",
+                "reason": "распределение", "narrow_bars": 10} in changes["exited"]
+        closed = [
+            row for row in storage.episodes(con, status="dismissed")
+            if row["symbol"] == "C00USDT"
+        ]
+        assert closed and closed[0]["exit_reason"] == "распределение подтверждено"
+
+    def test_forming_distribution_keeps_the_episode(self, con):
+        """Три события с плоскими максимумами — не снятие. Это намеренно."""
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW)
+        update_watchlist(con, self.NOW)
+        self.market(con, self.NOW + self.STEP)
+        con.execute("UPDATE scan_log SET dist_verdict = 'forming'")
+        con.commit()
+        update_watchlist(con, self.NOW + self.STEP)
+
+        assert "C00USDT" in {e["symbol"] for e in storage.open_episodes(con)}
+
+    def test_breakout_wins_over_distribution(self, con):
+        """Выстрелила и распределяется — это сработавший сигнал (§6.1)."""
+        from cryptomcp.collector import update_watchlist
+
+        self.market(con, self.NOW)
+        update_watchlist(con, self.NOW)
+        self.market(con, self.NOW + self.STEP)
+        self.scan(con, "C00USDT", 0.60, self.NOW + self.STEP, price=200.0)
+        con.execute(
+            "UPDATE scan_log SET dist_verdict = 'confirmed' "
+            "WHERE symbol = 'C00USDT' AND ts_ms = ?", (self.NOW + self.STEP,)
+        )
+        con.commit()
+        changes = update_watchlist(con, self.NOW + self.STEP)
+
+        exited = {e["symbol"]: e["reason"] for e in changes["exited"]}
+        assert exited["C00USDT"] == "пробой"
 
     def test_breakout_wins_over_rank(self, con):
         """Выстрелила и вылетела из топа — это сработавший сигнал, не выбывший."""

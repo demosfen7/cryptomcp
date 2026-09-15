@@ -229,6 +229,35 @@ class TestAbsorption:
 
         assert absorption(series, atr_values).taker_streak == 4
 
+    def test_pressure_streak_is_not_the_neutral_streak(self):
+        """Замер AINUSDT 13.09.2026: по нейтрали 8 подряд, по давлению 5.
+
+        Большее из двух чисел оказалось менее содержательным: серия по 0.50
+        включала часы с 0.51–0.54, то есть рыночный шум, а пять подряд выше
+        0.55 при схлопнувшемся объёме и стоящей цене были тем самым окном,
+        после которого монета прошла +98%.
+        """
+        from cryptomcp.volume import absorption
+
+        taker = (
+            [0.51, 0.52, 0.53]
+            + [0.62, 0.68, 0.61, 0.60, 0.58]
+            + [0.40] * 22
+        )
+        data = absorption(*self.series(taker))
+
+        assert data.taker_streak == 8
+        assert data.taker_streak_pressure == 5
+
+    def test_pressure_streak_is_zero_without_pressure(self):
+        """Ноль — «признака нет», и его видно отдельно от короткой серии."""
+        from cryptomcp.volume import absorption
+
+        data = absorption(*self.series([0.52] * 30))
+
+        assert data.taker_streak == 30
+        assert data.taker_streak_pressure == 0
+
     def test_interval_is_reported(self):
         from cryptomcp.volume import absorption
 
@@ -431,6 +460,46 @@ class TestVolumeLeadsPrice:
         lead, state = volume_leads_price(series, atr_values)
         assert lead is None
         assert "был движением цены" in state
+
+    def test_beyond_the_cap_the_number_is_replaced_by_words(self):
+        """Замер 14.09.2026: AINUSDT за час до роста на 98% печатал «объём
+        пришёл на 27 свечей ПОЗЖЕ движения», TRUTHUSDT — 33, AIOTUSDT — 40.
+        Число большое, по смыслу отрицательное, а читается как измерение
+        связи, которой на таком расстоянии уже нет."""
+        from cryptomcp.volume import LEAD_CAP, volume_leads_price
+
+        # Движение, потом через 25 свечей тихий всплеск объёма.
+        bars = [(1000.0, 0.0)] * 70 + [(1200.0, 2.0)] + [(1000.0, 0.0)] * 24
+        bars += [(5000.0, 0.1)] + [(1000.0, 0.0)] * 5
+        series, atr_values = self.series(bars)
+
+        lead, state = volume_leads_price(series, atr_values)
+
+        assert lead is not None and abs(lead) > LEAD_CAP
+        assert "вне окна" in state
+        assert "запаздывание" in state
+        assert "признаком набора не считается" in state
+
+    def test_the_number_survives_for_the_journal(self):
+        """Печать меняется, данные — нет: на них потолок потом и проверяется."""
+        from cryptomcp.volume import LEAD_CAP, volume_leads_price
+
+        bars = [(1000.0, 0.0)] * 70 + [(1200.0, 2.0)] + [(1000.0, 0.0)] * 24
+        bars += [(5000.0, 0.1)] + [(1000.0, 0.0)] * 5
+        lead, _ = volume_leads_price(*self.series(bars))
+
+        assert lead == -25
+        assert abs(lead) > LEAD_CAP
+
+    def test_inside_the_cap_keeps_the_number(self):
+        from cryptomcp.volume import volume_leads_price
+
+        bars = [(1000.0, 0.0)] * 80 + [(1200.0, 2.0)] + [(1000.0, 0.0)] * 12
+        bars += [(5000.0, 0.1)] + [(1000.0, 0.0)] * 5
+        lead, state = volume_leads_price(*self.series(bars))
+
+        assert lead == -13
+        assert state == "объём пришёл на 13 свечей ПОЗЖЕ движения"
 
     def test_spike_without_resolution_reports_waiting(self):
         """Самое интересное состояние: набор был, развязки ещё нет."""

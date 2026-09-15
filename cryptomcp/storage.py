@@ -24,7 +24,7 @@ import datetime as dt
 import json
 import os
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from . import SQUEEZE_FORMULA_VERSION
@@ -153,7 +153,18 @@ CREATE TABLE IF NOT EXISTS scan_log (
     -- Ход цены за сутки по закрытым свечам. Пишется ВСЕГДА, в том числе у
     -- монет, которые из-за него в список не попали (§4.35): иначе через два
     -- месяца нечем будет проверить, верен ли сам порог.
-    change_24h_pct    REAL
+    change_24h_pct    REAL,
+    -- Детектор распределения и его зеркало (SPEC-distribution-detector §7).
+    -- Считаются на СВОЁМ таймфрейме записи, в отличие от признаков набора:
+    -- структуру максимумов дневное разрешение не стирает.
+    dist_events       INTEGER,
+    dist_slope        REAL,
+    dist_drop         REAL,
+    dist_verdict      TEXT,
+    absorp_events     INTEGER,
+    absorp_slope      REAL,
+    absorp_rise       REAL,
+    absorp_verdict    TEXT
 );
 
 -- Одна строка на закрытую свечу И версию формулы. Сканер ходит раз в час, а
@@ -233,6 +244,14 @@ ACCUMULATION_COLUMNS = frozenset({
     "wick_streak",
 })
 
+#: Колонки детектора распределения. Список закрытый по той же причине, что и
+#: у признаков накопления: опечатка в имени писала бы в никуда, а обнаружилось
+#: бы это через месяц пустой статистики.
+DISTRIBUTION_COLUMNS = frozenset({
+    "dist_events", "dist_slope", "dist_drop", "dist_verdict",
+    "absorp_events", "absorp_slope", "absorp_rise", "absorp_verdict",
+})
+
 #: Колонки derivatives, кроме ключа. Порядок фиксирован: по нему строится upsert.
 DERIVATIVE_COLUMNS = (
     "open_interest",
@@ -295,6 +314,14 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("scan_log", "shock_share", "REAL"),
     ("scan_log", "shock_volume", "REAL"),
     ("scan_log", "shock_bars_ago", "INTEGER"),
+    ("scan_log", "dist_events", "INTEGER"),
+    ("scan_log", "dist_slope", "REAL"),
+    ("scan_log", "dist_drop", "REAL"),
+    ("scan_log", "dist_verdict", "TEXT"),
+    ("scan_log", "absorp_events", "INTEGER"),
+    ("scan_log", "absorp_slope", "REAL"),
+    ("scan_log", "absorp_rise", "REAL"),
+    ("scan_log", "absorp_verdict", "TEXT"),
 )
 
 
@@ -460,6 +487,7 @@ def record_scan(
     formula_version: str,
     ts_ms: int | None = None,
     accumulation: dict[str, Any] | None = None,
+    distribution: dict[str, Any] | None = None,
 ) -> int:
     """Строка журнала сканирования.
 
@@ -513,6 +541,13 @@ def record_scan(
     for column, value in (accumulation or {}).items():
         if column not in ACCUMULATION_COLUMNS:
             raise ValueError(f"Неизвестная колонка накопления: {column!r}")
+        columns.append(column)
+        values.append(value)
+    # Детектор, в отличие от них, считается по ТОМУ ЖЕ ряду, что и индекс, —
+    # но приходит тем же способом, чтобы запись оставалась одной.
+    for column, value in (distribution or {}).items():
+        if column not in DISTRIBUTION_COLUMNS:
+            raise ValueError(f"Неизвестная колонка детектора: {column!r}")
         columns.append(column)
         values.append(value)
 
@@ -599,13 +634,50 @@ def record_twin(
     )
 
 
+def scan_age_ms(row: Mapping[str, Any], now_ms: int) -> int | None:
+    """Сколько прошло с закрытия свечи, по которой посчитана запись.
+
+    None значит «неизвестно»: у записей, сделанных до появления колонки,
+    закрытия нет вовсе, и считать их замороженными было бы отказом по
+    отсутствующему основанию.
+    """
+    closed = row.get("closed_through_ms")
+    return None if closed is None else now_ms - int(closed)
+
+
+def scan_is_fresh(row: Mapping[str, Any], tf: str, now_ms: int) -> bool:
+    """Можно ли ещё сравнивать эту запись с остальными.
+
+    Символ, выпавший из универсума (оборот ушёл ниже архивного порога, пара
+    закрыта на бирже), перестаёт сканироваться, но его последняя строка в
+    журнале остаётся навсегда. Без проверки возраста она продолжает
+    участвовать в ранге: замер 14.09.2026 — AIOTUSDT держал ранг 1 с индексом
+    от 08.09, вытесняя живых кандидатов, а его эпизод показывал «+0.0%» при
+    фактических +19.7% от цены входа.
+    """
+    from .series import is_stale
+
+    return not is_stale(row.get("closed_through_ms"), tf, now_ms)
+
+
 def latest_scan(
-    con: sqlite3.Connection, tf: str, formula_version: str | None = None
+    con: sqlite3.Connection,
+    tf: str,
+    formula_version: str | None = None,
+    *,
+    fresh_as_of_ms: int | None = None,
 ) -> list[dict[str, Any]]:
     """Последняя запись скана по каждому символу этого таймфрейма.
 
     Версия формулы обязательна к учёту: индексы, посчитанные по разным
     формулам, между собой не сравниваются, а ранг — это именно сравнение.
+
+    То же относится и к возрасту записи, но это видно хуже: ``fresh_as_of_ms``
+    выбрасывает символы, которые перестали сканироваться. Всякий, кто строит
+    из выдачи ранг или отбор, обязан его передать — иначе замороженная строка
+    соревнуется с живыми. Без параметра возвращается всё, включая
+    замороженное: выдаче списка наблюдения нужно показать и такую строку,
+    только с пометкой возраста.
     """
     version = formula_version or SQUEEZE_FORMULA_VERSION
     rows = con.execute(
@@ -617,7 +689,10 @@ def latest_scan(
         "ORDER BY s.squeeze_index DESC",
         (tf, version, tf, version),
     ).fetchall()
-    return [dict(row) for row in rows]
+    result = [dict(row) for row in rows]
+    if fresh_as_of_ms is None:
+        return result
+    return [row for row in result if scan_is_fresh(row, tf, fresh_as_of_ms)]
 
 
 def scan_history(
@@ -679,6 +754,7 @@ def screen_scan(
     min_narrow_bars: int | None = None,
     sort_by: str = "squeeze",
     formula_version: str | None = None,
+    fresh_as_of_ms: int | None = None,
 ) -> list[dict[str, Any]]:
     """Отбор по журналу сканирования, а не пересчётом.
 
@@ -691,11 +767,16 @@ def screen_scan(
     Цена решения — отставание до одной свечи таймфрейма: строка пишется на
     закрытие. Поэтому в выдаче печатается, по какую свечу она закрыта.
 
+    Отставание на одну свечу — норма, на много свечей — уже другое: символ
+    перестали сканировать, а строка осталась. ``fresh_as_of_ms`` такие
+    выбрасывает, иначе отбор предлагал бы монету по числам недельной
+    давности.
+
     Возвращается ВЕСЬ отобранный список, а не первые N: вызывающему нужно
     знать, сколько монет прошло фильтр, иначе «показано 5» неотличимо от
     «пятеро и есть весь рынок».
     """
-    rows = latest_scan(con, tf, formula_version)
+    rows = latest_scan(con, tf, formula_version, fresh_as_of_ms=fresh_as_of_ms)
     if allowed is not None:
         rows = [row for row in rows if row["symbol"] in allowed]
     if exclude:
@@ -746,7 +827,9 @@ def open_episodes(con: sqlite3.Connection, tf: str | None = None) -> list[dict[s
 
 #: Что принимает фильтр статуса: два открытых состояния, два закрытых и два
 #: собирательных значения.
-EPISODE_STATUSES = ("candidate", "active", "broken_out", "expired", "closed", "all")
+EPISODE_STATUSES = (
+    "candidate", "active", "broken_out", "expired", "dismissed", "closed", "all",
+)
 
 
 def episodes(
@@ -790,6 +873,40 @@ def episodes(
     return [dict(row) for row in con.execute(sql, params)]
 
 
+def accumulation_sign(scan: Mapping[str, Any]) -> float | None:
+    """Признак накопления одним числом: 1 — есть, 0 — нет, None — не проверялось.
+
+    **Почему кластер, а не свёртка всех признаков.** Замер 15.09.2026 по
+    журналу, 20 370 исходов на горизонте 72 часа (база: средний максимум
+    +14.41%, средний исход +4.50%, доля выросших больше чем на 10% — 43.1%):
+
+    | признак            |   n   | сред. max | сред. исход | доля >+10% |
+    |--------------------|-------|-----------|-------------|------------|
+    | кластер набора     |   265 |   20.63%  |    7.09%    |   50.9%    |
+    | бары набора > 0    | 2 340 |   14.95%  |    4.49%    |   42.8%    |
+    | нижние фитили ≥ 3  | 1 290 |   14.27%  |    5.64%    |   39.0%    |
+    | лид объёма > 0     |   932 |   16.23%  |    7.14%    |   39.9%    |
+
+    Кластер — единственный, кто двигает все три величины в одну сторону.
+    Одиночные бары от фона неотличимы, и это ровно то, о чём говорит §4.25:
+    один бар с большим объёмом почти всегда новость или вынос стопов.
+    Взвешивать признаки, которые замер не отличает от шума, значило бы
+    разбавить единственный работающий.
+
+    **Ноль и None — разные ответы.** None означает «младшего ряда не было,
+    признаки не считались» (записи самого 1h, свежие листинги), ноль —
+    «считались, кластера нет». Замер по колонке, где эти два случая слиты,
+    ничего не покажет.
+
+    Число, а не булево, потому что колонка `accumulation_score` останется той
+    же, когда исходов хватит на настоящую свёртку: сегодняшние 1 и 0 — её
+    первое, самое грубое приближение, и переписывать схему не придётся.
+    """
+    if not scan.get("absorption_tf"):
+        return None
+    return 1.0 if (scan.get("absorption_clusters") or 0) > 0 else 0.0
+
+
 def open_episode(
     con: sqlite3.Connection,
     symbol: str,
@@ -810,16 +927,22 @@ def open_episode(
     Рынок берётся из самой записи скана: эпизод описывает тот ряд, по которому
     отобран, и потом это уже не восстановить — источник архива у символа
     может смениться, а числа эпизода останутся от прежнего.
+
+    Признак накопления пишется на входе и потом не пересчитывается — по той же
+    причине, что и границы диапазона: вопрос, ради которого колонка заведена,
+    звучит «были ли признаки набора В МОМЕНТ отбора», и текущее значение на
+    него не отвечает.
     """
     scan = scan or {}
     cursor = con.execute(
         "INSERT OR IGNORE INTO watchlist (symbol, tf, status, entered_at, entered_by, "
-        "squeeze_index, rank_at_entry, price_at_entry, range_low, range_high, "
-        "last_rank, last_index, market) "
-        "VALUES (?, ?, 'candidate', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "squeeze_index, accumulation_score, rank_at_entry, price_at_entry, "
+        "range_low, range_high, last_rank, last_index, market) "
+        "VALUES (?, ?, 'candidate', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             symbol, tf, entered_at, entered_by,
-            scan.get("squeeze_index"), rank, scan.get("price"),
+            scan.get("squeeze_index"), accumulation_sign(scan),
+            rank, scan.get("price"),
             scan.get("range_low"), scan.get("range_high"),
             rank, scan.get("squeeze_index"),
             market or scan.get("source"),

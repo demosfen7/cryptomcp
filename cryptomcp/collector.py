@@ -30,7 +30,7 @@ import statistics
 import time
 from typing import Any
 
-from . import SQUEEZE_FORMULA_VERSION, manual, render, storage
+from . import SQUEEZE_FORMULA_VERSION, distribution, manual, render, storage
 from .analysis import MIN_CANDLES, analyse_timeframe, required_candles
 from .client import BinanceClient
 from .config import Config
@@ -629,6 +629,31 @@ def accumulation_context(
     return context
 
 
+def _distribution_row(detector: distribution.Detector) -> dict[str, Any]:
+    """Обе стороны детектора колонками журнала.
+
+    Пишется с первого дня по той же причине, что и признаки набора: через два
+    месяца вопрос будет не «работает ли детектор», а «на каких порогах он
+    работает», и ответить на него можно только по накопленным строкам. Свои
+    пороги ТЗ само называет стартовыми и неоткалиброванными (§10).
+    """
+    dist, absorp = detector.distribution, detector.accumulation
+    return {
+        "dist_events": dist.count,
+        "dist_slope": _round(dist.slope, 8),
+        "dist_drop": _round(dist.shift_atr, 3),
+        "dist_verdict": dist.verdict,
+        "absorp_events": absorp.count,
+        "absorp_slope": _round(absorp.slope, 8),
+        "absorp_rise": _round(absorp.shift_atr, 3),
+        "absorp_verdict": absorp.verdict,
+    }
+
+
+def _round(value: float | None, digits: int) -> float | None:
+    return None if value is None or value != value else round(value, digits)
+
+
 def run_scan(con: sqlite3.Connection) -> int:
     """Посчитать индекс по всему архиву и записать в scan_log.
 
@@ -655,6 +680,9 @@ def run_scan(con: sqlite3.Connection) -> int:
             if len(series) < MIN_CANDLES:
                 continue
             view = analyse_timeframe(series, config)
+            detector = distribution.analyse(
+                series, atr(series.high, series.low, series.close, 14)
+            )
             # Контекст накопления один на символ: он не зависит от таймфрейма
             # записи, а пересчитывать его на каждый ТФ значило бы читать один и
             # тот же ряд трижды.
@@ -664,6 +692,7 @@ def run_scan(con: sqlite3.Connection) -> int:
                 con, symbol, source, view,
                 formula_version=SQUEEZE_FORMULA_VERSION,
                 accumulation=accumulation.get(symbol) if tf != ACCUMULATION_TF else None,
+                distribution=_distribution_row(detector),
             ):
                 written += 1
     con.commit()
@@ -676,6 +705,7 @@ async def scan_twin(
     *,
     timeframes: tuple[str, ...] = TWIN_TIMEFRAMES,
     limit: int = TWIN_LIMIT,
+    now_ms: int | None = None,
 ) -> int:
     """Посчитать те же величины на соседнем рынке для верхушки списка.
 
@@ -698,9 +728,13 @@ async def scan_twin(
     этот проход и заводится.
     """
     written = 0
+    now_ms = now_ms or int(dt.datetime.now(dt.UTC).timestamp() * 1000)
     for tf in timeframes:
         window = required_candles(tf) + WARMUP
-        for row in storage.latest_scan(con, tf)[:limit]:
+        # Верхушка живого списка, а не журнала: соседний рынок считается
+        # запросом к бирже, и платить им за символ, который уже не
+        # сканируется, незачем.
+        for row in storage.latest_scan(con, tf, fresh_as_of_ms=now_ms)[:limit]:
             symbol = row["symbol"]
             twin = SPOT.name if row["source"] == FUTURES.name else FUTURES.name
             client = clients[twin]
@@ -784,6 +818,18 @@ def _delta_entry(
     }
 
 
+def _frozen_days(scan: dict[str, Any] | None, tf: str, now_ms: int) -> float | None:
+    """На сколько суток запись скана отстала, если отстала совсем.
+
+    None у живой записи и у той, чьего возраста не знаем, — чтобы причина
+    закрытия эпизода никогда не выдумывалась из отсутствующего основания.
+    """
+    if scan is None or storage.scan_is_fresh(scan, tf, now_ms):
+        return None
+    age = storage.scan_age_ms(scan, now_ms)
+    return None if age is None else age / 86_400_000
+
+
 def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict[str, list]:
     """Пересчитать состав списка наблюдения и вернуть дельту к прошлому прогону.
 
@@ -815,6 +861,13 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
     Порядок проверок при закрытии важен: пробой раньше ранга. Монета, которая
     выстрелила и на этом вылетела из топа, должна попасть в статистику как
     сработавшая, а не как «выпала по рангу».
+
+    **В ранге участвуют только живые записи.** Правило «выпала из универсума»
+    было в коде с самого начала, но не срабатывало ни разу: `latest_scan`
+    отдавал последнюю строку символа независимо от её возраста, поэтому
+    переставший сканироваться символ сохранял ранг навсегда. Эпизод при этом
+    замерзал целиком — индекс, `узк` и цена «сейчас» оставались от последнего
+    прогона, а выдача печатала их как текущие.
     """
     now_ms = now_ms or int(dt.datetime.now(dt.UTC).timestamp() * 1000)
     # Записи дельты — словари, а не кортежи: полей стало пять (рынок ряда и
@@ -828,8 +881,19 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
     # просто не доходил бы.
     timeframes = dict.fromkeys((*WATCH_TIMEFRAMES, *storage.open_timeframes(con)))
     for tf in timeframes:
+        # Ранг — только по живым записям. Символ, выпавший из универсума,
+        # перестаёт сканироваться, но его последняя строка остаётся в журнале
+        # навсегда: без проверки возраста она держит ранг вечно, и эпизод по
+        # ней не закрывается никогда. Замер 14.09.2026: AIOTUSDT стоял первым
+        # с индексом от 08.09 и печатал «+0.0%» при фактических +19.7%.
+        #
+        # Факты по самому эпизоду при этом берутся из последней известной
+        # записи, даже замороженной: пробой, случившийся до заморозки, —
+        # состоявшийся факт, и терять его значило бы записать сработавшую
+        # монету в «выпала по рангу».
         rows = storage.latest_scan(con, tf)
-        rank = {row["symbol"]: i + 1 for i, row in enumerate(rows)}
+        fresh = storage.latest_scan(con, tf, fresh_as_of_ms=now_ms)
+        rank = {row["symbol"]: i + 1 for i, row in enumerate(fresh)}
         by_symbol = {row["symbol"]: row for row in rows}
 
         for episode in storage.open_episodes(con, tf):
@@ -851,6 +915,26 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
                 )
                 continue
 
+            # Распределение проверяется ПОСЛЕ пробоя, но ДО ранга (§6.1).
+            # Монета, снятая по признаку, должна попасть в журнал как
+            # отсеянная по признаку, а не как «выпала по рангу», — иначе
+            # статистика систематически потеряет ровно те случаи, ради
+            # которых детектор написан.
+            #
+            # Подтверждённое распределение снимает монету независимо от
+            # squeeze_index и узк (§6.2): сжатие описывает форму,
+            # распределение — механизм, и механизм важнее. OAX в июле был
+            # одновременно сжат и распределяем.
+            if not manual and _dismissed(scan):
+                storage.close_episode(
+                    con, episode["id"], status="dismissed",
+                    reason="распределение подтверждено", ts_ms=now_ms,
+                )
+                changes["exited"].append(
+                    _delta_entry(symbol, tf, market, scan, reason="распределение")
+                )
+                continue
+
             if now_ms - episode["entered_at"] > WATCH_MAX_DAYS * 86_400_000:
                 storage.close_episode(
                     con, episode["id"], status="expired",
@@ -862,16 +946,22 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
                 continue
 
             if not manual and (position is None or position > WATCH_EXIT_RANK):
+                frozen = _frozen_days(scan, tf, now_ms)
+                if position:
+                    reason = f"ранг {position} ниже {WATCH_EXIT_RANK}"
+                    short = "выпала по рангу"
+                elif frozen is not None:
+                    reason = f"данные не обновлялись {frozen:.1f} сут."
+                    short = "перестала обновляться"
+                else:
+                    reason = "выпала из универсума"
+                    short = "выпала по рангу"
                 storage.close_episode(
                     con, episode["id"], status="expired",
-                    reason=(
-                        f"ранг {position} ниже {WATCH_EXIT_RANK}" if position
-                        else "выпала из универсума"
-                    ),
-                    ts_ms=now_ms,
+                    reason=reason, ts_ms=now_ms,
                 )
                 changes["exited"].append(
-                    _delta_entry(symbol, tf, market, scan, reason="выпала по рангу")
+                    _delta_entry(symbol, tf, market, scan, reason=short)
                 )
                 continue
 
@@ -892,7 +982,7 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
         if tf not in WATCH_TIMEFRAMES:
             continue
 
-        for position, row in enumerate(rows[:WATCH_ENTER_RANK], start=1):
+        for position, row in enumerate(fresh[:WATCH_ENTER_RANK], start=1):
             if not _admissible(row, tf):
                 continue
             episode_id = storage.open_episode(
@@ -933,6 +1023,15 @@ def _admissible(scan: dict[str, Any], tf: str) -> bool:
     return not (index is not None and index < WATCH_MIN_INDEX)
 
 
+def _dismissed(scan: dict[str, Any] | None) -> bool:
+    """Подтверждено ли распределение по последней записи скана.
+
+    Ручные записи сюда не попадают: они детектором не снимаются, только
+    помечаются (§6.3) — то же правило, что уже действует для ранга.
+    """
+    return bool(scan) and scan.get("dist_verdict") == distribution.VERDICT_CONFIRMED
+
+
 def _broke_out(episode: dict[str, Any], scan: dict[str, Any]) -> bool:
     """Вышла ли цена за диапазон, зафиксированный на входе."""
     price = scan.get("price")
@@ -951,7 +1050,13 @@ def add_to_watchlist(
     записи не выбывают по рангу — только по пробою, сроку или вручную.
     """
     now_ms = now_ms or int(dt.datetime.now(dt.UTC).timestamp() * 1000)
-    rows = {row["symbol"]: row for row in storage.latest_scan(con, tf)}
+    # Только живые: границы диапазона запоминаются на входе и потом не
+    # пересчитываются, и засеять их числами недельной давности значило бы
+    # считать пробой от диапазона, которого уже нет.
+    rows = {
+        row["symbol"]: row
+        for row in storage.latest_scan(con, tf, fresh_as_of_ms=now_ms)
+    }
     episode_id = storage.open_episode(
         con, symbol.upper(), tf, entered_at=now_ms, entered_by="manual",
         scan=rows.get(symbol.upper(), {}),

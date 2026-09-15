@@ -348,6 +348,11 @@ LEAD_VOLUME_MULTIPLE = 3.0
 #: Насколько тело свечи должно превысить ATR, чтобы считаться движением цены.
 LEAD_MOVE_ATR = 1.5
 
+#: Потолок, за которым разрыв между всплеском объёма и движением цены
+#: перестаёт быть признаком. Двадцать свечей — примерно сутки на часовом ряду:
+#: дальше это два независимых события, а не одно с задержкой.
+LEAD_CAP = 20
+
 #: Всплеск объёма засчитывается за набор, только если сама свеча тихая — тот же
 #: порог, что у баров набора. Замерено: без этого условия признак не различает
 #: два кейса, ради которых заведён (ASTER +8 свечей против UAI +2, знак один).
@@ -391,6 +396,16 @@ class Absorption:
     cluster_longest: int = 0
     #: Самая длинная серия свечей подряд с нижним фитилём больше половины.
     wick_streak: int = 0
+    #: Серия подряд выше ДАВЛЕНИЯ (0.55), а не нейтрали (0.50).
+    #:
+    #: Замер AINUSDT 13.09.2026 16:00–20:00: пять часов подряд takerB
+    #: 0.62 · 0.68 · 0.61 · 0.60 · 0.58 при объёме 0.22–0.70x и стоящей цене,
+    #: через девять часов после этого монета прошла +98%. В выдаче от этого
+    #: окна не оставалось ничего: средняя по окну 0.49 (ниже нейтрали),
+    #: «выше 0.55: 27 свечей» не говорит, что они шли подряд, а серия по
+    #: нейтрали давала 8 — цифру больше, а признак слабее. Протокол
+    #: сформулирован именно на 0.55 («четыре часа из шести выше 0.55»).
+    taker_streak_pressure: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -401,6 +416,7 @@ class Absorption:
             "taker_max": round(self.taker_max, 3),
             "taker_above_pressure": self.taker_above,
             "taker_longest_streak": self.taker_streak,
+            "taker_longest_streak_pressure": self.taker_streak_pressure,
             "volume_ratio": round(self.volume_ratio, 3),
             "volume_lead_bars": self.lead_bars,
             "volume_lead_state": self.lead_state,
@@ -521,6 +537,7 @@ def absorption(
         taker_max=float(np.nanmax(taker)) if len(taker) else float("nan"),
         taker_above=int(np.sum(taker > TAKER_PRESSURE)) if len(taker) else 0,
         taker_streak=longest_streak(taker, TAKER_NEUTRAL),
+        taker_streak_pressure=longest_streak(taker, TAKER_PRESSURE),
         volume_ratio=ratio,
         weak_basis=samples < MIN_SAMPLES_PER_SLOT,
         lead_bars=lead_bars,
@@ -610,6 +627,21 @@ def volume_leads_price(
         return waited, f"всплеск объёма {candles(waited)} назад, движения ещё не было"
 
     lead = first_move - first_volume
+    if abs(lead) > LEAD_CAP:
+        # За пределами потолка число перестаёт означать связь: всплеск и
+        # движение разделены столькими свечами, что объём давно поглощён
+        # рынком. Замер 14.09.2026: AINUSDT за час до роста на 98% печатал
+        # «объём пришёл на 27 свечей ПОЗЖЕ движения» — отрицательный по виду
+        # сигнал ровно там, где набор шёл. TRUTHUSDT давал 33, AIOTUSDT 40.
+        #
+        # Само число остаётся в `lead_bars` и уходит в журнал: выбросить его
+        # значило бы лишиться данных, на которых потолок потом проверяется.
+        # Меняется только то, что читает человек.
+        side = "опережение" if lead > 0 else "запаздывание"
+        return lead, (
+            f"{side} вне окна ({candles(abs(lead))}) — объём поглощён, "
+            f"признаком набора не считается"
+        )
     if lead > 0:
         return lead, f"объём опередил цену на {candles(lead)}"
     if lead == 0:

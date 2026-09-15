@@ -17,7 +17,13 @@ from typing import Any
 
 import httpx
 
-from .errors import ErrorKind, ToolError, bad_params, unknown_symbol
+from .errors import (
+    ErrorKind,
+    ToolError,
+    bad_params,
+    symbol_closed,
+    unknown_symbol,
+)
 from .markets import FUTURES, Market
 from .ratelimit import WeightBudget
 
@@ -37,6 +43,15 @@ _MAX_ATTEMPTS = 3
 
 #: Коды Binance, которые означают ошибку запроса, а не сбой.
 _UNKNOWN_SYMBOL_CODES = {-1121}
+#: Пара существует, но торги по ней закрыты: делистинг, поставка, расчёт или
+#: ещё не начавшийся пре-трейдинг. Повтор не поможет ни через секунду, ни
+#: через сутки, поэтому вид ошибки отдельный и неретраебельный.
+#:
+#: Набор узкий сознательно: -4108 получен живым запросом
+#: (STORJUSDT, market=futures, 14.09.2026), остальные «похожие по смыслу»
+#: коды сюда не добавлены. Ошибочно попавший код объявил бы неретраебельным
+#: то, что стоило повторить, — а это отказ там, где данные были доступны.
+_CLOSED_SYMBOL_CODES = {-4108}
 _BAD_PARAM_CODES = {-1100, -1101, -1102, -1104, -1105, -1106, -1130, -1131}
 
 
@@ -242,6 +257,10 @@ class BinanceClient:
 
         if code in _UNKNOWN_SYMBOL_CODES:
             return unknown_symbol(str(params.get("symbol", "?")), self.market.name)
+        if code in _CLOSED_SYMBOL_CODES:
+            return symbol_closed(
+                str(params.get("symbol", "?")), self.market.name, msg
+            )
         if code in _BAD_PARAM_CODES:
             return bad_params(f"Binance отклонил параметры: {msg}", code=code, **params)
         return ToolError(

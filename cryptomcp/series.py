@@ -83,6 +83,39 @@ def interval_ms(interval: str) -> int:
     return INTERVAL_MS[interval]
 
 
+#: Во сколько интервалов таймфрейма укладывается ещё свежая последняя свеча.
+#:
+#: Мера одна на весь проект: живость сборщика («был ли прогон за последние два
+#: интервала», ARCHITECTURE §2), возраст записи скана и свежесть ряда в выдаче
+#: — это один и тот же вопрос, и разные пороги для него означали бы, что
+#: healthcheck и выдача расходятся в оценке одного и того же символа. Два, а не
+#: один: пропуск одного прогона — норма, два подряд означают, что символ
+#: перестали считать.
+FRESH_INTERVALS = 2
+
+
+def series_age_ms(closed_through_ms: int | None, reference_ms: int) -> int | None:
+    """Сколько прошло с закрытия последней свечи. None — возраст неизвестен."""
+    if closed_through_ms is None:
+        return None
+    return reference_ms - int(closed_through_ms)
+
+
+def is_stale(
+    closed_through_ms: int | None, interval: str, reference_ms: int
+) -> bool:
+    """Отстал ли ряд настолько, что его числа нельзя считать текущими.
+
+    Неизвестный возраст — не основание: у записей, сделанных до появления
+    колонки закрытия, его нет вовсе, и объявлять их протухшими значило бы
+    отказывать по отсутствующему признаку.
+    """
+    age = series_age_ms(closed_through_ms, reference_ms)
+    if age is None:
+        return False
+    return age > FRESH_INTERVALS * interval_ms(interval)
+
+
 @dataclass(frozen=True)
 class Series:
     """Ряд ЗАКРЫТЫХ свечей одного символа и таймфрейма."""

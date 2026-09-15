@@ -385,6 +385,118 @@ class TestArchiveQueries:
         assert storage.price_extremes(con, "CAKEUSDT", "1h", 0, 100) is None
 
 
+class TestAccumulationSign:
+    """Признак накопления на входе: кластер, а не свёртка всех признаков.
+
+    Замер 15.09.2026 по 20 370 исходам на 72ч: с кластером средний максимум
+    20.63% против 14.41% по базе, доля выросших больше 10% — 50.9 против 43.1.
+    Одиночные бары набора дали 14.95 и 42.8, то есть фон.
+    """
+
+    def test_cluster_is_the_sign(self):
+        assert storage.accumulation_sign(
+            {"absorption_tf": "1h", "absorption_clusters": 1}
+        ) == 1.0
+
+    def test_no_cluster_is_a_measured_zero(self):
+        assert storage.accumulation_sign(
+            {"absorption_tf": "1h", "absorption_clusters": 0}
+        ) == 0.0
+
+    def test_single_bars_do_not_make_a_sign(self):
+        """Бары без кластера — не признак: замер не отличает их от фона."""
+        assert storage.accumulation_sign({
+            "absorption_tf": "1h", "absorption_clusters": 0,
+            "absorption_bars": 4, "wick_streak": 5, "volume_lead": 9,
+        }) == 0.0
+
+    def test_uncomputed_is_not_zero(self):
+        """Младшего ряда не было — это «не проверялось», а не «признака нет»."""
+        assert storage.accumulation_sign({"absorption_clusters": None}) is None
+
+    def test_written_on_entry(self, con):
+        storage.open_episode(
+            con, "AAAUSDT", "1d", entered_at=1000, entered_by="scanner",
+            scan={"absorption_tf": "1h", "absorption_clusters": 2,
+                  "squeeze_index": 0.8},
+        )
+        row = storage.open_episodes(con)[0]
+        assert row["accumulation_score"] == 1.0
+
+
+class TestScanFreshness:
+    """Замороженная запись не участвует в сравнении (замер 14.09.2026).
+
+    AIOTUSDT держал ранг 1 с индексом от 08.09: символ выпал из универсума,
+    сканировать его перестали, а последняя строка журнала осталась и
+    соревновалась с живыми вечно.
+    """
+
+    NOW = 1_788_000_000_000
+    DAY = 86_400_000
+
+    def row(self, con, symbol, index, closed):
+        from cryptomcp import SQUEEZE_FORMULA_VERSION
+
+        con.execute(
+            "INSERT INTO scan_log (ts_ms, symbol, source, tf, formula_version, "
+            "squeeze_index, closed_through_ms) VALUES (?, ?, 'spot', '1d', ?, ?, ?)",
+            (closed, symbol, SQUEEZE_FORMULA_VERSION, index, closed),
+        )
+        con.commit()
+
+    def test_without_the_parameter_everything_is_returned(self, con):
+        """Выдаче списка нужна и замороженная строка — только с пометкой."""
+        self.row(con, "МЁРТВАЯUSDT", 0.9, self.NOW - 6 * self.DAY)
+        assert len(storage.latest_scan(con, "1d")) == 1
+
+    def test_frozen_row_drops_out_of_the_ranking(self, con):
+        self.row(con, "МЁРТВАЯUSDT", 0.9, self.NOW - 6 * self.DAY)
+        self.row(con, "ЖИВАЯUSDT", 0.1, self.NOW)
+
+        rows = storage.latest_scan(con, "1d", fresh_as_of_ms=self.NOW)
+
+        assert [r["symbol"] for r in rows] == ["ЖИВАЯUSDT"]
+
+    def test_one_missed_run_is_tolerated(self, con):
+        """Порог — два интервала: пропуск одного прогона не выбрасывает пару."""
+        self.row(con, "ЖИВАЯUSDT", 0.5, self.NOW - self.DAY)
+
+        rows = storage.latest_scan(con, "1d", fresh_as_of_ms=self.NOW)
+
+        assert [r["symbol"] for r in rows] == ["ЖИВАЯUSDT"]
+
+    def test_the_bound_is_the_timeframe_not_the_calendar(self, con):
+        """Те же двое суток на 4h — это уже двенадцать пропущенных свечей."""
+        from cryptomcp import SQUEEZE_FORMULA_VERSION
+
+        con.execute(
+            "INSERT INTO scan_log (ts_ms, symbol, source, tf, formula_version, "
+            "squeeze_index, closed_through_ms) VALUES (?, 'AAAUSDT', 'spot', "
+            "'4h', ?, 0.5, ?)",
+            (self.NOW - 2 * self.DAY, SQUEEZE_FORMULA_VERSION,
+             self.NOW - 2 * self.DAY),
+        )
+        con.commit()
+
+        assert storage.latest_scan(con, "4h", fresh_as_of_ms=self.NOW) == []
+
+    def test_unknown_age_is_not_a_reason_to_drop(self, con):
+        """У записей до появления колонки закрытия нет — это не основание."""
+        from cryptomcp import SQUEEZE_FORMULA_VERSION
+
+        con.execute(
+            "INSERT INTO scan_log (ts_ms, symbol, source, tf, formula_version, "
+            "squeeze_index) VALUES (?, 'СТАРАЯUSDT', 'spot', '1d', ?, 0.5)",
+            (self.NOW - 90 * self.DAY, SQUEEZE_FORMULA_VERSION),
+        )
+        con.commit()
+
+        rows = storage.latest_scan(con, "1d", fresh_as_of_ms=self.NOW)
+
+        assert [r["symbol"] for r in rows] == ["СТАРАЯUSDT"]
+
+
 class TestFormulaVersionIsolation:
     """Индексы разных формул между собой не сравниваются, а ранг — сравнение."""
 

@@ -20,11 +20,19 @@ from typing import Any
 
 from .analysis import SHOCK_RANGE_ATR, SHOCK_VOLUME_MULTIPLE, TimeframeView
 from .derivatives import Funding, OpenInterest, side_of_flow
+from .distribution import (
+    VOLUME_MULTIPLE as DIST_VOLUME,
+)
+from .distribution import (
+    WICK_FRACTION as DIST_WICK,
+)
+from .distribution import Detector, Sided
 from .errors import ErrorKind, ToolError
 from .indicators import Metric
 from .levels import Level, Pivots
 from .markets import FUTURES, Market, market_short
-from .series import Series
+from .series import Series, is_stale, series_age_ms
+from .storage import scan_age_ms, scan_is_fresh
 from .symbols import SymbolInfo, format_price
 from .volume import (
     MIN_SAMPLES_PER_SLOT,
@@ -58,6 +66,24 @@ def closed_through(view: TimeframeView, *, short: bool = False) -> str:
         return "n/a"
     stamp = utc(int(ms) + 1)
     return stamp[5:16] if short else stamp[:16]
+
+
+def _stale_timeframes(
+    views: Mapping[str, TimeframeView], *, reference_ms: int
+) -> list[str]:
+    """Таймфреймы, чья последняя закрытая свеча отстала больше двух интервалов.
+
+    Порог — общий для проекта (`series.FRESH_INTERVALS`), а не свой: у ряда,
+    у записи скана и у живости сборщика это один и тот же вопрос.
+    """
+    out = []
+    for tf, view in views.items():
+        closed = view.meta.get("closed_through_ms")
+        if not is_stale(closed, tf, reference_ms):
+            continue
+        days = series_age_ms(int(closed), reference_ms) / 86_400_000
+        out.append(f"{tf} — {days:.1f} сут назад")
+    return out
 
 
 def skip_label(error: ToolError) -> str:
@@ -228,6 +254,18 @@ def render_snapshot(
     lines.append("закрыты по (UTC): " + " · ".join(
         f"{tf} {closed_through(v, short=True)}" for tf, v in views.items()
     ))
+    # Строка «закрыты по» сама по себе на протухший архив не указывает: дату
+    # надо вычесть из сегодняшней, а живая цена в шапке создаёт впечатление
+    # свежести. Замер 14.09.2026: STORJUSDT (спот) показывал живую цену и
+    # «1d 09-03 03:00» рядом — архив оборвался одиннадцатью сутками раньше, и
+    # понять это можно было только сопоставлением трёх вызовов.
+    stale = _stale_timeframes(views, reference_ms=as_of_ms or now_ms)
+    if stale:
+        lines.append(
+            "ДАННЫЕ НЕ ОБНОВЛЯЛИСЬ: " + " · ".join(stale)
+            + f" — метрики посчитаны по этим свечам, а не по текущей цене; "
+            f"оборот за сутки сейчас {turnover} USDT"
+        )
     gaps = [
         f"{tf} {v.meta['missing']} св."
         for tf, v in views.items() if v.meta.get("missing")
@@ -629,6 +667,36 @@ def _price(value: Any) -> str:
     return f"{value:.8g}" if value else "n/a"
 
 
+def _frozen_days(scan: Mapping[str, Any], tf: str, now_ms: int) -> float | None:
+    """На сколько суток отстала запись скана, если отстала совсем."""
+    if not scan or scan_is_fresh(scan, tf, now_ms):
+        return None
+    age = scan_age_ms(scan, now_ms)
+    return None if age is None else age / 86_400_000
+
+
+def _accumulation(value: float | None) -> str:
+    """Признак накопления словом: «да», «нет» или «n/a».
+
+    Три состояния, а не два: n/a значит «младшего ряда не было, не считали»,
+    «нет» — «считали, кластера не нашли». Печатать их одинаково значило бы
+    смешать непроверенное с проверенным — то же различие, ради которого метрика
+    без базы печатает причину, а не ноль.
+    """
+    if value is None:
+        return "n/a"
+    return "да" if value > 0 else "нет"
+
+
+def _stamp(scan: Mapping[str, Any]) -> str:
+    """Свеча, по которую посчитана запись скана, — датой и часом UTC."""
+    closed = scan.get("closed_through_ms")
+    if closed is None:
+        return "неизвестной даты"
+    moment = dt.datetime.fromtimestamp(int(closed) / 1000, dt.UTC)
+    return f"{moment.strftime('%d.%m %H:%M')} UTC"
+
+
 def _pair(entry: Any, current: Any) -> str:
     """Значение «на входе → сейчас».
 
@@ -668,6 +736,7 @@ def render_watchlist(
         return "список наблюдения пуст"
 
     closed = any(row.get("exited_at") for row in episodes)
+    stale = False
     lines = [
         f"эпизодов: {len(episodes)}",
         f"{'символ':<14}{'ТФ':>4}{'рынок':>7}{'статус':>11}{'ранг':>10}"
@@ -685,11 +754,22 @@ def render_watchlist(
             if index_now is not None and index_in is not None else "—"
         )
         price_in = row.get("price_at_entry")
+        # Замороженная запись — та, по которой скан перестал ходить: символ
+        # выпал из универсума, а последняя строка осталась. Её числа не
+        # текущие, и печатать их молча нельзя.
+        frozen = _frozen_days(scan, row["tf"], now_ms)
         # У сканерной записи «сейчас» — цена последней закрытой свечи скана, у
         # ручной её взять неоткуда: монеты может не быть в архиве вовсе, ради
         # таких её и заводят руками. Тогда берётся живая цена, и это честно:
         # цена входа у ручной записи тоже живая (§4.28).
-        price_now = scan.get("price") or (prices or {}).get(row["symbol"])
+        #
+        # У замороженной цена скана тоже не берётся: она равна цене входа, и
+        # ход от входа печатался бы ровным «+0.0%» — на AIOTUSDT так
+        # скрывались фактические +19.7% (замер 14.09.2026).
+        price_now = (
+            (None if frozen is not None else scan.get("price"))
+            or (prices or {}).get(row["symbol"])
+        )
         move = (
             f"{(price_now / price_in - 1) * 100:+.1f}%"
             if price_now and price_in else "n/a"
@@ -706,7 +786,7 @@ def render_watchlist(
             f"{row['status']:>11}"
             f"{_pair(row.get('rank_at_entry'), row.get('last_rank')):>10}"
             f"{f'{index_now:.2f}' if index_now is not None else '—':>7}{delta:>7}"
-            f"{f'{accumulation:.2f}' if accumulation is not None else 'n/a':>8}"
+            f"{_accumulation(accumulation):>8}"
             f"{narrow if narrow is not None else '—':>5}"
             f"{_days(narrow, row['tf']):>6}"
             f"{_cell(scan.get('twin_narrow_bars')):>6}"
@@ -715,6 +795,15 @@ def render_watchlist(
         )
         if row.get("exited_at"):
             line += f"  ·  {row.get('exit_reason') or row['status']}"
+        if scan.get("dist_verdict") == "confirmed":
+            # Ручная запись детектором не снимается, только помечается
+            # (§6.3) — то же правило, что уже действует для ранга. У
+            # сканерной эпизод к этому моменту уже закрыт, и пометка
+            # объясняет, чем именно.
+            line += "  ·  распределение подтверждено"
+        if frozen is not None:
+            stale = True
+            line += f"  ·  данные от {_stamp(scan)}, {frozen:.1f} сут назад"
         lines.append(line)
 
     notes = [
@@ -736,12 +825,23 @@ def render_watchlist(
         "узк² — та же длительность на соседнем рынке (у спотовой записи это "
         "перп, у фьючерсной — спот): на HOMEUSDT 4h вышло 17 против 36 на "
         "одной свече. Справка; ни в ранг, ни в отбор не входит",
-        "накопл — метрика накопления; колонка заведена, метрика ещё не считается",
+        "накопл — был ли на входе кластер набора на младшем ряду (серия свечей, "
+        "за которую цена никуда не ушла). Замер по 20 370 исходам: с кластером "
+        "средний максимум за 72ч 20.6% против 14.4% по всей базе, одиночные "
+        "бары от фона неотличимы. n/a — младшего ряда не было, не проверялось",
         "кем — источник: scanner отбирает рангом, manual заводится руками и "
         "рангом не снимается (только руками или по сроку в 30 суток)",
         "«сейчас» у сканерных записей — цена последней закрытой свечи скана, "
         "у ручных — живая: их вход тоже отмечен по живой",
     ]
+    # Пояснение печатается, только когда замороженная строка есть: иначе
+    # оно висело бы в каждой выдаче, объясняя то, чего в ней нет.
+    if stale:
+        lines.append(
+            "«данные от» — скан по этой паре перестал обновляться: символ "
+            "выпал из универсума. Числа в строке от той даты, а не текущие, "
+            "и ход от входа по ним не считается"
+        )
     return "\n".join(lines)
 
 
@@ -862,6 +962,13 @@ def render_absorption(data: Absorption | None, *, skipped: str | None = None) ->
 
     # «3+ подряд» — та граница, ниже которой серия неотличима от выброса.
     streak = f"{data.taker_streak} подряд" if data.taker_streak else "нет"
+    # Серия по 0.55 — та, на которой сформулирован протокол. Печатается рядом
+    # с серией по нейтрали, а не вместо: на AINUSDT они разошлись как 5 и 8,
+    # и большее из двух чисел оказалось менее содержательным.
+    pressure = (
+        f"{data.taker_streak_pressure} подряд"
+        if data.taker_streak_pressure else "нет"
+    )
     # Кластер важнее одиночного бара: один бар с большим объёмом почти всегда
     # новость или вынос стопов, набор — это серия (§4.25).
     clusters = (
@@ -880,12 +987,95 @@ def render_absorption(data: Absorption | None, *, skipped: str | None = None) ->
         f"максимум {data.taker_max:.2f} · "
         f"выше {TAKER_PRESSURE:.2f}: {data.taker_above} свечей",
         f"   серия выше 0.50  {streak}",
+        f"   серия выше {TAKER_PRESSURE:.2f}  {pressure} "
+        f"(устойчивый перевес покупателя, а не одна заявка)",
         f"   объём/цена       {data.lead_state}",
         f"   объём последней  {data.volume_ratio:.2f}x"
         + ("~ слабая база" if data.weak_basis else ""),
         "   считается на младшем ряду: дневное разрешение стирает поглощение "
         "внутри свечи",
     ])
+
+
+#: Как вердикт детектора читается человеком.
+_VERDICTS = {
+    "none": "признака нет",
+    "forming": "ФОРМИРУЕТСЯ",
+    "confirmed": "ПОДТВЕРЖДЕНО ⚑",
+}
+
+
+def render_distribution(
+    data: Detector | None, *, skipped: str | None = None
+) -> str:
+    """Раздел 7: распределение с зеркалом (SPEC-distribution-detector §8).
+
+    Печатается тем же стилем, что остальные шесть, и по тем же правилам: ни
+    одно число без базы сравнения, `n/a` с причиной вместо нуля, незакрытые
+    свечи не участвуют.
+
+    События перечисляются с датами, объёмом и фитилём: вывод должен быть
+    проверяем по сырым свечам вручную, иначе вердикт «ПОДТВЕРЖДЕНО» нечем
+    оспорить.
+    """
+    if data is None or skipped is not None:
+        return f"\n\n7. Распределение\n   n/a — {skipped}"
+
+    side = data.distribution
+    lines = [
+        f"\n\n7. Распределение (окно {candles(side.window)})",
+        f"   события          {side.count} "
+        f"(объём ≥{DIST_VOLUME:.0f}x при верхнем фитиле "
+        f"≥{DIST_WICK * 100:.0f}% диапазона)",
+    ]
+    if side.verdict == "n/a":
+        lines.append(f"   вердикт          n/a — {side.reason}")
+        return "\n".join(lines)
+
+    if side.events:
+        lines.append(
+            "   максимумы        "
+            + " → ".join(f"{e.extreme:.6g}" for e in side.events)
+            + f" · наклон {_slope_word(side.slope)}"
+        )
+        for event in side.events:
+            when = dt.datetime.fromtimestamp(event.ts_ms / 1000, dt.UTC)
+            lines.append(
+                f"      {when:%d.%m %H:%M}  {event.extreme:.6g}  "
+                f"объём {event.volume_ratio:.2f}x  "
+                f"фитиль {event.wick * 100:.0f}%"
+                + (f"  ({event.bars} бара схлопнуты)" if event.bars > 1 else "")
+            )
+    lines.append(f"   смещение         {_shift(side)}")
+    lines.append(f"   вердикт          {_VERDICTS.get(side.verdict, side.verdict)}")
+    lines.append(
+        f"   зеркало          накопление: событий {data.accumulation.count}"
+        + (
+            f", вердикт {_VERDICTS.get(data.accumulation.verdict, '')}"
+            if data.accumulation.verdict != "none" else ""
+        )
+    )
+    return "\n".join(lines)
+
+
+def _slope_word(slope: float | None) -> str:
+    if slope is None:
+        return "n/a (событий меньше двух)"
+    return "отрицательный" if slope < 0 else "неотрицательный"
+
+
+def _shift(side: Sided) -> str:
+    """Смещение от первого события к последнему — в процентах и в ATR.
+
+    Процент отвечает «насколько», ATR — «много это для ЭТОЙ монеты». Одно
+    другое не заменяет: −19% у монеты с ATR 3% и у монеты с ATR 15% означают
+    разное.
+    """
+    if side.shift_atr is None or len(side.events) < 2:
+        return "n/a (событий меньше двух)"
+    first, last = side.events[0].extreme, side.events[-1].extreme
+    pct = (last / first - 1) * 100 if first else float("nan")
+    return f"{pct:+.1f}% = {abs(side.shift_atr):.1f} ATR"
 
 
 def render_screen(

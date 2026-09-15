@@ -22,6 +22,8 @@ class ErrorKind(StrEnum):
     IP_BANNED = "ip_banned"
     #: Не сбой, а нормальный ответ для свежего листинга.
     INSUFFICIENT_HISTORY = "insufficient_history"
+    #: Пара на бирже есть, но торги по ней закончились.
+    SYMBOL_CLOSED = "symbol_closed"
     DATA_GAP = "data_gap"
     UPSTREAM_ERROR = "upstream_error"
 
@@ -76,6 +78,30 @@ def unknown_symbol(symbol: str, market: str = "futures") -> ToolError:
         f"Символ {symbol!r} не найден на рынке {market} Binance. "
         f"Часть монет есть только на одном из рынков — попробовать "
         f"market={other!r}.",
+        details={"symbol": symbol, "market": market},
+    )
+
+
+def symbol_closed(symbol: str, market: str, reason: str) -> ToolError:
+    """Контракт закрыт биржей — повторять запрос бессмысленно.
+
+    Отдельный вид, а не общий `upstream_error`, по двум причинам. Первая:
+    `upstream_error` ретраебелен, и модель уходила повторять запрос к
+    расчитанному контракту до упора. Вторая: сырое «Symbol is on delivering
+    or delivered or settling or closed or pre-trading» не отвечает на
+    единственный уместный вопрос — где эту монету всё-таки смотреть.
+
+    Тот же принцип, что в ARCHITECTURE §7 про частичный результат:
+    составной инструмент отвечает тем, что у него есть. Здесь «есть» —
+    соседний рынок, если пара торгуется там.
+    """
+    other = "spot" if market == "futures" else "futures"
+    return ToolError(
+        ErrorKind.SYMBOL_CLOSED,
+        f"Контракт {symbol} на рынке {market} закрыт биржей: торги по нему "
+        f"прекращены, расчёт проведён или ещё не начат. Данных по нему "
+        f"больше не будет — если монета торгуется на соседнем рынке, смотреть "
+        f"через market={other!r}. Ответ биржи: {reason}",
         details={"symbol": symbol, "market": market},
     )
 

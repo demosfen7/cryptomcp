@@ -257,6 +257,51 @@ class TestSkippedTimeframes:
         assert "недоступные ТФ" not in text
 
 
+class TestStaleArchiveIsNamed:
+    """Замер 14.09.2026: STORJUSDT (спот) печатал живую цену и рядом
+    «закрыты по 1d 09-03 03:00». Архив оборвался одиннадцатью сутками раньше,
+    но понять это можно было только вычитанием даты из сегодняшней — а живая
+    цена в шапке создавала ровно обратное впечатление."""
+
+    DAY = 86_400_000
+
+    def render(self, *, age_days, quote_volume_24h=0.9e6):
+        now = 100 * self.DAY
+        closed = int(now - age_days * self.DAY)
+        return render_snapshot(
+            INFO, {"1d": view(interval="1d", meta={"closed_through_ms": closed})},
+            live_price=100.5, change_24h=1.0,
+            quote_volume_24h=quote_volume_24h, now_ms=now,
+        )
+
+    def test_stale_series_is_called_out(self):
+        text = self.render(age_days=11)
+        assert "ДАННЫЕ НЕ ОБНОВЛЯЛИСЬ" in text
+        assert "1d — 11.0 сут назад" in text
+
+    def test_last_known_turnover_is_printed(self):
+        """Оборот отвечает на вопрос «почему перестали»: ниже порога архива.
+
+        Формат тот же, что в шапке: два разных написания одного числа в одном
+        сообщении читаются как два разных числа.
+        """
+        assert "оборот за сутки сейчас 0.9M USDT" in self.render(age_days=11)
+
+    def test_one_missed_candle_is_not_an_alarm(self):
+        """Отставание на свечу — норма: строка пишется на закрытие."""
+        assert "ДАННЫЕ НЕ ОБНОВЛЯЛИСЬ" not in self.render(age_days=1.5)
+
+    def test_bound_is_the_timeframe_not_the_calendar(self):
+        """Те же полтора суток на 4h — это девять пропущенных свечей."""
+        now = 100 * self.DAY
+        text = render_snapshot(
+            INFO,
+            {"4h": view(meta={"closed_through_ms": int(now - 1.5 * self.DAY)})},
+            live_price=100.5, change_24h=1.0, quote_volume_24h=1e9, now_ms=now,
+        )
+        assert "ДАННЫЕ НЕ ОБНОВЛЯЛИСЬ" in text
+
+
 class TestWatchlistRender:
     """Выдача списка наблюдения: чего в ней не должно быть видно неправильно."""
 
@@ -294,6 +339,45 @@ class TestWatchlistRender:
         """У ручной записи ранга при входе не было; ноль читался бы как «первый»."""
         text = self.render([self.episode(rank_at_entry=None, entered_by="manual")])
         assert "—→3" in text
+
+    def test_a_frozen_scan_is_named_in_the_row(self):
+        """Строка от 08.09 не должна читаться как сегодняшняя (замер 14.09.2026)."""
+        scan = {
+            "symbol": "BTCUSDT", "price": 90123.45, "narrow_bars": 18,
+            "closed_through_ms": self.NOW - 6 * 86_400_000,
+        }
+        text = self.render(
+            [self.episode(tf="1d")], {("BTCUSDT", "1d"): scan}
+        )
+
+        assert "данные от" in text
+        assert "6.0 сут назад" in text
+
+    def test_a_frozen_scan_does_not_fake_a_flat_move(self):
+        """У AIOTUSDT цена скана равнялась цене входа, и выдача печатала +0.0%.
+
+        Фактически монета прошла +19.7%: цена скана замёрзла вместе со
+        строкой, а колонка «сейчас» выдавала её за текущую.
+        """
+        scan = {
+            "symbol": "BTCUSDT", "price": 90123.45,
+            "closed_through_ms": self.NOW - 6 * 86_400_000,
+        }
+        text = self.render(
+            [self.episode(tf="1d")], {("BTCUSDT", "1d"): scan}
+        )
+
+        assert "+0.0%" not in text
+        assert "n/a" in text
+
+    def test_a_fresh_scan_is_not_marked(self):
+        scan = {
+            "symbol": "BTCUSDT", "price": 90123.45, "narrow_bars": 18,
+            "closed_through_ms": self.NOW - self.H4,
+        }
+        text = self.render([self.episode()], {("BTCUSDT", "4h"): scan})
+
+        assert "данные от" not in text
 
     def test_accumulation_prints_na_while_not_measured(self):
         """Пусто в колонке — «не измерено», а не «признака нет»."""

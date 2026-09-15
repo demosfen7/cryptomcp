@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from cryptomcp.analysis import TimeframeView
-from cryptomcp.errors import ErrorKind, unknown_symbol
+from cryptomcp.errors import ErrorKind, symbol_closed, unknown_symbol
 from cryptomcp.fetcher import pages_needed
 from cryptomcp.indicators import Metric
 from cryptomcp.journal import Journal
@@ -161,6 +161,36 @@ class TestUnknownSymbolPointsAtTheOtherMarket:
 
     def test_futures_error_suggests_spot(self):
         assert "market='spot'" in unknown_symbol("XXXUSDT", "futures").message
+
+
+class TestClosedContractIsNotRetried:
+    """Замер 14.09.2026: get_market_snapshot(STORJUSDT, futures) отдавал сырое
+    «Symbol is on delivering or delivered or settling or closed or pre-trading»
+    с retryable=true — то есть приглашал повторять запрос к расчитанному
+    контракту до упора."""
+
+    def test_kind_is_its_own(self):
+        error = symbol_closed("STORJUSDT", "futures", "Symbol is on delivering")
+        assert error.kind is ErrorKind.SYMBOL_CLOSED
+
+    def test_not_retryable(self):
+        assert not symbol_closed("STORJUSDT", "futures", "closed").retryable
+
+    def test_points_at_the_other_market(self):
+        message = symbol_closed("STORJUSDT", "futures", "closed").message
+        assert "market='spot'" in message
+
+    def test_keeps_the_exchange_wording(self):
+        """Своими словами, но без потери оригинала: по нему ищут в поддержке."""
+        assert "Symbol is on delivering" in symbol_closed(
+            "STORJUSDT", "futures", "Symbol is on delivering"
+        ).message
+
+    def test_client_maps_the_code(self):
+        from cryptomcp.client import _CLOSED_SYMBOL_CODES
+
+        assert -4108 in _CLOSED_SYMBOL_CODES
+        assert -1121 not in _CLOSED_SYMBOL_CODES
 
 
 class TestSpotRendering:

@@ -33,6 +33,7 @@ from .client import BinanceClient
 from .collector import merge_manual, watchlist_view
 from .config import Config
 from .derivatives import DerivativesReader
+from .distribution import analyse
 from .errors import ErrorKind, ToolError, bad_params
 from .fetcher import CandleFetcher
 from .indicators import MIN_PERCENTILE_SPAN_DAYS, atr
@@ -44,6 +45,7 @@ from .render import (
     closed_through,
     render_absorption,
     render_derivatives,
+    render_distribution,
     render_klines,
     render_levels,
     render_pivots,
@@ -394,10 +396,14 @@ async def get_squeeze_metrics(
         absorption_block = await _absorption(
             fetcher, info.symbol, interval, as_of_ms
         )
+        distribution_block = await _distribution(
+            fetcher, info.symbol, interval, as_of_ms
+        )
         return (
             f"{info.symbol}{mkt.suffix} ({mkt.label})\n\n"
             + render_squeeze_metrics(view)
             + absorption_block
+            + distribution_block
         )
     except ToolError as error:
         return _fail(error)
@@ -703,10 +709,10 @@ async def _scan_screen(
             continue
         allowed.add(symbol)
 
+    now_ms = await client.now_ms()
     con = _archive()
     try:
         if min_age_days is not None:
-            now_ms = await client.now_ms()
             edge = now_ms - min_age_days * 86_400_000
             listed = storage.listing_dates(con, mkt.name)
             allowed = {
@@ -719,8 +725,9 @@ async def _scan_screen(
             matched = storage.screen_scan(
                 con, interval, allowed=allowed, exclude=exclude,
                 min_narrow_bars=min_narrow_bars, sort_by=sort_by,
+                fresh_as_of_ms=now_ms,
             )
-            logged = len(storage.latest_scan(con, interval))
+            logged = len(storage.latest_scan(con, interval, fresh_as_of_ms=now_ms))
             blocks.append(render_screen(
                 interval, matched[:limit], version=SQUEEZE_FORMULA_VERSION,
                 sort_by=sort_by, filtered=passed, logged=logged,
@@ -892,6 +899,27 @@ async def _absorption(
 
     atr_values = atr(series.high, series.low, series.close, 14)
     return render_absorption(absorption(series, atr_values))
+
+
+async def _distribution(
+    fetcher: ArchiveReader, symbol: str, interval: str, as_of_ms: int | None
+) -> str:
+    """Раздел распределения — по СВОЕМУ таймфрейму, а не по младшему.
+
+    В отличие от поглощения, детектор работает на том же ряду, что и сжатие:
+    он отвечает на вопрос о структуре максимумов за окно, а её дневное
+    разрешение не стирает — в отличие от набора внутри свечи.
+    """
+    try:
+        series = await fetcher.get(
+            symbol, interval, as_of_ms=as_of_ms, min_candles=MIN_CANDLES,
+            target_span_days=_target_span(interval),
+        )
+    except ToolError as error:
+        return render_distribution(None, skipped=skip_label(error))
+
+    atr_values = atr(series.high, series.low, series.close, 14)
+    return render_distribution(analyse(series, atr_values))
 
 
 def _archive() -> sqlite3.Connection:

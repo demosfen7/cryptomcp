@@ -83,9 +83,29 @@ def tradingview_url(
 
 
 def _head(entry: dict) -> str:
-    """Начало строки: ссылка, таймфрейм, рынок."""
+    """Начало строки: тикер хэштегом, таймфрейм, рынок.
+
+    Хэштег, а не ссылка: нажатие на него в Telegram показывает ВСЕ сообщения
+    канала с этой монетой, то есть всю её историю входов, подтверждений и
+    выходов одним касанием. Ссылка на график из строки не исчезает — она
+    уезжает в конец отдельным словом, потому что тикер может быть либо
+    хэштегом, либо ссылкой, но не тем и другим сразу: обёрнутый в тег <a>
+    хэштег перестаёт быть хэштегом.
+    """
     tf, market = entry.get("tf"), entry.get("market")
-    return f"{_link(entry['symbol'], tf, market)} {tf} {market_short(market)}"
+    return f"{_tag(entry['symbol'])} {tf} {market_short(market)}"
+
+
+def _tag(symbol: str) -> str:
+    """Тикер хэштегом для поиска по каналу."""
+    return f"#{html.escape(str(symbol))}"
+
+
+def _chart(entry: dict) -> str:
+    """Ссылка на график отдельным словом в конце строки."""
+    return " · " + _link(
+        entry["symbol"], entry.get("tf"), entry.get("market"), label="график"
+    )
 
 
 def _squeeze(entry: dict) -> str:
@@ -102,11 +122,17 @@ def _squeeze(entry: dict) -> str:
     return f" · узк {bars} ({days:.1f} сут)"
 
 
-def _link(symbol: str, tf: str | None = None, market: str | None = None) -> str:
-    """Символ как ссылка на график. Экранируется и текст, и адрес."""
+def _link(
+    symbol: str,
+    tf: str | None = None,
+    market: str | None = None,
+    *,
+    label: str | None = None,
+) -> str:
+    """Ссылка на график. Экранируется и текст, и адрес."""
     return (
         f'<a href="{html.escape(tradingview_url(symbol, tf, market), quote=True)}">'
-        f"{html.escape(str(symbol))}</a>"
+        f"{html.escape(str(label or symbol))}</a>"
     )
 
 
@@ -209,10 +235,14 @@ def render_watchlist_delta(
     Записи дельты — словари: полей стало пять, и позиционное чтение кортежа
     на пятом поле ошибается молча.
 
-    Символ — ссылка на график TradingView в том же таймфрейме и на том же
-    рынке, на которых он попал в список: иначе между «пришло уведомление» и
-    «вижу свечи» стоит ручной поиск тикера, а в момент входа ценна как раз
-    скорость. Рынок печатается и словом — «перп» или «спот»: на HOMEUSDT ряды
+    Тикер — хэштег: нажатие собирает по каналу все сообщения об этой монете,
+    то есть её историю входов и выходов. Ссылка на график TradingView в том же
+    таймфрейме и на том же рынке стоит в конце строки словом «график»: иначе
+    между «пришло уведомление» и «вижу свечи» стоит ручной поиск тикера, а в
+    момент входа ценна как раз скорость. Одним элементом обе роли не
+    закрываются — хэштег внутри тега <a> перестаёт быть хэштегом.
+
+    Рынок печатается и словом — «перп» или «спот»: на HOMEUSDT ряды
     разошлись вдвое (узк 17 против 36), и молча выдавать один за другой
     нельзя. Результат — HTML, и уходит он только через `Telegram.send` с
     parse_mode=HTML.
@@ -229,14 +259,21 @@ def render_watchlist_delta(
     lines = [f"Список наблюдения · {stamp} UTC"]
     if entered:
         lines.append(f"\nВошли ({len(entered)})")
-        lines += [f"  + {_head(e)} · ранг {e['rank']}{_squeeze(e)}" for e in entered]
+        lines += [
+            f"  + {_head(e)} · ранг {e['rank']}{_squeeze(e)}{_chart(e)}"
+            for e in entered
+        ]
     if promoted:
         lines.append(f"\nПодтверждены ({len(promoted)})")
-        lines += [f"  ↑ {_head(e)} · ранг {e['rank']}{_squeeze(e)}" for e in promoted]
+        lines += [
+            f"  ↑ {_head(e)} · ранг {e['rank']}{_squeeze(e)}{_chart(e)}"
+            for e in promoted
+        ]
     if exited:
         lines.append(f"\nВышли ({len(exited)})")
         lines += [
-            f"  − {_head(e)} · {html.escape(str(e['reason']))}" for e in exited
+            f"  − {_head(e)} · {html.escape(str(e['reason']))}{_chart(e)}"
+            for e in exited
         ]
     return "\n".join(lines)
 
