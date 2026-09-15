@@ -257,6 +257,55 @@ class TestSkippedTimeframes:
         assert "недоступные ТФ" not in text
 
 
+class TestVersionBumpIsExplained:
+    """Час после подъёма версии выдача выглядит сломанной, но не сломана.
+
+    Колонки скана пусты у ВСЕХ строк разом: записи текущего поколения ещё не
+    написаны, а прежние с ним не сравниваются. Та же подсказка уже стоит в
+    scan_pairs; без неё отличить переход от поломки снаружи нельзя.
+    """
+
+    NOW = 1_788_393_600_000
+
+    def episode(self):
+        return {
+            "symbol": "BTCUSDT", "tf": "1d", "status": "active",
+            "entered_at": self.NOW - 86_400_000, "entered_by": "scanner",
+            "squeeze_index": 0.4, "accumulation_score": None,
+            "rank_at_entry": 7, "price_at_entry": 90123.45,
+            "last_rank": 3, "last_index": 0.47,
+            "exited_at": None, "exit_reason": None,
+        }
+
+    def test_empty_scans_with_earlier_versions_are_explained(self):
+        from cryptomcp.render import render_watchlist
+
+        text = render_watchlist(
+            [self.episode()], {}, now_ms=self.NOW,
+            earlier=["v6"], version="v7",
+        )
+        assert "колонки скана пусты не из-за сбоя" in text
+        assert "v6" in text and "v7" in text
+
+    def test_nothing_is_said_when_scans_are_there(self):
+        from cryptomcp.render import render_watchlist
+
+        scan = {"symbol": "BTCUSDT", "price": 90123.45, "narrow_bars": 11,
+                "closed_through_ms": self.NOW - 3_600_000}
+        text = render_watchlist(
+            [self.episode()], {("BTCUSDT", "1d"): scan}, now_ms=self.NOW,
+            earlier=["v6"], version="v7",
+        )
+        assert "колонки скана пусты" not in text
+
+    def test_nothing_is_said_without_earlier_generations(self):
+        """Пустой журнал без прежних поколений — это другое, и лечится другим."""
+        from cryptomcp.render import render_watchlist
+
+        text = render_watchlist([self.episode()], {}, now_ms=self.NOW)
+        assert "колонки скана пусты" not in text
+
+
 class TestStaleArchiveIsNamed:
     """Замер 14.09.2026: STORJUSDT (спот) печатал живую цену и рядом
     «закрыты по 1d 09-03 03:00». Архив оборвался одиннадцатью сутками раньше,

@@ -30,7 +30,7 @@ import statistics
 import time
 from typing import Any
 
-from . import SQUEEZE_FORMULA_VERSION, distribution, manual, render, storage
+from . import SQUEEZE_FORMULA_VERSION, distribution, flow, manual, render, storage
 from .analysis import MIN_CANDLES, analyse_timeframe, required_candles
 from .client import BinanceClient
 from .config import Config
@@ -629,8 +629,32 @@ def accumulation_context(
     return context
 
 
-def _distribution_row(detector: distribution.Detector) -> dict[str, Any]:
-    """Обе стороны детектора колонками журнала.
+def _flow_row(series: Any) -> dict[str, Any]:
+    """Поток тейкеров колонками журнала (SPEC-flow-and-absorption-v2 §9).
+
+    Окно 30 — основное; 60 и 90 печатаются в выдаче, но в журнал не идут:
+    вопрос «не окажется ли окно 30 слишком коротким» ТЗ само выносит в
+    калибровку (§12), а для неё хватает одного окна плюс исходов.
+    """
+    data = flow.flow(series, 30)
+    ratio = flow.vol_ratio(series)
+    row: dict[str, Any] = {"vol_ratio_12_30": _round(ratio.value, 4)}
+    if data is None:
+        return row
+    row.update(
+        delta_sum_30=_round(data.delta_sum, 2),
+        delta_share_30=_round(data.delta_share, 4),
+        delta_slope=_round(data.delta_slope, 6),
+        delta_quadrant=data.quadrant,
+        absorption_ratio=_round(data.absorption_ratio, 3),
+    )
+    return row
+
+
+def _distribution_row(
+    detector: distribution.Detector, stream: dict[str, Any]
+) -> dict[str, Any]:
+    """Детектор и поток колонками журнала.
 
     Пишется с первого дня по той же причине, что и признаки набора: через два
     месяца вопрос будет не «работает ли детектор», а «на каких порогах он
@@ -639,6 +663,7 @@ def _distribution_row(detector: distribution.Detector) -> dict[str, Any]:
     """
     dist, absorp = detector.distribution, detector.accumulation
     return {
+        **stream,
         "dist_events": dist.count,
         "dist_slope": _round(dist.slope, 8),
         "dist_drop": _round(dist.shift_atr, 3),
@@ -692,7 +717,7 @@ def run_scan(con: sqlite3.Connection) -> int:
                 con, symbol, source, view,
                 formula_version=SQUEEZE_FORMULA_VERSION,
                 accumulation=accumulation.get(symbol) if tf != ACCUMULATION_TF else None,
-                distribution=_distribution_row(detector),
+                distribution=_distribution_row(detector, _flow_row(series)),
             ):
                 written += 1
     con.commit()
@@ -1384,8 +1409,15 @@ def watchlist_view(
         for timeframe in {row["tf"] for row in rows}
         for scan in storage.latest_scan(con, timeframe)
     }
+    timeframes = {row["tf"] for row in rows}
+    earlier = sorted({
+        version
+        for timeframe in timeframes
+        for version in storage.earlier_versions(con, timeframe)
+    })
     return render.render_watchlist(
-        rows[:limit], scans, now_ms=stamp, prices=prices
+        rows[:limit], scans, now_ms=stamp, prices=prices,
+        earlier=earlier, version=SQUEEZE_FORMULA_VERSION,
     )
 
 

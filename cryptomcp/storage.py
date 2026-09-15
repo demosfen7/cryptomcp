@@ -164,7 +164,18 @@ CREATE TABLE IF NOT EXISTS scan_log (
     absorp_events     INTEGER,
     absorp_slope      REAL,
     absorp_rise       REAL,
-    absorp_verdict    TEXT
+    absorp_verdict    TEXT,
+    -- Поток тейкеров (SPEC-flow-and-absorption-v2 §9). Считается на СВОЁМ
+    -- ряду записи; события поглощения — на младшем, как и признаки набора.
+    delta_sum_30      REAL,
+    delta_share_30    REAL,
+    delta_slope       REAL,
+    delta_quadrant    TEXT,
+    absorption_ratio  REAL,
+    vol_ratio_12_30   REAL,
+    -- ТЗ называет эту колонку absorp_events, но это имя уже занято зеркалом
+    -- детектора распределения и означает другое. Здесь — бары поглощения §5.
+    absorp_bars       INTEGER
 );
 
 -- Одна строка на закрытую свечу И версию формулы. Сканер ходит раз в час, а
@@ -250,6 +261,8 @@ ACCUMULATION_COLUMNS = frozenset({
 DISTRIBUTION_COLUMNS = frozenset({
     "dist_events", "dist_slope", "dist_drop", "dist_verdict",
     "absorp_events", "absorp_slope", "absorp_rise", "absorp_verdict",
+    "delta_sum_30", "delta_share_30", "delta_slope", "delta_quadrant",
+    "absorption_ratio", "vol_ratio_12_30", "absorp_bars",
 })
 
 #: Колонки derivatives, кроме ключа. Порядок фиксирован: по нему строится upsert.
@@ -322,6 +335,13 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("scan_log", "absorp_slope", "REAL"),
     ("scan_log", "absorp_rise", "REAL"),
     ("scan_log", "absorp_verdict", "TEXT"),
+    ("scan_log", "delta_sum_30", "REAL"),
+    ("scan_log", "delta_share_30", "REAL"),
+    ("scan_log", "delta_slope", "REAL"),
+    ("scan_log", "delta_quadrant", "TEXT"),
+    ("scan_log", "absorption_ratio", "REAL"),
+    ("scan_log", "vol_ratio_12_30", "REAL"),
+    ("scan_log", "absorp_bars", "INTEGER"),
 )
 
 

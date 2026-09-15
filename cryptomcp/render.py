@@ -28,6 +28,16 @@ from .distribution import (
 )
 from .distribution import Detector, Sided
 from .errors import ErrorKind, ToolError
+from .flow import (
+    EVENT_BODY as FLOW_EVENT_BODY,
+)
+from .flow import (
+    EVENT_VOLUME as FLOW_EVENT_VOLUME,
+)
+from .flow import (
+    EVENT_WICK as FLOW_EVENT_WICK,
+)
+from .flow import AbsorptionEvent, Flow, VolRatio
 from .indicators import Metric
 from .levels import Level, Pivots
 from .markets import FUTURES, Market, market_short
@@ -415,8 +425,15 @@ def render_derivatives(
     return "\n".join(lines)
 
 
-def render_squeeze_metrics(view: TimeframeView) -> str:
-    """Уровень L2: пять групп признаков ТЗ §4.2 с базой сравнения."""
+def render_squeeze_metrics(view: TimeframeView, flow_block: str = "") -> str:
+    """Уровень L2: пять групп признаков ТЗ §4.2 с базой сравнения.
+
+    ``flow_block`` — разделы 2.1 и 2.2 (поток тейкеров и события поглощения).
+    Приходит готовым текстом и встаёт СРАЗУ ПОСЛЕ группы объёма, а не в конец:
+    нумерация 2.1 обещает читателю, что это уточнение второй группы, и
+    поставить её после пятой значило бы обмануть нумерацию. Текст собирается
+    снаружи, потому что события ищутся на ДРУГОМ ряду — младшем.
+    """
     volume = view.volume
     lines = [
         f"{view.interval} · свечи закрыты по {closed_through(view)} UTC",
@@ -452,6 +469,7 @@ def render_squeeze_metrics(view: TimeframeView) -> str:
             f" ({volume.taker_buy_quote_total / volume.quote_total * 100:.0f}%)"
             if volume.quote_total else ""
         ),
+        *([flow_block.strip(chr(10))] if flow_block else []),
         "",
         "3. Диапазон",
         f"   ширина(20)       {view.range_width * 100:.2f}% = "
@@ -715,6 +733,8 @@ def render_watchlist(
     *,
     now_ms: int,
     prices: dict[str, float] | None = None,
+    earlier: Sequence[str] = (),
+    version: str = "",
 ) -> str:
     """Список наблюдения столбиком.
 
@@ -812,6 +832,20 @@ def render_watchlist(
     ]
     if notes:
         lines += ["", "заметки к ручным записям:"] + notes
+
+    # Час после подъёма версии выдача выглядит сломанной: узк, сут и «сейчас»
+    # пусты у ВСЕХ строк разом, потому что записи текущего поколения ещё не
+    # написаны, а прежние с ним не сравниваются. Ровно та же подсказка уже
+    # стоит в scan_pairs; без неё отличить переход от поломки снаружи нельзя.
+    if not scans and earlier:
+        lines += [
+            "",
+            f"колонки скана пусты не из-за сбоя: формула поднята до {version}, "
+            f"а записи в журнале пока только прежних поколений "
+            f"({', '.join(earlier)}). Поколения между собой не сравниваются, "
+            f"журнал наполняется заново — первые числа появятся с ближайшим "
+            f"часовым прогоном сканера.",
+        ]
 
     lines += [
         "",
@@ -1076,6 +1110,136 @@ def _shift(side: Sided) -> str:
     first, last = side.events[0].extreme, side.events[-1].extreme
     pct = (last / first - 1) * 100 if first else float("nan")
     return f"{pct:+.1f}% = {abs(side.shift_atr):.1f} ATR"
+
+
+def render_flow(
+    windows: Sequence[Flow],
+    volume_ratio: VolRatio | None = None,
+    *,
+    narrow_bars: int = 0,
+    skipped: str | None = None,
+) -> str:
+    """Раздел 2.1: накопленный поток тейкеров (SPEC-flow-and-absorption-v2 §10).
+
+    Печатаются все окна сразу: разворот потока виден только на их сравнении —
+    у AGLD окно 30 давало поглощение, а окно 90 распределение, и одно окно
+    ответило бы половину вопроса.
+
+    **Флаг ставится только при сжатии.** Это не осторожность, а следствие
+    замера: на росте ASTER +30% 19–22.08.2026 доля тейкер-покупок была ниже
+    нейтрали все дни, дельта за окно отрицательная при цене +30%, то есть
+    формально первый квадрант. Накоплением это не было.
+    """
+    if skipped is not None or not windows:
+        return f"\n\n2.1. Поток тейкеров накопленный\n   n/a — {skipped or 'истории меньше окна'}"
+
+    first = windows[0]
+    share = first.buy_sum / first.turnover_sum * 100 if first.turnover_sum else float("nan")
+    flag = "  ⚑" if first.flagged and narrow_bars > 0 else ""
+    lines = [
+        "\n\n2.1. Поток тейкеров накопленный",
+        f"     окно {first.window:<13} оборот {usdt(first.turnover_sum)} · "
+        f"куплено {usdt(first.buy_sum)} ({share:.1f}%)",
+        f"     дельта             {usdt(first.delta_sum)} USDT = "
+        f"{first.delta_share:+.1f}% оборота",
+        f"     цена за окно       {first.price_change:+.1f}%",
+        f"     квадрант           {_quadrant_line(first)}{flag}",
+        f"     absorption_ratio   {_ratio_line(first)}",
+        f"     наклон             {_flow_slope(first)}",
+    ]
+    for other in windows[1:]:
+        lines.append(
+            f"     окно {other.window:<13} дельта {usdt(other.delta_sum)} = "
+            f"{other.delta_share:+.1f}% · цена {other.price_change:+.1f}% · "
+            f"{other.quadrant}"
+        )
+    if volume_ratio is not None:
+        lines.append(f"     расширение объёма  {_vol_ratio_line(volume_ratio)}")
+    lines.append(
+        f"     потолок набора     {usdt(first.buy_sum)} — столько куплено по "
+        f"рынку ВСЕМИ за окно"
+    )
+    if first.flagged and narrow_bars == 0:
+        lines.append(
+            "     флага нет: узк 0. Вне сжатия первый квадрант не признак — "
+            "на росте ASTER +30% он стоял все четыре дня"
+        )
+    return "\n".join(lines)
+
+
+def _quadrant_line(data: Flow) -> str:
+    """Квадрант словами: знак дельги сам по себе ничего не говорит."""
+    explain = {
+        "поглощение": "продают в рынок, цена растёт",
+        "обычный спрос": "тейкеры сами двигают цену",
+        "обычный выход": "поглощать некому",
+        "распределение": "покупают в рынок, цену продавливают лимитом",
+    }
+    label = data.quadrant.upper() if data.flagged else data.quadrant
+    return f"{label}: {explain.get(data.quadrant, '')}"
+
+
+def _ratio_line(data: Flow) -> str:
+    """Отношение хода цены к доле потока — с оговоркой или с причиной."""
+    if data.absorption_ratio is None:
+        return f"n/a — {data.ratio_note}"
+    meaning = (
+        "цена против потока" if data.absorption_ratio < 0
+        else "цену двигают дёшево" if abs(data.absorption_ratio) < 1
+        else "цена сопротивляется потоку"
+    )
+    note = f" · {data.ratio_note}" if data.ratio_note else ""
+    return f"{data.absorption_ratio:+.1f} ({meaning}){note}"
+
+
+def _flow_slope(data: Flow) -> str:
+    if data.delta_slope is None:
+        return "n/a"
+    word = "отрицательный" if data.delta_slope < 0 else "положительный"
+    return f"{word}, {data.delta_slope:+.3f} оборота свечи за свечу"
+
+
+def _vol_ratio_line(data: VolRatio) -> str:
+    if data.value is None:
+        return f"n/a — {data.reason}"
+    return f"vol_ratio {data.recent}/{data.previous} = {data.value:.2f}x"
+
+
+def render_absorption_events(
+    events: Sequence[AbsorptionEvent],
+    *,
+    interval: str,
+    window: int,
+    mirror: Sequence[AbsorptionEvent] = (),
+) -> str:
+    """Раздел 2.2: одиночные бары поглощения (§5).
+
+    Исключение из правила «считать кластеры, а не бары», и оно кодифицировано:
+    бар на 5x к сезонной базе с фитилём от 0.8 диапазона и телом до 15% — это
+    не новость и не вынос стопов. У выноса тело большое и закрытие у края.
+    """
+    lines = [
+        f"\n\n2.2. События поглощения (ряд {interval}, окно {candles(window)})"
+    ]
+    if not events:
+        lines.append(
+            f"     баров поглощения нет (нужен объём ≥{FLOW_EVENT_VOLUME:.0f}x "
+            f"при нижнем фитиле ≥{FLOW_EVENT_WICK * 100:.0f}% и теле "
+            f"≤{FLOW_EVENT_BODY * 100:.0f}% диапазона)"
+        )
+    for event in events:
+        when = dt.datetime.fromtimestamp(event.ts_ms / 1000, dt.UTC)
+        lines.append(
+            f"     {when:%d.%m %H:%M}        объём {event.volume_ratio:.2f}x · "
+            f"нижний фитиль {event.wick * 100:.0f}% · "
+            f"тело {event.body * 100:.0f}% диапазона"
+        )
+    lines.append(f"     зеркало            баров раздачи: {len(mirror)}")
+    lines.append(
+        "     событие само по себе вердиктом не является и монету с "
+        "наблюдения не снимает"
+    )
+    return "\n".join(lines)
 
 
 def render_screen(

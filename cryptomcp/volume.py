@@ -330,6 +330,23 @@ CLUSTER_MIN_BARS = 3
 CLUSTER_VOLUME_MULTIPLE = 1.5
 CLUSTER_BODY_FRACTION = 0.4
 
+#: Перцентиль СОБСТВЕННОГО объёма монеты, с которого свеча считается
+#: повышенной по объёму внутри кластера (SPEC-flow-and-absorption-v2 §4).
+#:
+#: Абсолютный множитель 1.5x на тонкой монете отсекает настоящие кластеры:
+#: ANKR 1h 18.08.2026 04:00–09:00 — takerB 0.63 · 0.59 · 0.63 · 0.42 · 0.58 ·
+#: 0.63, пять часов из шести выше 0.55, ход цены за шесть часов +1.06%, но
+#: объёмы 1.59x · 1.34x · 0.95x · 1.03x · 1.26x · 1.48x, и до 1.5x дотянули
+#: два часа из шести. При обороте 500K в сутки порог 1.5x означает требование
+#: к абсолютной величине (25K в час), а не к относительной.
+#:
+#: Ровно та же замена, что уже сделана для ширины диапазона, когда абсолютные
+#: пороги 6–8% не срабатывали ни у кого.
+CLUSTER_VOLUME_PERCENTILE = 60.0
+
+#: Сколько суток собственной истории берётся под этот перцентиль.
+CLUSTER_PERCENTILE_DAYS = 30
+
 #: Итоговый ход цены за кластер. Максимум из двух по той же причине, что и у
 #: тела одиночного бара: доля цены не должна исчезать вместе с волатильностью.
 #: Цена мягкости замерена: только с абсолютными 0.5% кластер находится у 2
@@ -459,8 +476,31 @@ def wick_streak(series: Series, *, window: int) -> int:
     return best
 
 
+def _cluster_volume_threshold(
+    series: Series, volume_multiple: float | None, percentile: float | None
+) -> np.ndarray:
+    """Порог объёма на каждую свечу ряда: перцентиль истории или множитель.
+
+    Перцентиль берётся по окну в 30 суток, а не по всему ряду: активность
+    монеты дрейфует, и порог, посчитанный по годовой истории, у ожившей пары
+    оказался бы недостижимым, а у затихшей — достижимым всегда.
+    """
+    volumes = series.quote_volume
+    if percentile is None:
+        return pd.Series(volumes).rolling(20).mean().to_numpy() * volume_multiple
+    span = int(CLUSTER_PERCENTILE_DAYS * 86_400_000 / interval_ms(series.interval))
+    window = max(20, min(span, len(volumes)))
+    level = float(np.nanpercentile(volumes[-window:], percentile))
+    return np.full(len(volumes), level)
+
+
 def clusters(
-    series: Series, atr_values: np.ndarray, *, window: int
+    series: Series,
+    atr_values: np.ndarray,
+    *,
+    window: int,
+    volume_multiple: float = CLUSTER_VOLUME_MULTIPLE,
+    volume_percentile: float | None = None,
 ) -> tuple[int, int]:
     """Кластеры набора в окне: сколько их и какой самый длинный.
 
@@ -469,14 +509,27 @@ def clusters(
     отличает набор от импульса: три свечи подряд с объёмом 2x бывают и в
     начале движения, но там они сдвигают цену.
 
-    База объёма та же скользящая двадцатка, что у одиночных баров набора:
-    два числа в одном блоке обязаны считаться от одной величины.
+    **Порог объёма остаётся множителем к скользящей двадцатке, а не
+    перцентилем.** §4 ТЗ требует замены, и его довод верен — абсолютный
+    множитель на тонкой монете превращается в требование к обороту. Но
+    предложенный 60-й перцентиль замерен по универсуму 15.09.2026 и меняет
+    признак до неузнаваемости: кластер есть у 163 монет из 433 (37.6%) против
+    17 (3.9%) у множителя. Признак, который есть у трети рынка, не может нести
+    ту информацию, ради которой заведён: по 20 370 исходам кластер давал
+    средний максимум 20.63% против 14.41% по базе, и разбавление до 38%
+    вернуло бы его к фону.
+
+    Редкость множителя воспроизводит 95-й перцентиль (4.4%), а не 60-й.
+    Замена отложена до решения заказчика; перцентиль доступен параметром
+    `volume_percentile`, и обе ветки проверяются приёмочным тестом 5.
     """
     volumes = series.quote_volume
     if len(volumes) < window + 20:
         return 0, 0
 
-    rolling = pd.Series(volumes).rolling(20).mean().to_numpy()
+    threshold = _cluster_volume_threshold(
+        series, volume_multiple, volume_percentile
+    )
     opens, closes, high, low = (
         series.col("open"), series.close, series.high, series.low
     )
@@ -499,11 +552,11 @@ def clusters(
         run.clear()
 
     for i in range(len(volumes) - window, len(volumes)):
-        mean = rolling[i]
+        level = threshold[i]
         span = high[i] - low[i]
         quiet = (
-            not np.isnan(mean) and mean > 0 and span > 0
-            and volumes[i] >= CLUSTER_VOLUME_MULTIPLE * mean
+            not np.isnan(level) and level > 0 and span > 0
+            and volumes[i] >= level
             and abs(closes[i] - opens[i]) / span < CLUSTER_BODY_FRACTION
         )
         if quiet:

@@ -36,6 +36,7 @@ from .derivatives import DerivativesReader
 from .distribution import analyse
 from .errors import ErrorKind, ToolError, bad_params
 from .fetcher import CandleFetcher
+from .flow import absorption_events, flows, vol_ratio
 from .indicators import MIN_PERCENTILE_SPAN_DAYS, atr
 from .journal import Journal
 from .markets import MARKETS, Market
@@ -44,8 +45,10 @@ from .reader import ArchiveReader, archive_path
 from .render import (
     closed_through,
     render_absorption,
+    render_absorption_events,
     render_derivatives,
     render_distribution,
+    render_flow,
     render_klines,
     render_levels,
     render_pivots,
@@ -59,7 +62,7 @@ from .render import (
 )
 from .series import INTERVAL_MS
 from .symbols import SymbolRegistry, format_price
-from .volume import absorption
+from .volume import absorption, absorption_window
 
 #: Максимум сырых свечей на запрос: третий уровень предназначен для чтения
 #: формы, а не для выгрузки истории (PLAN §5).
@@ -399,9 +402,12 @@ async def get_squeeze_metrics(
         distribution_block = await _distribution(
             fetcher, info.symbol, interval, as_of_ms
         )
+        flow_block = await _flow(
+            fetcher, info.symbol, interval, as_of_ms, view=view
+        )
         return (
             f"{info.symbol}{mkt.suffix} ({mkt.label})\n\n"
-            + render_squeeze_metrics(view)
+            + render_squeeze_metrics(view, flow_block)
             + absorption_block
             + distribution_block
         )
@@ -899,6 +905,47 @@ async def _absorption(
 
     atr_values = atr(series.high, series.low, series.close, 14)
     return render_absorption(absorption(series, atr_values))
+
+
+async def _flow(
+    fetcher: ArchiveReader,
+    symbol: str,
+    interval: str,
+    as_of_ms: int | None,
+    *,
+    view: TimeframeView,
+) -> str:
+    """Разделы 2.1 и 2.2: поток на своём ряду, события — на младшем.
+
+    Поток суммируется за 30–90 свечей и набирает статистику там, где
+    отдельная свеча шумит, поэтому порог оборота 2M к нему не применяется
+    (§8). События поглощения — наоборот, считаются по фитилю одной свечи и
+    живут по общим правилам тонкого рынка.
+    """
+    series = await fetcher.get(
+        symbol, interval, as_of_ms=as_of_ms, min_candles=MIN_CANDLES,
+        target_span_days=_target_span(interval),
+    )
+    block = render_flow(
+        flows(series), vol_ratio(series), narrow_bars=view.narrow_bars
+    )
+
+    lower = accumulation_interval(interval)
+    if lower == interval:
+        return block
+    try:
+        younger = await fetcher.get(
+            symbol, lower, as_of_ms=as_of_ms, min_candles=MIN_CANDLES,
+            target_span_days=_target_span(lower),
+        )
+    except ToolError:
+        return block
+    window = absorption_window(lower)
+    return block + render_absorption_events(
+        absorption_events(younger, window=window),
+        interval=lower, window=window,
+        mirror=absorption_events(younger, window=window, side="sell"),
+    )
 
 
 async def _distribution(
