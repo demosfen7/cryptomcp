@@ -186,6 +186,40 @@ class TestAbsorptionEvent:
         assert F.absorption_events(s, window=72, side="buy") == ()
 
 
+class TestFlagNeedsThreeThings:
+    """Флаг ⚑ — утверждение, и оно требует всех трёх условий."""
+
+    def build(self, *, buy_share, last_price, narrow_bars):
+        from cryptomcp.render import render_flow
+
+        bars = flat(29, buy_share=buy_share)
+        bars.append((100.0, last_price, 1000.0, 1000.0 * buy_share))
+        data = F.flow(series(bars), 30)
+        return render_flow([data], narrow_bars=narrow_bars)
+
+    def test_flagged_when_squeezed_and_flow_is_real(self):
+        assert "⚑" in self.build(
+            buy_share=0.4, last_price=120.0, narrow_bars=11
+        )
+
+    def test_no_flag_without_squeeze(self):
+        """Вне сжатия первый квадрант стоял все четыре дня роста ASTER."""
+        text = self.build(buy_share=0.4, last_price=120.0, narrow_bars=0)
+        assert "⚑" not in text
+        assert "узк 0" in text
+
+    def test_no_flag_when_flow_is_noise(self):
+        """HYPERUSDT спот 15.09.2026: дельта −0.1% оборота, флаг стоял.
+
+        Полосу |доля| < 0.5% ТЗ само называет шумом в §2 и отказывается
+        считать на ней absorption_ratio. Вешать на неё вердикт — утверждать
+        больше, чем измерено.
+        """
+        text = self.build(buy_share=0.499, last_price=120.0, narrow_bars=11)
+        assert "⚑" not in text
+        assert "в пределах шума" in text
+
+
 class TestSpecCases:
     """Приёмочные тесты ТЗ на живых данных, 15.09.2026, перпетуал, `as_of_ms`.
 

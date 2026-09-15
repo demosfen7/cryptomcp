@@ -1059,7 +1059,7 @@ def render_distribution(
     lines = [
         f"\n\n7. Распределение (окно {candles(side.window)})",
         f"   события          {side.count} "
-        f"(объём ≥{DIST_VOLUME:.0f}x при верхнем фитиле "
+        f"(объём ≥{DIST_VOLUME:g}x при верхнем фитиле "
         f"≥{DIST_WICK * 100:.0f}% диапазона)",
     ]
     if side.verdict == "n/a":
@@ -1135,7 +1135,13 @@ def render_flow(
 
     first = windows[0]
     share = first.buy_sum / first.turnover_sum * 100 if first.turnover_sum else float("nan")
-    flag = "  ⚑" if first.flagged and narrow_bars > 0 else ""
+    # Флаг требует трёх условий, а не одного. Сжатие — из §9: вне его первый
+    # квадрант стоял все четыре дня роста ASTER на +30%. Поток выше шума — из
+    # §2 того же ТЗ: полосу |доля| < 0.5% оно само называет шумом, и вешать
+    # на неё «ПОГЛОЩЕНИЕ» значит утверждать больше, чем измерено. Замер
+    # 15.09.2026: HYPERUSDT спот, дельта −0.1% оборота, флаг стоял.
+    quiet_flow = first.absorption_ratio is None
+    flag = "  ⚑" if first.flagged and narrow_bars > 0 and not quiet_flow else ""
     lines = [
         "\n\n2.1. Поток тейкеров накопленный",
         f"     окно {first.window:<13} оборот {usdt(first.turnover_sum)} · "
@@ -1163,6 +1169,11 @@ def render_flow(
         lines.append(
             "     флага нет: узк 0. Вне сжатия первый квадрант не признак — "
             "на росте ASTER +30% он стоял все четыре дня"
+        )
+    elif first.flagged and quiet_flow:
+        lines.append(
+            "     флага нет: поток в пределах шума, знак дельты на таких "
+            "величинах не утверждение"
         )
     return "\n".join(lines)
 
