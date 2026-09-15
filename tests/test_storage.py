@@ -687,6 +687,63 @@ class TestMigration:
             con.close()
 
 
+class TestFlowFilters:
+    """Конъюнкция §3.3: один лишь рост объёма отбирает тех, кто уже поехал.
+
+    Документированный кейс UAI: фильтр «объём вырос в 2–3 раза» показал бы
+    монету на вершине, а не в основании. Смысл появляется, когда объём
+    расширился, а цена за то же окно осталась на месте.
+    """
+
+    NOW = 1_788_400_000_000
+
+    def scan(self, con, symbol, *, vol_ratio, change, delta, narrow=10):
+        from cryptomcp import SQUEEZE_FORMULA_VERSION
+
+        con.execute(
+            "INSERT OR REPLACE INTO scan_log (ts_ms, symbol, source, tf, "
+            "formula_version, squeeze_index, price, narrow_bars, "
+            "vol_ratio_12_30, flow_change_30, delta_sum_30, closed_through_ms) "
+            "VALUES (?, ?, 'futures', '4h', ?, 0.5, 100.0, ?, ?, ?, ?, ?)",
+            (self.NOW, symbol, SQUEEZE_FORMULA_VERSION, narrow,
+             vol_ratio, change, delta, self.NOW - 1),
+        )
+        con.commit()
+
+    def universe(self, con):
+        self.scan(con, "НАБОРUSDT", vol_ratio=2.0, change=1.5, delta=-50_000)
+        self.scan(con, "ПОЕХАЛUSDT", vol_ratio=2.0, change=22.0, delta=-50_000)
+        self.scan(con, "ТИХАЯUSDT", vol_ratio=0.6, change=1.0, delta=-50_000)
+        self.scan(con, "СПРОСUSDT", vol_ratio=2.0, change=1.5, delta=+50_000)
+
+    def names(self, rows):
+        return {row["symbol"] for row in rows}
+
+    def test_volume_alone_keeps_the_one_that_already_moved(self, con):
+        self.universe(con)
+        rows = storage.screen_scan(con, "4h", min_vol_ratio=1.5)
+        assert "ПОЕХАЛUSDT" in self.names(rows)
+
+    def test_conjunction_drops_it(self, con):
+        self.universe(con)
+        rows = storage.screen_scan(
+            con, "4h", min_vol_ratio=1.5, max_abs_change_window=5.0,
+            only_negative_delta=True,
+        )
+        assert self.names(rows) == {"НАБОРUSDT"}
+
+    def test_unknown_value_does_not_pass_the_filter(self, con):
+        """У записей прошлых поколений колонок потока нет вовсе, и пускать их
+        по отсутствующему полю значило бы отбирать без основания."""
+        self.scan(con, "СТАРАЯUSDT", vol_ratio=None, change=None, delta=None)
+        rows = storage.screen_scan(con, "4h", min_vol_ratio=1.5)
+        assert "СТАРАЯUSDT" not in self.names(rows)
+
+    def test_filters_are_off_by_default(self, con):
+        self.universe(con)
+        assert len(storage.screen_scan(con, "4h")) == 4
+
+
 class TestScreenScan:
     """Отбор идёт по журналу, а не пересчётом: пересчёт стоил бы запроса
     к бирже за свежим хвостом по каждому символу."""

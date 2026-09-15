@@ -175,7 +175,11 @@ CREATE TABLE IF NOT EXISTS scan_log (
     vol_ratio_12_30   REAL,
     -- ТЗ называет эту колонку absorp_events, но это имя уже занято зеркалом
     -- детектора распределения и означает другое. Здесь — бары поглощения §5.
-    absorp_bars       INTEGER
+    absorp_bars       INTEGER,
+    -- Ход цены за ТО ЖЕ окно, что и дельта. Отдельная колонка, а не
+    -- change_24h_pct: конъюнкция §3.3 требует «объём расширился, а цена за то
+    -- же окно осталась на месте», и сутки тут — другое окно.
+    flow_change_30    REAL
 );
 
 -- Одна строка на закрытую свечу И версию формулы. Сканер ходит раз в час, а
@@ -262,7 +266,7 @@ DISTRIBUTION_COLUMNS = frozenset({
     "dist_events", "dist_slope", "dist_drop", "dist_verdict",
     "absorp_events", "absorp_slope", "absorp_rise", "absorp_verdict",
     "delta_sum_30", "delta_share_30", "delta_slope", "delta_quadrant",
-    "absorption_ratio", "vol_ratio_12_30", "absorp_bars",
+    "absorption_ratio", "vol_ratio_12_30", "absorp_bars", "flow_change_30",
 })
 
 #: Колонки derivatives, кроме ключа. Порядок фиксирован: по нему строится upsert.
@@ -342,6 +346,7 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("scan_log", "absorption_ratio", "REAL"),
     ("scan_log", "vol_ratio_12_30", "REAL"),
     ("scan_log", "absorp_bars", "INTEGER"),
+    ("scan_log", "flow_change_30", "REAL"),
 )
 
 
@@ -772,6 +777,9 @@ def screen_scan(
     allowed: set[str] | None = None,
     exclude: set[str] | None = None,
     min_narrow_bars: int | None = None,
+    min_vol_ratio: float | None = None,
+    max_abs_change_window: float | None = None,
+    only_negative_delta: bool = False,
     sort_by: str = "squeeze",
     formula_version: str | None = None,
     fresh_as_of_ms: int | None = None,
@@ -803,6 +811,27 @@ def screen_scan(
         rows = [row for row in rows if row["symbol"] not in exclude]
     if min_narrow_bars is not None:
         rows = [row for row in rows if (row["narrow_bars"] or 0) >= min_narrow_bars]
+    # Конъюнкция §3.3: фильтр по одному росту объёма отбирает тех, кто уже
+    # поехал — это документированный кейс UAI, где «объём вырос в 2-3 раза»
+    # показал бы монету на вершине, а не в основании. Условия задаются
+    # параметрами, а не собираются глазами по колонкам.
+    if min_vol_ratio is not None:
+        rows = [
+            row for row in rows
+            if row.get("vol_ratio_12_30") is not None
+            and row["vol_ratio_12_30"] >= min_vol_ratio
+        ]
+    if max_abs_change_window is not None:
+        rows = [
+            row for row in rows
+            if row.get("flow_change_30") is not None
+            and abs(row["flow_change_30"]) < max_abs_change_window
+        ]
+    if only_negative_delta:
+        rows = [
+            row for row in rows
+            if row.get("delta_sum_30") is not None and row["delta_sum_30"] < 0
+        ]
 
     if sort_by == "duration":
         rows.sort(key=lambda r: (-(r["narrow_bars"] or 0), -(r["squeeze_index"] or 0)))

@@ -564,7 +564,13 @@ async def get_derivatives(symbol: str, as_of_ms: int | None = None) -> str:
         "бирже, до 100 пар, любой ТФ: нужен для монет вне "
         "архива или когда важна свежесть, а не охват. Фильтры: оборот, возраст "
         "листинга, максимальное движение за сутки (монета в движении — не "
-        "кандидат на накопление), длительность сжатия, исключения. Сортировка: "
+        "кандидат на накопление), длительность сжатия, исключения. Поток "
+        "тейкеров задаётся тремя параметрами и работает КОНЪЮНКЦИЕЙ, а не по "
+        "отдельности: min_vol_ratio (объём последних 12 свечей к предыдущим "
+        "30), max_abs_change_window (ход цены за то же окно) и "
+        "only_negative_delta. Один лишь рост объёма отбирает тех, кто уже "
+        "поехал; смысл появляется, когда объём расширился, а цена осталась на "
+        "месте. Сортировка: "
         "squeeze, duration, accumulation. Несколько таймфреймов за вызов: "
         "timeframes списком, либо timeframe одним значением."
     )
@@ -580,6 +586,9 @@ async def scan_pairs(
     max_abs_change_24h: float | None = None,
     exclude: list[str] | None = None,
     min_narrow_bars: int | None = None,
+    min_vol_ratio: float | None = None,
+    max_abs_change_window: float | None = None,
+    only_negative_delta: bool = False,
     sort_by: str = "squeeze",
     limit: int = 20,
     market: str = "futures",
@@ -608,6 +617,9 @@ async def scan_pairs(
             max_abs_change_24h=max_abs_change_24h,
             exclude={s.upper() for s in exclude} if exclude else None,
             min_narrow_bars=min_narrow_bars,
+            min_vol_ratio=min_vol_ratio,
+            max_abs_change_window=max_abs_change_window,
+            only_negative_delta=only_negative_delta,
             sort_by=sort_by,
             limit=max(1, min(limit, 100)),
             market=market,
@@ -682,6 +694,9 @@ async def _scan_screen(
     max_abs_change_24h: float | None,
     exclude: set[str] | None,
     min_narrow_bars: int | None,
+    min_vol_ratio: float | None = None,
+    max_abs_change_window: float | None = None,
+    only_negative_delta: bool = False,
     sort_by: str,
     limit: int,
     market: str,
@@ -731,6 +746,9 @@ async def _scan_screen(
             matched = storage.screen_scan(
                 con, interval, allowed=allowed, exclude=exclude,
                 min_narrow_bars=min_narrow_bars, sort_by=sort_by,
+                min_vol_ratio=min_vol_ratio,
+                max_abs_change_window=max_abs_change_window,
+                only_negative_delta=only_negative_delta,
                 fresh_as_of_ms=now_ms,
             )
             logged = len(storage.latest_scan(con, interval, fresh_as_of_ms=now_ms))

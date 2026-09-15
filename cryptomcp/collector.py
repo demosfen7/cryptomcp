@@ -647,6 +647,7 @@ def _flow_row(series: Any) -> dict[str, Any]:
         delta_slope=_round(data.delta_slope, 6),
         delta_quadrant=data.quadrant,
         absorption_ratio=_round(data.absorption_ratio, 3),
+        flow_change_30=_round(data.price_change, 4),
     )
     return row
 
