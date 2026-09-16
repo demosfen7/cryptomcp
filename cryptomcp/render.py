@@ -42,6 +42,11 @@ from .indicators import Metric
 from .levels import Level, Pivots
 from .markets import FUTURES, Market, market_short
 from .orderbook import OrderBook
+from .orderbook_watch import (
+    LONG_LIVED_FRACTION,
+    NEAR_PRICE_PCT,
+    VANISHED_BEFORE_TOUCH_SNAPSHOTS,
+)
 from .series import Series, is_stale, series_age_ms
 from .storage import scan_age_ms, scan_is_fresh
 from .symbols import SymbolInfo, format_price
@@ -180,6 +185,177 @@ def _render_book_level(level: Any, precision: int) -> str:
         f"  {format_price(level.price, precision)} · qty {level.qty:g} · "
         f"notional {usdt(level.notional_usdt)} · cum {usdt(level.cum_notional_usdt)}"
     )
+
+
+def render_order_book_watches(watches: Sequence[Mapping[str, Any]], *, now_ms: int) -> str:
+    """Короткий список временных сессий с явной отметкой молчащего тикера."""
+    if not watches:
+        return "Сессий наблюдения за стаканом нет."
+    lines = ["Сессии наблюдения за стаканом:"]
+    for row in watches:
+        status = _watch_status(row, now_ms)
+        remaining = max(0, int((int(row["ends_at"]) - now_ms) / 60_000))
+        estimated_kb = int(row["snapshot_count"]) * 9
+        lines.append(
+            f"{row['watch_id']} · {row['symbol']} ({row['market']}) · "
+            f"интервал {row['interval_sec']}с · осталось {remaining} мин · {status}\n"
+            f"  снимков {row['snapshot_count']}, ошибок {row['error_count']} · "
+            f"занято примерно {estimated_kb}K"
+        )
+    return "\n".join(lines)
+
+
+def render_order_book_watch_data(
+    watch: Mapping[str, Any],
+    snapshots: Sequence[Mapping[str, Any]],
+    events: Sequence[Mapping[str, Any]],
+    *,
+    format: str,
+    now_ms: int,
+) -> str:
+    """Сырые снимки и записанный при тике diff плюс сводка B.7."""
+    head = (
+        f"Сессия {watch['watch_id']}, {watch['symbol']} ({watch['market']}) · "
+        f"интервал {watch['interval_sec']}с · длительность {watch['duration_min']} мин\n"
+        f"Начало {utc(int(watch['started_at']))} UTC · статус {_watch_status(watch, now_ms)} "
+        f"· снимков {len(snapshots)}"
+    )
+    lines = [head, "", _watch_summary(watch, snapshots, events)]
+    if format in {"raw", "both"}:
+        lines += ["", "Сырые снимки:"]
+        if not snapshots:
+            lines.append("  n/a — снимков пока нет")
+        for snapshot in snapshots:
+            lines += _render_watch_snapshot(snapshot)
+    if format in {"diff", "both"}:
+        lines += ["", "Diff между последовательными снимками:"]
+        if not events:
+            lines.append("  событий пока нет")
+        for event in events:
+            lines.append(
+                f"  {utc(int(event['ts']))} UTC · {event['event_type']} · "
+                f"{event['side']} {event['price']:g} · qty "
+                f"{event['qty_before']:g} → {event['qty_after']:g}"
+            )
+    return "\n".join(lines)
+
+
+def _watch_status(row: Mapping[str, Any], now_ms: int) -> str:
+    status = str(row["status"])
+    if status != "active":
+        return status
+    if now_ms >= int(row["ends_at"]):
+        return "active, срок окончен — тикер молчит до уборки сборщиком"
+    last = row.get("last_snapshot_at")
+    stale_after = max(2 * int(row["interval_sec"]) * 1000, 10_000)
+    if last is None or now_ms - int(last) > stale_after:
+        return "active, но нет свежих снимков — тикер сервера мог остановиться"
+    return "active"
+
+
+def _render_watch_snapshot(snapshot: Mapping[str, Any]) -> list[str]:
+    lines = [
+        f"  {utc(int(snapshot['ts']))} UTC · mid {snapshot['mid_price']:g} · "
+        f"bid {snapshot['best_bid']:g} · ask {snapshot['best_ask']:g} · "
+        f"spread {snapshot['spread_pct']:.3f}%",
+        "    bids:",
+    ]
+    lines += [_render_watch_level(level) for level in snapshot["bids"]]
+    lines.append("    asks:")
+    lines += [_render_watch_level(level) for level in snapshot["asks"]]
+    return lines
+
+
+def _render_watch_level(level: Mapping[str, Any]) -> str:
+    return (
+        f"      {level['price']:g} · qty {level['qty']:g} · "
+        f"notional {usdt(float(level['notional_usdt']))} · "
+        f"cum {usdt(float(level['cum_notional_usdt']))}"
+    )
+
+
+def _watch_summary(
+    watch: Mapping[str, Any],
+    snapshots: Sequence[Mapping[str, Any]],
+    events: Sequence[Mapping[str, Any]],
+) -> str:
+    lines = [
+        f"Долгоживущие уровни (>{LONG_LIVED_FRACTION:.0%} длительности сессии; "
+        "порог стартовый, не откалиброван):"
+    ]
+    if len(snapshots) < 2:
+        lines.append("  n/a — нужно минимум два снимка")
+    else:
+        lived = _long_lived_levels(watch, snapshots)
+        if not lived:
+            lines.append("  нет")
+        for item in lived:
+            lines.append(
+                f"  {item['price']:g} {item['side']} · {usdt(item['notional_usdt'])} · "
+                f"присутствовал {item['minutes']:.1f} мин"
+            )
+
+    lines += [
+        "Кандидаты на спуфинг (исчез в пределах "
+        f"{VANISHED_BEFORE_TOUCH_SNAPSHOTS} снимков до касания цены ±{NEAR_PRICE_PCT:g}%; "
+        "пороги стартовые, не откалиброваны):"
+    ]
+    candidates = _vanished_near_price(snapshots, events)
+    if not candidates:
+        lines.append("  нет")
+    for item in candidates:
+        lines += [
+            f"  {item['price']:g} {item['side']} · исчез {utc(item['vanished_at'])} UTC, "
+            f"цена коснулась {item['touch_price']:g} в {utc(item['touch_at'])} UTC",
+            "  поток сделок недоступен — filled/cancelled не различить",
+        ]
+    return "\n".join(lines)
+
+
+def _long_lived_levels(
+    watch: Mapping[str, Any], snapshots: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    seen: dict[tuple[str, float], list[tuple[int, Mapping[str, Any]]]] = {}
+    for snapshot in snapshots:
+        for side in ("bids", "asks"):
+            for level in snapshot[side]:
+                key = ("bid" if side == "bids" else "ask", float(level["price"]))
+                seen.setdefault(key, []).append((int(snapshot["ts"]), level))
+    minimum_ms = (int(watch["ends_at"]) - int(watch["started_at"])) * LONG_LIVED_FRACTION
+    result = []
+    for (side, price), occurrences in seen.items():
+        first, last = occurrences[0][0], occurrences[-1][0]
+        if last - first < minimum_ms:
+            continue
+        level = occurrences[-1][1]
+        result.append({
+            "side": side, "price": price,
+            "notional_usdt": float(level["notional_usdt"]),
+            "minutes": (last - first) / 60_000,
+        })
+    return sorted(result, key=lambda item: (-item["notional_usdt"], item["side"]))
+
+
+def _vanished_near_price(
+    snapshots: Sequence[Mapping[str, Any]], events: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    result = []
+    for event in events:
+        if event["event_type"] != "disappeared":
+            continue
+        later = [item for item in snapshots if int(item["ts"]) > int(event["ts"])]
+        for snapshot in later[:VANISHED_BEFORE_TOUCH_SNAPSHOTS]:
+            if abs(float(snapshot["mid_price"]) - float(event["price"])) / float(
+                snapshot["mid_price"]
+            ) * 100 > NEAR_PRICE_PCT:
+                continue
+            result.append({
+                "side": event["side"], "price": float(event["price"]),
+                "vanished_at": int(event["ts"]), "touch_at": int(snapshot["ts"]),
+                "touch_price": float(snapshot["mid_price"]),
+            })
+            break
+    return result
 
 
 def _distance(target: float, price: float, atr_value: float, precision: int) -> str:
