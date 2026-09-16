@@ -319,6 +319,38 @@ class BinanceClient:
             cache_ttl_s=30,
         )
 
+    async def ticker_price(self, symbol: str) -> dict[str, Any]:
+        """Живая последняя цена отдельным запросом.
+
+        Стакан и тикер всегда сняты в разные моменты, поэтому вызывающий обязан
+        печатать эту цену рядом с серединой книги, а не использовать её для
+        расстояний уровней (решение Р5 в README задания).
+        """
+        return await self._request(
+            self.market.path("ticker/price"),
+            params={"symbol": symbol.upper()},
+            weight=self.market.ticker_price_weight,
+            cache_ttl_s=0,
+        )
+
+    async def order_book(self, symbol: str, *, limit: int = 100) -> dict[str, Any]:
+        """L2-снимок с проверкой enum и резервированием измеренного веса."""
+        if limit not in self.market.depth_limits:
+            allowed = ", ".join(map(str, sorted(self.market.depth_limits)))
+            raise bad_params(
+                f"limit={limit} недопустим для рынка {self.market.name}. "
+                f"Допустимы: {allowed}",
+                limit=limit,
+                market=self.market.name,
+                allowed=sorted(self.market.depth_limits),
+            )
+        return await self._request(
+            self.market.path("depth"),
+            params={"symbol": symbol.upper(), "limit": limit},
+            weight=self.market.depth_weight(limit),
+            cache_ttl_s=0,
+        )
+
     async def premium_index(self, symbol: str) -> dict[str, Any]:
         return await self._request(
             "/fapi/v1/premiumIndex",
