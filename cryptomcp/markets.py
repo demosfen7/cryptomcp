@@ -35,6 +35,33 @@ def _spot_klines_weight(limit: int) -> int:
     return 2
 
 
+def _futures_depth_weight(limit: int) -> int:
+    """Вес /fapi/v1/depth, замеренный 16.09.2026 (README задания).
+
+    Таблица из документации Binance оказалась таблицей спота: у фьючерсов
+    уровни 5--50 стоят 2, 100 -- 5, 500 -- 10, 1000 -- 20 единиц. Значение
+    5000 futures отвергает ещё до расхода веса, поэтому его нет в enum рынка.
+    """
+    if limit <= 50:
+        return 2
+    if limit == 100:
+        return 5
+    if limit == 500:
+        return 10
+    return 20
+
+
+def _spot_depth_weight(limit: int) -> int:
+    """Вес /api/v3/depth, замеренный 16.09.2026 (README задания)."""
+    if limit <= 100:
+        return 5
+    if limit == 500:
+        return 25
+    if limit == 1000:
+        return 50
+    return 250
+
+
 @dataclass(frozen=True)
 class Market:
     """Всё, чем один рынок Binance отличается от другого."""
@@ -49,6 +76,8 @@ class Market:
     exchange_info_weight: int
     ticker_one_weight: int
     ticker_all_weight: int
+    #: Вес /ticker/price для одного символа.
+    ticker_price_weight: int
     #: Как рынок называется в выдаче и что дописывается к символу.
     label: str
     #: То же имя в одну колонку таблицы: «USDⓈ-M perp» в строку списка не
@@ -57,6 +86,10 @@ class Market:
     suffix: str
     has_derivatives: bool
     klines_weight: Callable[[int], int] = field(compare=False)
+    #: Допустимые значения limit и функция веса L2-стакана. Это свойства
+    #: рынка: futures и spot расходятся по обоим пунктам (README задания).
+    depth_limits: frozenset[int] = field(default_factory=frozenset)
+    depth_weight: Callable[[int], int] = field(default=lambda _: 1, compare=False)
 
     def path(self, endpoint: str) -> str:
         return f"{self.prefix}/{endpoint}"
@@ -71,11 +104,14 @@ FUTURES = Market(
     exchange_info_weight=1,
     ticker_one_weight=1,
     ticker_all_weight=40,
+    ticker_price_weight=1,
     label="USDⓈ-M perp",
     short="перп",
     suffix=".P",
     has_derivatives=True,
     klines_weight=futures_klines_weight,
+    depth_limits=frozenset({5, 10, 20, 50, 100, 500, 1000}),
+    depth_weight=_futures_depth_weight,
 )
 
 SPOT = Market(
@@ -87,11 +123,14 @@ SPOT = Market(
     exchange_info_weight=20,
     ticker_one_weight=2,
     ticker_all_weight=80,
+    ticker_price_weight=2,
     label="спот",
     short="спот",
     suffix="",
     has_derivatives=False,
     klines_weight=_spot_klines_weight,
+    depth_limits=frozenset({5, 10, 20, 50, 100, 500, 1000, 5000}),
+    depth_weight=_spot_depth_weight,
 )
 
 MARKETS: dict[str, Market] = {FUTURES.name: FUTURES, SPOT.name: SPOT}
