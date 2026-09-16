@@ -30,7 +30,15 @@ import statistics
 import time
 from typing import Any
 
-from . import SQUEEZE_FORMULA_VERSION, distribution, flow, manual, render, storage
+from . import (
+    SQUEEZE_FORMULA_VERSION,
+    distribution,
+    flow,
+    manual,
+    orderbook_watch,
+    render,
+    storage,
+)
 from .analysis import MIN_CANDLES, analyse_timeframe, required_candles
 from .client import BinanceClient
 from .config import Config
@@ -1201,6 +1209,7 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
     client = BinanceClient(FUTURES)
     spot = BinanceClient(SPOT)
     try:
+        cleanup_order_book_watches()
         rows = await universe_rows(client)
         core = core_symbols(rows)
         archived, waiting = admit(con, archived_rows(rows))
@@ -1320,6 +1329,27 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
     finally:
         await client.aclose()
         await spot.aclose()
+
+
+def cleanup_order_book_watches() -> dict[str, int]:
+    """Убрать временные данные стакана, не рискуя часовым прогоном (B.6, Р3).
+
+    Отдельный файл может ещё не существовать — это нормальный случай до
+    первого start. Любая другая ошибка также только логируется: цена ошибки
+    здесь — лишняя временная запись, а цена падения collector — потерянный час
+    невосстановимых деривативов.
+    """
+    try:
+        result = orderbook_watch.cleanup()
+    except Exception:
+        log.exception("уборка сессий стакана не выполнена")
+        return {"expired": 0, "deleted": 0}
+    if result["expired"] or result["deleted"]:
+        log.info(
+            "стакан: истекло сессий %d, удалено по retention %d",
+            result["expired"], result["deleted"],
+        )
+    return result
 
 
 async def loop(con: sqlite3.Connection) -> None:
