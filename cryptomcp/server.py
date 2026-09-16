@@ -41,6 +41,7 @@ from .indicators import MIN_PERCENTILE_SPAN_DAYS, atr
 from .journal import Journal
 from .markets import MARKETS, Market
 from .oauth import OAUTH_SCOPE, SQLiteOAuthProvider
+from .orderbook import build_order_book, normalise_depth_pcts
 from .reader import ArchiveReader, archive_path
 from .render import (
     closed_through,
@@ -51,6 +52,7 @@ from .render import (
     render_flow,
     render_klines,
     render_levels,
+    render_order_book,
     render_pivots,
     render_scan_history,
     render_screen,
@@ -451,6 +453,72 @@ async def get_klines(
             info.symbol, interval, limit=max(limit, 500), as_of_ms=as_of_ms
         )
         return render_klines(series, info, limit, market=mkt)
+    except ToolError as error:
+        return _fail(error)
+
+
+@server.tool(
+    description=(
+        "Живой L2-стакан Binance одним REST-снимком: сырые уровни bids/asks с "
+        "накопленным notional, глубина и imbalance в диапазонах от середины "
+        "этого же снимка. limit строго ограничен enum конкретного рынка: у "
+        "futures доступны 5, 10, 20, 50, 100, 500, 1000; у spot дополнительно "
+        "5000. depth_pct принимает одно число или список процентов; неполное "
+        "покрытие печатается явно, глубина автоматически не наращивается. "
+        "Видимый объём уровня не учитывает айсберг-заявки, а Binance не отдаёт "
+        "число ордеров на уровне: это суммарный объём, не намерение участника. "
+        "Снимок не хранит историю и не выявляет спуфинг."
+    )
+)
+async def get_order_book(
+    symbol: str,
+    market: str = "futures",
+    limit: int = 100,
+    depth_pct: float | list[float] | None = None,
+) -> str:
+    """Часть A: один REST-снимок, без хранения и без вывода о намерении."""
+    try:
+        # Валидируем до exchangeInfo и тем более до depth: неверный limit не
+        # должен тратить вес или превращаться в биржевой -1130 (A.2, README).
+        mkt = _market(market)
+        if limit not in mkt.depth_limits:
+            allowed = ", ".join(map(str, sorted(mkt.depth_limits)))
+            raise bad_params(
+                f"limit={limit} недопустим для рынка {mkt.name}. Допустимы: {allowed}",
+                limit=limit,
+                market=mkt.name,
+                allowed=sorted(mkt.depth_limits),
+            )
+        try:
+            depth_pcts = normalise_depth_pcts(depth_pct)
+        except ValueError as exc:
+            raise bad_params(str(exc), depth_pct=depth_pct) from exc
+
+        client, _, registry, _, _ = await _ctx(mkt.name)
+        info = await registry.get(symbol)
+        snapshot = await client.order_book(info.symbol, limit=limit)
+        # last_price намеренно отдельный и явно подписан в выдаче: его момент
+        # не совпадает со снимком и он не участвует в процентах Р5.
+        price, turnover, snapshot_ms = await asyncio.gather(
+            client.ticker_price(info.symbol),
+            client.ticker_24hr(info.symbol),
+            client.now_ms(),
+        )
+        try:
+            book = build_order_book(
+                snapshot,
+                timestamp_ms=snapshot_ms,
+                last_price=float(price["price"]),
+                limit=limit,
+                depth_pcts=depth_pcts,
+                turnover_24h_usdt=float(turnover["quoteVolume"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ToolError(
+                ErrorKind.UPSTREAM_ERROR,
+                f"Binance вернул неполный стакан: {exc}",
+            ) from exc
+        return render_order_book(book, info.symbol, market=mkt, precision=info.price_precision)
     except ToolError as error:
         return _fail(error)
 
