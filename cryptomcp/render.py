@@ -41,6 +41,7 @@ from .flow import AbsorptionEvent, Flow, VolRatio
 from .indicators import Metric
 from .levels import Level, Pivots
 from .markets import FUTURES, Market, market_short
+from .orderbook import OrderBook
 from .series import Series, is_stale, series_age_ms
 from .storage import scan_age_ms, scan_is_fresh
 from .symbols import SymbolInfo, format_price
@@ -128,6 +129,57 @@ def usdt(value: float) -> str:
         if abs(value) >= scale:
             return f"{value / scale:.2f}{suffix}"
     return f"{value:.0f}"
+
+
+def render_order_book(
+    book: OrderBook, symbol: str, *, market: Market = FUTURES, precision: int = 2
+) -> str:
+    """Выдать L2-снимок с сырым блоком, агрегатами и честными n/a (A.4--A.8)."""
+    lines = [
+        f"Стакан {symbol}{market.suffix} ({market.label}), снапшот "
+        f"{utc(book.timestamp_ms)} UTC · limit={book.limit}",
+        f"last_price {format_price(book.last_price, precision)} (live, отдельный тикер) "
+        f"· середина книги {format_price(book.mid_price, precision)}",
+        f"best_bid {format_price(book.best_bid, precision)} · best_ask "
+        f"{format_price(book.best_ask, precision)} · spread "
+        f"{format_price(book.spread, precision)} ({book.spread_pct:.3f}% к середине)",
+        "",
+    ]
+    for depth in book.ranges:
+        imbalance = (
+            f"{depth.imbalance:+.2f}"
+            if depth.imbalance is not None
+            else f"n/a — {depth.imbalance_reason}"
+        )
+        lines.append(
+            f"Диапазон ±{depth.depth_pct:g}%   bid {usdt(depth.bid_notional_usdt)} "
+            f"· ask {usdt(depth.ask_notional_usdt)} · imbalance {imbalance}"
+        )
+        if not depth.fully_covered:
+            lines.append(
+                "  покрытие неполное: "
+                f"биды −{depth.bid_coverage_pct:.2f}%, "
+                f"аски +{depth.ask_coverage_pct:.2f}% от середины при "
+                f"limit={book.limit} — дальше уровней в ответе Binance нет"
+            )
+
+    lines += ["", f"Сырые уровни bids ({len(book.bids)}, от лучшей цены):"]
+    lines += [_render_book_level(level, precision) for level in book.bids]
+    lines += ["", f"Сырые уровни asks ({len(book.asks)}, от лучшей цены):"]
+    lines += [_render_book_level(level, precision) for level in book.asks]
+    lines += [
+        "",
+        "Крупные уровни: n/a — нет базы истории размеров уровней",
+        "Кластеры: n/a — нет базы истории размеров уровней",
+    ]
+    return "\n".join(lines)
+
+
+def _render_book_level(level: Any, precision: int) -> str:
+    return (
+        f"  {format_price(level.price, precision)} · qty {level.qty:g} · "
+        f"notional {usdt(level.notional_usdt)} · cum {usdt(level.cum_notional_usdt)}"
+    )
 
 
 def _distance(target: float, price: float, atr_value: float, precision: int) -> str:
