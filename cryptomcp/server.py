@@ -22,6 +22,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from . import SQUEEZE_FORMULA_VERSION, manual, storage
+from . import orderbook_watch as watch
 from .analysis import (
     MIN_CANDLES,
     TimeframeView,
@@ -53,6 +54,8 @@ from .render import (
     render_klines,
     render_levels,
     render_order_book,
+    render_order_book_watch_data,
+    render_order_book_watches,
     render_pivots,
     render_scan_history,
     render_screen,
@@ -90,6 +93,7 @@ WATCHLIST_STATUSES = (*storage.EPISODE_STATUSES, "manual", "removed")
 
 config = Config.load()
 journal = Journal(config.journal_path)
+log = logging.getLogger("cryptomcp.server")
 
 
 def _oauth_from_environment() -> tuple[SQLiteOAuthProvider | None, Any | None]:
@@ -187,6 +191,10 @@ if _oauth_provider is not None:
 #: поэтому и бюджеты должны быть разными объектами.
 _clients: dict[str, BinanceClient] = {}
 _lock = asyncio.Lock()
+
+#: Тикеры принадлежат процессу сервера. После его рестарта эти задачи исчезают,
+#: а строка в отдельной БД остаётся active до уборки collector (решение Р2).
+_watch_tasks: dict[str, asyncio.Task[None]] = {}
 
 
 def _market(name: str) -> Market:
@@ -521,6 +529,227 @@ async def get_order_book(
         return render_order_book(book, info.symbol, market=mkt, precision=info.price_precision)
     except ToolError as error:
         return _fail(error)
+
+
+@server.tool(
+    description=(
+        "Начинает временную сессию наблюдения за L2-стаканом: каждые "
+        "interval_sec секунд сохраняется REST-снимок limit=100 и готовый diff "
+        "к предыдущему. duration_min от 1 до 240, по умолчанию 60; общий вес "
+        "активных сессий ограничен половиной IP-лимита каждого рынка, максимум "
+        "10 сессий. Тикер живёт ВНУТРИ процесса сервера: после рестарта сервера "
+        "сессия не продолжится, строка останется active и будет помечена "
+        "просроченной часовым сборщиком. Событие короче interval_sec невидимо; "
+        "исчезновение уровня не доказывает отмену без потока сделок."
+    )
+)
+async def start_order_book_watch(
+    symbol: str,
+    market: str = "futures",
+    interval_sec: int = watch.DEFAULT_INTERVAL_SEC,
+    duration_min: int = watch.DEFAULT_DURATION_MIN,
+    depth_pct: float | list[float] | None = None,
+) -> str:
+    """B.2--B.4: допустить сессию до запуска первого асинхронного тика."""
+    try:
+        mkt = _market(market)
+        try:
+            depth_pcts = normalise_depth_pcts(depth_pct)
+        except ValueError as exc:
+            raise bad_params(str(exc), depth_pct=depth_pct) from exc
+        _, _, registry, _, _ = await _ctx(mkt.name)
+        info = await registry.get(symbol)
+        con = watch.connect()
+        try:
+            session = watch.start(
+                con,
+                symbol=info.symbol,
+                market=mkt.name,
+                interval_sec=interval_sec,
+                duration_min=duration_min,
+                depth_pcts=depth_pcts,
+                depth_weight=mkt.depth_weight(watch.WATCH_LIMIT),
+                market_weight_limit=mkt.weight_limit,
+            )
+        finally:
+            con.close()
+        _watch_tasks[session["watch_id"]] = asyncio.create_task(
+            _run_order_book_watch(session["watch_id"])
+        )
+        return (
+            f"Сессия {session['watch_id']} запущена: {session['symbol']} "
+            f"({session['market']}), интервал {session['interval_sec']}с, "
+            f"окончание {utc(session['ends_at'])} UTC · запросы занимают "
+            f"{session['weight_per_min']:g} ед/мин"
+        )
+    except watch.WatchAdmissionError as error:
+        return _fail(bad_params(str(error)))
+    except ToolError as error:
+        return _fail(error)
+
+
+@server.tool(
+    description="Останавливает активную сессию стакана; накопленные данные остаются до retention."
+)
+async def stop_order_book_watch(watch_id: str) -> str:
+    try:
+        con = watch.connect()
+        try:
+            if not watch.stop(con, watch_id):
+                raise bad_params(f"Активная сессия {watch_id!r} не найдена", watch_id=watch_id)
+        finally:
+            con.close()
+        _cancel_order_book_watch(watch_id)
+        return f"Сессия {watch_id} остановлена; данные сохранятся до автоматической уборки."
+    except ToolError as error:
+        return _fail(error)
+
+
+@server.tool(
+    description=(
+        "Перечисляет активные и недавно завершённые сессии стакана: остаток времени, "
+        "число снимков, ошибки и примерный размер. Отдельно помечает сессию без "
+        "свежих снимков: она могла пережить рестарт сервера только строкой в БД, "
+        "но её тикер уже не работает."
+    )
+)
+async def list_order_book_watches() -> str:
+    con = watch.read_only()
+    try:
+        return render_order_book_watches(watch.list_watches(con), now_ms=watch.now_ms())
+    finally:
+        if con is not None:
+            con.close()
+
+
+@server.tool(
+    description=(
+        "Возвращает накопленные данные сессии стакана. format=raw — снимки, "
+        "format=diff — события, посчитанные при записи, format=both — оба блока; "
+        "from_ts/to_ts ограничивают окно в миллисекундах Unix. Сводка показывает "
+        "долгоживущие уровни и кандидатов на спуфинг, но честно предупреждает: "
+        "без потока сделок filled и cancelled не различить."
+    )
+)
+async def get_order_book_watch_data(
+    watch_id: str,
+    from_ts: int | None = None,
+    to_ts: int | None = None,
+    format: str = "both",
+) -> str:
+    try:
+        if format not in {"raw", "diff", "both"}:
+            raise bad_params("format должен быть raw, diff или both", format=format)
+        if from_ts is not None and to_ts is not None and from_ts > to_ts:
+            raise bad_params("from_ts не может быть больше to_ts")
+        con = watch.read_only()
+        try:
+            session = watch.get_watch(con, watch_id)
+            if session is None:
+                raise bad_params(f"Сессия {watch_id!r} не найдена", watch_id=watch_id)
+            return render_order_book_watch_data(
+                session,
+                watch.snapshots(con, watch_id, from_ts=from_ts, to_ts=to_ts),
+                watch.diffs(con, watch_id, from_ts=from_ts, to_ts=to_ts),
+                format=format,
+                now_ms=watch.now_ms(),
+            )
+        finally:
+            if con is not None:
+                con.close()
+    except ToolError as error:
+        return _fail(error)
+
+
+@server.tool(
+    description="Удаляет сессию стакана и все её временные raw-снимки и diff раньше retention."
+)
+async def delete_order_book_watch(watch_id: str) -> str:
+    try:
+        con = watch.connect()
+        try:
+            if not watch.delete(con, watch_id):
+                raise bad_params(f"Сессия {watch_id!r} не найдена", watch_id=watch_id)
+        finally:
+            con.close()
+        _cancel_order_book_watch(watch_id)
+        return f"Сессия {watch_id} и её временные данные удалены."
+    except ToolError as error:
+        return _fail(error)
+
+
+async def _run_order_book_watch(watch_id: str) -> None:
+    """Тикер B.3: ошибка пропускает тик, но не убивает всю сессию."""
+    try:
+        while True:
+            started = watch.now_ms()
+            active = await _record_order_book_watch_snapshot(watch_id)
+            if not active:
+                return
+            con = watch.read_only()
+            try:
+                session = watch.get_watch(con, watch_id)
+            finally:
+                if con is not None:
+                    con.close()
+            if session is None or session["status"] != "active":
+                return
+            delay = max(0.0, session["interval_sec"] - (watch.now_ms() - started) / 1000)
+            await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        _watch_tasks.pop(watch_id, None)
+
+
+async def _record_order_book_watch_snapshot(watch_id: str) -> bool:
+    con = watch.read_only()
+    try:
+        session = watch.get_watch(con, watch_id)
+    finally:
+        if con is not None:
+            con.close()
+    if session is None or session["status"] != "active" or watch.now_ms() >= session["ends_at"]:
+        return False
+    try:
+        client, _, _, _, _ = await _ctx(session["market"])
+        snapshot = await client.order_book(session["symbol"], limit=watch.WATCH_LIMIT)
+        turnover, snapshot_ms = await asyncio.gather(
+            client.ticker_24hr(session["symbol"]), client.now_ms()
+        )
+        # В тике last_price не запрашивается (Р5). Поле OrderBook нужно ядру,
+        # но в БД и выдачу сессии не попадает; середина того же снимка честнее.
+        bids, asks = snapshot.get("bids", ()), snapshot.get("asks", ())
+        last_price = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+        book = build_order_book(
+            snapshot,
+            timestamp_ms=snapshot_ms,
+            last_price=last_price,
+            limit=watch.WATCH_LIMIT,
+            depth_pcts=tuple(session["depth_pcts"]),
+            turnover_24h_usdt=float(turnover["quoteVolume"]),
+        )
+        con = watch.connect()
+        try:
+            watch.record_snapshot(con, watch_id, book)
+        finally:
+            con.close()
+        return True
+    except (ToolError, KeyError, TypeError, ValueError, OSError, sqlite3.Error):
+        # Один сбой тика не превращается в смерть наблюдения (B.3).
+        log.warning("снимок стакана %s не записан", watch_id, exc_info=True)
+        con = watch.connect()
+        try:
+            watch.record_error(con, watch_id)
+        finally:
+            con.close()
+        return True
+
+
+def _cancel_order_book_watch(watch_id: str) -> None:
+    task = _watch_tasks.pop(watch_id, None)
+    if task is not None:
+        task.cancel()
 
 
 @server.tool(
