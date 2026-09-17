@@ -27,6 +27,7 @@ import httpx
 
 from . import manual, storage
 from . import orderbook_watch as watch
+from .errors import ToolError
 from .orderbook import OrderBook, build_order_book
 from .symbols import format_price
 
@@ -95,6 +96,13 @@ CREATE TABLE IF NOT EXISTS bot_watches (
     finished_at INTEGER
 );
 """
+
+
+#: Глубина стакана для кнопки. Сто уровней у ликвидной монеты покрывают лишь
+#: ±0.6% (замер ARBUSDT 17.09.2026), и шаблон оставался без единой суммы.
+#: Тысяча уровней стоит 20 единиц веса вместо 5 — для разового нажатия это
+#: приемлемо, а сессия наблюдения по-прежнему ходит сотней.
+BOOK_LIMIT = 1000
 
 
 def now_ms() -> int:
@@ -311,6 +319,17 @@ def _move(row: dict[str, Any], scan: dict[str, Any]) -> float | None:
     return (float(current) / float(entry) - 1) * 100
 
 
+def _stale_days(scan: dict[str, Any], now: int) -> str | None:
+    """Насколько устарела запись скана, если она перестала обновляться."""
+    closed = scan.get("closed_through_ms")
+    if closed is None:
+        return None
+    if (now - int(closed)) / 86_400_000 < 1.5:
+        return None
+    moment = dt.datetime.fromtimestamp(int(closed) / 1000, dt.UTC)
+    return f"от {moment.strftime('%d.%m')}"
+
+
 def render_watchlist_message(
     rows: list[dict[str, Any]], scans: dict[tuple[str, str], dict[str, Any]], *, now: int
 ) -> str:
@@ -366,8 +385,19 @@ def render_watchlist_message(
         lines.append(line)
     manual_rows = [row for row in rows if str(row.get("entered_by", "")).startswith("manual")]
     if manual_rows:
-        manual_text = " · ".join(short_symbol(str(row["symbol"])) for row in manual_rows[:3])
-        lines += ["", f"Ваши: {manual_text}"]
+        # Ход цены и возраст данных — то же, что у сканерных строк: без них
+        # своя находка выглядит записью без судьбы (приёмка 17.09.2026).
+        parts = []
+        for row in manual_rows[:3]:
+            scan = scans.get((str(row["symbol"]), str(row["tf"]))) or {}
+            movement = _move(row, scan)
+            stale = _stale_days(scan, now)
+            text = short_symbol(str(row["symbol"]))
+            text += f" {movement:+.1f}%" if movement is not None else " нет свежей цены"
+            if stale is not None:
+                text += f" (данные {stale})"
+            parts.append(text)
+        lines += ["", "Ваши: " + " · ".join(parts)]
     legend: list[str] = []
     if has_up or has_down:
         legend.append("⬆⬇ сдвинулась в списке на 3+ места с момента входа")
@@ -405,32 +435,64 @@ def _balance_words(value: float | None, turnover: float) -> str:
     return f"{who} {strength}"
 
 
-def render_order_book_message(book: OrderBook, symbol: str, *, precision: int = 6) -> str:
-    """Шаблон стакана из OrderBook, посчитанного ядром, без разбора текста MCP."""
+def _spread_words(book: OrderBook, tick_size: float) -> str:
+    """Разрыв между покупкой и продажей — в шагах цены монеты.
+
+    Прежняя формула делила разрыв сам на себя и всегда печатала «1 шаг»
+    (приёмка 17.09.2026). Шаг берётся у биржи; без него честнее показать
+    проценты, чем выдуманное число шагов.
+    """
+    if tick_size and tick_size > 0:
+        steps = max(1, round(book.spread / tick_size))
+        return f"{steps} {_step_word(steps)} цены"
+    return f"{book.spread_pct:.2f}% цены"
+
+
+def _step_word(value: int) -> str:
+    last_two = value % 100
+    if 11 <= last_two <= 14:
+        return "шагов"
+    if value % 10 == 1:
+        return "шаг"
+    if 2 <= value % 10 <= 4:
+        return "шага"
+    return "шагов"
+
+
+def render_order_book_message(
+    book: OrderBook, symbol: str, *, precision: int = 6, tick_size: float = 0.0
+) -> str:
+    """Шаблон стакана из OrderBook, посчитанного ядром, без разбора текста MCP.
+
+    Неполное покрытие не выбрасывает блок, а дописывает строку «дальше стакан
+    не виден»: у ликвидной монеты сто уровней покрывают ±0.6%, и прежний
+    шаблон на ARBUSDT печатал две строки про невидимый стакан и ни одной
+    суммы (приёмка 17.09.2026).
+    """
     price = format_price(book.last_price, precision)
-    spread_steps = max(1, round(book.spread / max(book.best_ask - book.best_bid, 1e-12)))
     lines = [
         f"📊 Стакан {short_symbol(symbol)} · фьючерсы · "
         f"{utc_stamp(book.timestamp_ms, comma=False)}",
-        f"Цена {price} · между покупкой и продажей {spread_steps} шаг цены",
+        f"Цена {price} · между покупкой и продажей {_spread_words(book, tick_size)}",
         "",
     ]
     visible_ranges = [item for item in book.ranges if item.depth_pct in {1.0, 2.0}]
     for item in visible_ranges:
-        if not item.fully_covered:
-            coverage = min(item.bid_coverage_pct, item.ask_coverage_pct)
-            lines.append(f"Дальше {coverage:.1f}% стакан не виден.")
-            continue
         percent = int(item.depth_pct) if item.depth_pct.is_integer() else item.depth_pct
         lines += [
             f"В пределах {percent}%:",
             f"  покупают на {amount_usd(item.bid_notional_usdt)} · "
             f"продают на {amount_usd(item.ask_notional_usdt)}",
             f"  → {_balance_words(item.imbalance, book.turnover_24h_usdt)}",
-            "",
         ]
+        if not item.fully_covered:
+            coverage = min(item.bid_coverage_pct, item.ask_coverage_pct)
+            lines.append(
+                f"  видно только до {coverage:.1f}% — дальше заявок в ответе биржи нет"
+            )
+        lines.append("")
     one_pct = next((item for item in book.ranges if item.depth_pct == 1.0), None)
-    if one_pct and one_pct.fully_covered and book.turnover_24h_usdt > 0:
+    if one_pct and book.turnover_24h_usdt > 0:
         share = (
             (one_pct.bid_notional_usdt + one_pct.ask_notional_usdt)
             / book.turnover_24h_usdt
@@ -464,10 +526,12 @@ def render_watch_summary(watch_row: dict[str, Any], *, now: int) -> str:
         if con is not None:
             con.close()
     outcomes = watch.classify_liquidity(snapshots, trades, gaps)["outcomes"]
-    duration = max(0, end - int(watch_row["started_at"])) // 60_000
+    # Округление вверх: двухминутная сессия из 24 снимков печаталась как
+    # «1 мин» (приёмка 17.09.2026).
+    duration = -(-max(0, end - int(watch_row["started_at"])) // 60_000)
     lines = [
         f"👁 Наблюдение {short_symbol(str(watch_row['symbol']))} завершено · "
-        f"{duration} мин · {len(snapshots)} снимков",
+        f"{duration} мин · {len(snapshots)} {_snapshot_word(len(snapshots))}",
         "",
         "Что происходило с заявками рядом с ценой:",
     ]
@@ -490,15 +554,49 @@ def render_watch_summary(watch_row: dict[str, Any], *, now: int) -> str:
     return "\n".join(lines)
 
 
-def render_manual_message(rows: list[dict[str, Any]], *, now: int) -> str:
+def _snapshot_word(value: int) -> str:
+    last_two = value % 100
+    if 11 <= last_two <= 14:
+        return "снимков"
+    if value % 10 == 1:
+        return "снимок"
+    if 2 <= value % 10 <= 4:
+        return "снимка"
+    return "снимков"
+
+
+def render_manual_message(
+    rows: list[dict[str, Any]],
+    *,
+    now: int,
+    prices: dict[str, float] | None = None,
+) -> str:
+    """Свои находки с ходом цены от добавления.
+
+    Ход — главное в этом списке: ради сравнения своего выбора со сканерным
+    запись и заводится, а цена входа без текущей на вопрос не отвечает
+    (приёмка 17.09.2026).
+    """
     lines = [f"⭐ Мои находки · {utc_stamp(now)}"]
     if not rows:
         return "\n".join(lines + ["Здесь пока нет ручных находок."])
+    prices = prices or {}
     for row in rows:
         price = row.get("price_at_entry")
         note = row.get("note") or "без заметки"
-        entry = f"по цене {format_price(float(price), 6)}" if price else "цена не сохранена"
-        lines.append(f"{short_symbol(str(row['symbol']))} · {row['tf']} · {entry} · {note}")
+        if price:
+            entry = f"по цене {format_price(float(price), 6)}"
+            current = prices.get(str(row["symbol"]))
+            move = (
+                f"{(float(current) / float(price) - 1) * 100:+.1f}%"
+                if current else "нет свежей цены"
+            )
+        else:
+            entry, move = "цена не сохранена", "нет свежей цены"
+        lines.append(
+            f"{short_symbol(str(row['symbol']))} · {row['tf']} · {entry} · "
+            f"с добавления {move} · {note}"
+        )
     return "\n".join(lines)
 
 
@@ -608,7 +706,7 @@ class TemplateService:
 
         client, _, registry, _, market = await server._ctx("futures")
         info = await registry.get(symbol)
-        snapshot = await client.order_book(info.symbol, limit=100)
+        snapshot = await client.order_book(info.symbol, limit=BOOK_LIMIT)
         price, turnover, stamp = await asyncio.gather(
             client.ticker_price(info.symbol), client.ticker_24hr(info.symbol), client.now_ms()
         )
@@ -616,22 +714,53 @@ class TemplateService:
             snapshot,
             timestamp_ms=stamp,
             last_price=float(price["price"]),
-            limit=100,
+            limit=BOOK_LIMIT,
             depth_pcts=(1.0, 2.0),
             turnover_24h_usdt=float(turnover["quoteVolume"]),
         )
         # Сейчас кнопка определена для фьючерсов; рынок не скрываем в словах
         # рендера и не выдаём спотовый стакан за перпетуал.
         assert market.name == "futures"
-        return render_order_book_message(book, info.symbol, precision=info.price_precision)
+        return render_order_book_message(
+            book, info.symbol, precision=info.price_precision,
+            tick_size=float(getattr(info, "tick_size", 0.0) or 0.0),
+        )
 
     async def manual(self) -> str:
         con = manual.read_only()
         try:
-            return render_manual_message(manual.entries(con, now_ms=now_ms()), now=now_ms())
+            rows = manual.entries(con, now_ms=now_ms())
         finally:
             if con is not None:
                 con.close()
+        return render_manual_message(
+            rows, now=now_ms(), prices=await self._live_prices(rows)
+        )
+
+    @staticmethod
+    async def _live_prices(rows: list[dict[str, Any]]) -> dict[str, float]:
+        """Живые цены по ручным записям: их монет может не быть в архиве вовсе.
+
+        Ровно поэтому их и заводят руками (PLAN §4.28). Сбой цены не должен
+        отменить весь список — тогда пропадёт и заметка, ради которой запись
+        сделана.
+        """
+        if not rows:
+            return {}
+        from . import server
+
+        try:
+            client, _, _, _, _ = await server._ctx("futures")
+            prices = {}
+            for symbol in {str(row["symbol"]) for row in rows}:
+                try:
+                    ticker = await client.ticker_price(symbol)
+                    prices[symbol] = float(ticker["price"])
+                except Exception:  # noqa: BLE001 - цена не обязана быть
+                    continue
+            return prices
+        except Exception:  # noqa: BLE001
+            return {}
 
     async def watch_summary(self, watch_id: str) -> str:
         con = watch.read_only()
@@ -930,15 +1059,23 @@ class Bot:
         )
 
     async def _start_watch(self, chat_id: int, symbol: str, duration_min: int) -> None:
-        """Б8: запускает тот же тикер, но задача принадлежит процессу бота."""
+        """Б8: запускает тот же тикер, но задача принадлежит процессу бота.
+
+        Сессия заводится теми же функциями хранилища и тикером, что и у
+        MCP-инструмента, а не разбором его текста регуляркой: текст пишется
+        для модели и меняется свободно (приёмка 17.09.2026, Б4).
+        """
         from . import server
 
-        result = await server.start_order_book_watch(symbol, duration_min=duration_min)
-        match = re.match(r"Сессия (watch_[0-9a-f]+) запущена", result)
-        if match is None:
-            await self.telegram.send_message(chat_id, result)
+        try:
+            session = await server.begin_order_book_watch(
+                symbol, duration_min=duration_min
+            )
+        except (ToolError, watch.WatchAdmissionError) as error:
+            reason = getattr(error, "message", None) or str(error)
+            await self.telegram.send_message(chat_id, f"⚠️ {reason}")
             return
-        watch_id = match.group(1)
+        watch_id = str(session["watch_id"])
         self.store.remember_watch(watch_id, chat_id, symbol, now_ms())
         await self.telegram.send_message(
             chat_id, f"👁 Наблюдаю за {short_symbol(symbol)} {duration_min} мин. Итог пришлю сам."
@@ -1072,18 +1209,27 @@ async def _render_command(scenario: str, symbol: str | None) -> str:
         "стакан": "book",
         "manual": "manual",
         "мои": "manual",
+        "watch": "watch",
+        "наблюдение": "watch",
+        "итог": "watch",
     }
     chosen = aliases.get(scenario.lower())
     if chosen == "watchlist":
         return await templates.watchlist()
     if chosen == "manual":
         return await templates.manual()
+    if chosen == "watch":
+        if not symbol:
+            raise ValueError(
+                "для итога наблюдения нужен watch_id: render watch watch_1a2b3c4d"
+            )
+        return await templates.watch_summary(symbol)
     if chosen == "book":
         if not symbol:
             raise ValueError("для стакана нужен тикер: render book ARBUSDT")
         ticker = symbol.upper() if symbol.upper().endswith("USDT") else f"{symbol.upper()}USDT"
         return await templates.book(ticker)
-    raise ValueError("сценарий: watchlist, book или manual")
+    raise ValueError("сценарий: watchlist, book, manual или watch")
 
 
 def main() -> None:

@@ -18,6 +18,7 @@ from cryptomcp.bot import (
     main_menu,
     render_manual_message,
     render_order_book_message,
+    render_watch_summary,
     render_watchlist_message,
 )
 from cryptomcp.orderbook import build_order_book
@@ -234,13 +235,14 @@ async def test_b8_completed_bot_watch_sends_summary_to_starting_chat(monkeypatch
     )
 
     async def start(symbol, *, duration_min):
+        """Бот зовёт функцию сессии, а не разбирает текст инструмента (Б4)."""
         assert (symbol, duration_min) == ("ARBUSDT", 30)
-        return "Сессия watch_1234abcd запущена: ARBUSDT"
+        return {"watch_id": "watch_1234abcd", "symbol": "ARBUSDT"}
 
     async def finished():
         return None
 
-    monkeypatch.setattr(server, "start_order_book_watch", start)
+    monkeypatch.setattr(server, "begin_order_book_watch", start)
     server._watch_tasks["watch_1234abcd"] = asyncio.create_task(finished())
     await worker.handle_update(callback(42, "observe-30:ARBUSDT", chat_id=-10099))
     await asyncio.sleep(0)
@@ -294,3 +296,144 @@ async def test_manual_add_uses_ticker_timeframe_and_note_without_mcp_text(tmp_pa
 
     assert telegram.messages[-1]["text"] == "⭐ Мои находки · ID"
     assert telegram.messages[-1]["reply_markup"] is not None
+
+
+def _liquid_book():
+    """Стакан ликвидной монеты: сто уровней покрывают доли процента."""
+    bids = [[f"{100 - i * 0.001:.3f}", "1000"] for i in range(100)]
+    asks = [[f"{100.01 + i * 0.001:.3f}", "1000"] for i in range(100)]
+    return build_order_book(
+        {"bids": bids, "asks": asks},
+        timestamp_ms=1_789_870_000_000,
+        last_price=100.005,
+        limit=1000,
+        depth_pcts=(1.0, 2.0),
+        turnover_24h_usdt=50_000_000,
+    )
+
+
+def test_incomplete_coverage_still_shows_the_sums():
+    """Приёмка 17.09: у ARBUSDT шаблон печатал только «стакан не виден»."""
+    text = render_order_book_message(_liquid_book(), "ARBUSDT", precision=3)
+
+    assert "В пределах 1%:" in text
+    assert "покупают на" in text and "продают на" in text
+    assert "видно только до" in text
+    assert not forbidden_words(text)
+
+
+def test_spread_is_counted_in_price_steps_not_by_dividing_itself():
+    """Приёмка 17.09: прежняя формула всегда печатала «1 шаг цены»."""
+    book = build_order_book(
+        {"bids": [["77.01", "10"], ["76.90", "10"]], "asks": [["77.15", "10"], ["77.30", "10"]]},
+        timestamp_ms=1_789_870_000_000,
+        last_price=77.05,
+        limit=100,
+        depth_pcts=(1.0,),
+        turnover_24h_usdt=5_000_000,
+    )
+
+    text = render_order_book_message(book, "KODEX200USDT", precision=2, tick_size=0.01)
+
+    assert "14 шагов цены" in text
+
+
+def test_spread_without_tick_size_falls_back_to_percent():
+    book = build_order_book(
+        {"bids": [["100", "10"], ["99", "10"]], "asks": [["101", "10"], ["102", "10"]]},
+        timestamp_ms=1_789_870_000_000,
+        last_price=100.5,
+        limit=100,
+        depth_pcts=(1.0,),
+        turnover_24h_usdt=5_000_000,
+    )
+
+    text = render_order_book_message(book, "IDUSDT", precision=2)
+
+    assert "% цены" in text
+    assert "шаг цены" not in text
+
+
+def test_watch_summary_rounds_duration_up_and_declines_snapshots(monkeypatch):
+    """Приёмка 17.09: двухминутная сессия из 24 снимков печаталась как «1 мин»."""
+    from cryptomcp import bot as module
+
+    start = 1_789_870_000_000
+    snapshots = [{"ts": start + i * 5_000} for i in range(24)]
+
+    class FakeWatch:
+        WatchAdmissionError = RuntimeError
+
+        @staticmethod
+        def read_only():
+            return None
+
+        @staticmethod
+        def snapshots(con, watch_id):
+            return snapshots
+
+        @staticmethod
+        def trades(con, watch_id, *, from_ts, to_ts):
+            return []
+
+        @staticmethod
+        def trade_gaps(con, watch_id, *, from_ts, to_ts):
+            return []
+
+        @staticmethod
+        def classify_liquidity(snaps, trades, gaps):
+            return {"outcomes": {
+                "устоял": [], "исполнен": [], "снят у цены": [],
+                "снят заранее": [], "похоже на айсберг": [],
+            }}
+
+    monkeypatch.setattr(module, "watch", FakeWatch)
+
+    text = render_watch_summary(
+        {"watch_id": "watch_1", "symbol": "ARBUSDT", "started_at": start}, now=start,
+    )
+
+    assert "2 мин" in text
+    assert "24 снимка" in text
+
+
+def test_manual_list_shows_move_since_it_was_added():
+    """Ход цены — то, ради чего ручная запись и заводится (приёмка 17.09)."""
+    text = render_manual_message(
+        [{"symbol": "PHAUSDT", "tf": "4h", "price_at_entry": 0.027, "note": "пробой"}],
+        now=1_789_870_000_000,
+        prices={"PHAUSDT": 0.0297},
+    )
+
+    assert "с добавления +10.0%" in text
+    assert "пробой" in text
+
+
+def test_manual_list_without_a_live_price_says_so():
+    text = render_manual_message(
+        [{"symbol": "PHAUSDT", "tf": "4h", "price_at_entry": 0.027, "note": "пробой"}],
+        now=1_789_870_000_000,
+    )
+
+    assert "нет свежей цены" in text
+
+
+def test_watchlist_tail_shows_move_and_stale_mark_for_manual_rows():
+    now = 1_789_870_000_000
+    rows = [
+        {"symbol": "IDUSDT", "tf": "1d", "entered_by": "scanner", "last_rank": 1,
+         "rank_at_entry": 1, "price_at_entry": 0.03},
+        {"symbol": "PHAUSDT", "tf": "4h", "entered_by": "manual", "last_rank": None,
+         "rank_at_entry": None, "price_at_entry": 0.027},
+    ]
+    scans = {
+        ("IDUSDT", "1d"): {"narrow_bars": 21, "price": 0.031,
+                           "closed_through_ms": now - 3_600_000},
+        ("PHAUSDT", "4h"): {"narrow_bars": 4, "price": 0.0297,
+                            "closed_through_ms": now - 3 * 86_400_000},
+    }
+
+    text = render_watchlist_message(rows, scans, now=now)
+
+    assert "Ваши: PHA +10.0%" in text
+    assert "(данные от" in text

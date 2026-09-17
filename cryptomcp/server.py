@@ -545,6 +545,54 @@ async def get_order_book(
         "снятую заявку различить можно лишь приблизительно."
     )
 )
+async def begin_order_book_watch(
+    symbol: str,
+    market: str = "futures",
+    interval_sec: int = watch.DEFAULT_INTERVAL_SEC,
+    duration_min: int = watch.DEFAULT_DURATION_MIN,
+    depth_pct: float | list[float] | None = None,
+) -> dict[str, Any]:
+    """Завести сессию и запустить её тикер, вернув саму запись.
+
+    Отдельно от инструмента, потому что у сессии два вызывающих: MCP-инструмент
+    печатает текст модели, а Telegram-бот берёт `watch_id` и ждёт окончания.
+    Разбирать текст инструмента регуляркой боту нельзя — текст пишется для
+    модели и меняется свободно (приёмка бота 17.09.2026).
+    """
+    mkt = _market(market)
+    try:
+        depth_pcts = normalise_depth_pcts(depth_pct)
+    except ValueError as exc:
+        raise bad_params(str(exc), depth_pct=depth_pct) from exc
+    client, _, registry, _, _ = await _ctx(mkt.name)
+    info = await registry.get(symbol)
+    turnover, started_at = await asyncio.gather(
+        client.ticker_24hr(info.symbol), client.now_ms()
+    )
+    con = watch.connect()
+    try:
+        session = watch.start(
+            con,
+            symbol=info.symbol,
+            market=mkt.name,
+            interval_sec=interval_sec,
+            duration_min=duration_min,
+            depth_pcts=depth_pcts,
+            depth_weight=mkt.depth_weight(watch.WATCH_LIMIT),
+            market_weight_limit=mkt.weight_limit,
+            trade_weight=mkt.agg_trades_weight,
+            started_at=started_at,
+            turnover_24h=float(turnover["quoteVolume"]),
+            turnover_taken_at=started_at,
+        )
+    finally:
+        con.close()
+    _watch_tasks[session["watch_id"]] = asyncio.create_task(
+        _run_order_book_watch(session["watch_id"])
+    )
+    return session
+
+
 async def start_order_book_watch(
     symbol: str,
     market: str = "futures",
@@ -554,36 +602,8 @@ async def start_order_book_watch(
 ) -> str:
     """B.2--B.4: допустить сессию до запуска первого асинхронного тика."""
     try:
-        mkt = _market(market)
-        try:
-            depth_pcts = normalise_depth_pcts(depth_pct)
-        except ValueError as exc:
-            raise bad_params(str(exc), depth_pct=depth_pct) from exc
-        client, _, registry, _, _ = await _ctx(mkt.name)
-        info = await registry.get(symbol)
-        turnover, started_at = await asyncio.gather(
-            client.ticker_24hr(info.symbol), client.now_ms()
-        )
-        con = watch.connect()
-        try:
-            session = watch.start(
-                con,
-                symbol=info.symbol,
-                market=mkt.name,
-                interval_sec=interval_sec,
-                duration_min=duration_min,
-                depth_pcts=depth_pcts,
-                depth_weight=mkt.depth_weight(watch.WATCH_LIMIT),
-                market_weight_limit=mkt.weight_limit,
-                trade_weight=mkt.agg_trades_weight,
-                started_at=started_at,
-                turnover_24h=float(turnover["quoteVolume"]),
-                turnover_taken_at=started_at,
-            )
-        finally:
-            con.close()
-        _watch_tasks[session["watch_id"]] = asyncio.create_task(
-            _run_order_book_watch(session["watch_id"])
+        session = await begin_order_book_watch(
+            symbol, market, interval_sec, duration_min, depth_pct
         )
         return (
             f"Сессия {session['watch_id']} запущена: {session['symbol']} "
