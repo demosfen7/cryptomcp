@@ -41,6 +41,10 @@ DEFAULT_DAILY_BUDGET_USD = 1.0
 DEFAULT_TIMEZONE = "Europe/Berlin"
 DEFAULT_MORNING_TIME = "08:00"
 
+#: Сколько часов после назначенного времени обзор ещё имеет смысл. Вечером он
+#: уже не утренний, а пропущенное утро не досылается (Б7).
+MORNING_WINDOW_H = 2
+
 # MOCKUPS.md §1.3: эти технические термины не должны попадать в сообщения
 # человеку. Проверка живёт рядом с рендерами, чтобы ею пользовались и тесты,
 # и проверочная команда Б11.
@@ -1267,7 +1271,13 @@ class Bot:
             return False
         zone = ZoneInfo(self.config.timezone)
         local = dt.datetime.fromtimestamp(stamp_ms / 1000, zone)
-        if local.time() < dt.time.fromisoformat(self.config.morning_time):
+        planned = dt.datetime.combine(
+            local.date(), dt.time.fromisoformat(self.config.morning_time), zone
+        )
+        # Окно, а не «после времени»: иначе бот, поднятый вечером, шлёт
+        # «утренний обзор» в десять вечера — поймано на первом выкате
+        # 17.09.2026, в 22:04 по месту.
+        if not planned <= local < planned + dt.timedelta(hours=MORNING_WINDOW_H):
             return False
         today = local.date().isoformat()
         if self.store.get_meta("last_morning_date") == today:

@@ -589,7 +589,10 @@ async def test_morning_fires_once_a_day_and_is_not_sent_late(tmp_path):
     night = int(dt.datetime(2026, 9, 18, 3, 0, tzinfo=zone).timestamp() * 1000)
     next_day = int(dt.datetime(2026, 9, 19, 9, 0, tzinfo=zone).timestamp() * 1000)
 
+    evening = int(dt.datetime(2026, 9, 18, 22, 4, tzinfo=zone).timestamp() * 1000)
+
     assert await worker._morning_due(night) is False
+    assert await worker._morning_due(evening) is False, "вечером обзор не утренний"
     assert await worker._morning_due(morning) is True
     assert await worker._morning_due(morning) is False, "второй раз за сутки — нет"
     assert await worker._morning_due(next_day) is True
