@@ -205,6 +205,10 @@ def render_order_book_watches(watches: Sequence[Mapping[str, Any]], *, now_ms: i
     return "\n".join(lines)
 
 
+MAX_WATCH_RESPONSE_CHARS = 36_000
+MAX_WATCH_SUMMARY_ROWS = 10
+
+
 def render_order_book_watch_data(
     watch: Mapping[str, Any],
     snapshots: Sequence[Mapping[str, Any]],
@@ -212,32 +216,88 @@ def render_order_book_watch_data(
     *,
     format: str,
     now_ms: int,
+    total_snapshots: int | None = None,
+    total_events: int | None = None,
 ) -> str:
-    """Сырые снимки и записанный при тике diff плюс сводка B.7."""
+    """Короткая сводка и постраничные raw/diff, пригодные для контекста модели."""
+    total_snapshots = len(snapshots) if total_snapshots is None else total_snapshots
+    total_events = len(events) if total_events is None else total_events
     head = (
         f"Сессия {watch['watch_id']}, {watch['symbol']} ({watch['market']}) · "
         f"интервал {watch['interval_sec']}с · длительность {watch['duration_min']} мин\n"
         f"Начало {utc(int(watch['started_at']))} UTC · статус {_watch_status(watch, now_ms)} "
-        f"· снимков {len(snapshots)}"
+        f"· снимков {total_snapshots} · событий {total_events}"
     )
     lines = [head, "", _watch_summary(watch, snapshots, events)]
     if format in {"raw", "both"}:
         lines += ["", "Сырые снимки:"]
         if not snapshots:
             lines.append("  n/a — снимков пока нет")
-        for snapshot in snapshots:
-            lines += _render_watch_snapshot(snapshot)
+        else:
+            raw_groups = [
+                (int(snapshot["ts"]), _render_watch_snapshot(snapshot))
+                for snapshot in snapshots
+            ]
+            _append_watch_page(
+                lines,
+                raw_groups,
+                total=total_snapshots,
+                label="снимков",
+                max_chars=(
+                    MAX_WATCH_RESPONSE_CHARS - 5_000
+                    if format == "both"
+                    else MAX_WATCH_RESPONSE_CHARS
+                ),
+            )
     if format in {"diff", "both"}:
         lines += ["", "Diff между последовательными снимками:"]
         if not events:
             lines.append("  событий пока нет")
-        for event in events:
-            lines.append(
-                f"  {utc(int(event['ts']))} UTC · {event['event_type']} · "
-                f"{event['side']} {event['price']:g} · qty "
-                f"{event['qty_before']:g} → {event['qty_after']:g}"
+        else:
+            diff_groups = [
+                (int(event["ts"]), [
+                    f"  {utc(int(event['ts']))} UTC · {event['event_type']} · "
+                    f"{event['side']} {event['price']:g} · qty "
+                    f"{event['qty_before']:g} → {event['qty_after']:g}"
+                ])
+                for event in events
+            ]
+            _append_watch_page(
+                lines,
+                diff_groups,
+                total=total_events,
+                label="событий",
+                max_chars=MAX_WATCH_RESPONSE_CHARS,
             )
     return "\n".join(lines)
+
+
+def _append_watch_page(
+    lines: list[str],
+    groups: Sequence[tuple[int, list[str]]],
+    *,
+    total: int,
+    label: str,
+    max_chars: int,
+) -> None:
+    """Вложить только полные снимки/события и подсказать следующую страницу."""
+    shown = 0
+    last_ts: int | None = None
+    for timestamp, group in groups:
+        candidate = "\n".join([*lines, *group])
+        # Оставляем место для строки пагинации: она также часть лимита ответа.
+        if len(candidate) > max_chars - 120:
+            break
+        lines.extend(group)
+        shown += 1
+        last_ts = timestamp
+    if shown < total:
+        next_from = (last_ts + 1) if last_ts is not None else "укажите from_ts"
+        lines.append(
+            f"  показано {shown} из {total} {label}; следующая страница: from_ts={next_from}"
+        )
+    else:
+        lines.append(f"  показано {shown} из {total} {label}")
 
 
 def _watch_status(row: Mapping[str, Any], now_ms: int) -> str:
@@ -289,11 +349,12 @@ def _watch_summary(
         lived = _long_lived_levels(watch, snapshots)
         if not lived:
             lines.append("  нет")
-        for item in lived:
+        for item in lived[:MAX_WATCH_SUMMARY_ROWS]:
             lines.append(
                 f"  {item['price']:g} {item['side']} · {usdt(item['notional_usdt'])} · "
                 f"присутствовал {item['minutes']:.1f} мин"
             )
+        lines.append(f"  всего {len(lived)}")
 
     lines += [
         "Кандидаты на спуфинг (исчез в пределах "
@@ -303,12 +364,14 @@ def _watch_summary(
     candidates = _vanished_near_price(snapshots, events)
     if not candidates:
         lines.append("  нет")
-    for item in candidates:
+    for item in candidates[:MAX_WATCH_SUMMARY_ROWS]:
         lines += [
             f"  {item['price']:g} {item['side']} · исчез {utc(item['vanished_at'])} UTC, "
             f"цена коснулась {item['touch_price']:g} в {utc(item['touch_at'])} UTC",
             "  поток сделок недоступен — filled/cancelled не различить",
         ]
+    if candidates:
+        lines.append(f"  всего {len(candidates)}")
     return "\n".join(lines)
 
 
