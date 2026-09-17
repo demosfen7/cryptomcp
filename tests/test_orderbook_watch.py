@@ -10,13 +10,16 @@ from cryptomcp.orderbook import build_order_book
 from cryptomcp.orderbook_watch import (
     RETENTION_AFTER_END_MIN,
     WatchAdmissionError,
+    classify_liquidity,
     cleanup,
     connect,
     diffs,
     get_watch,
+    list_watches,
     record_snapshot,
     record_trades,
     start,
+    storage_bytes,
     trade_gaps,
     trades,
 )
@@ -52,6 +55,38 @@ def _start(db, **overrides):
     )
     kwargs.update(overrides)
     return start(db, **kwargs)
+
+
+def _levels(*rows):
+    total = 0.0
+    result = []
+    for price, qty in rows:
+        total += price * qty
+        result.append({
+            "price": price,
+            "qty": qty,
+            "notional_usdt": price * qty,
+            "cum_notional_usdt": total,
+        })
+    return result
+
+
+def _watch_snapshot(
+    ts,
+    *,
+    bids=((100.0, 10.0), (99.0, 10.0)),
+    asks=((100.1, 10.0), (101.0, 10.0)),
+    mid=100.0,
+):
+    return {"ts": ts, "mid_price": mid, "bids": _levels(*bids), "asks": _levels(*asks)}
+
+
+def _trade(agg_id, ts, *, price, qty, maker):
+    return {"agg_id": agg_id, "ts": ts, "price": price, "qty": qty, "buyer_is_maker": maker}
+
+
+def _outcomes(snapshots, rows=(), gaps=()):
+    return classify_liquidity(snapshots, list(rows), list(gaps))["outcomes"]
 
 
 def test_b10_2_budget_rejection_happens_before_any_snapshot_is_written(db):
@@ -152,3 +187,96 @@ def test_c3_stores_raw_trades_and_records_aggregate_id_gap(db):
     assert stored["trade_request_count"] == 2
     assert stored["trade_extra_page_count"] == 1
     assert stored["trade_gap_count"] == 1
+
+
+def test_c5_1_level_with_opposite_taker_flow_that_remains_is_stable():
+    before = _watch_snapshot(NOW)
+    after = _watch_snapshot(NOW + 5_000)
+
+    outcomes = _outcomes([before, after], [_trade(1, NOW + 1, price=100, qty=3, maker=True)])
+
+    assert any(item["side"] == "bid" and item["price"] == 100 for item in outcomes["устоял"])
+
+
+def test_c5_2_disappeared_level_with_ninety_percent_flow_is_filled():
+    before = _watch_snapshot(NOW, bids=((100.0, 10.0), (99.5, 10.0), (99.0, 10.0)))
+    after = _watch_snapshot(NOW + 5_000, bids=((100.0, 10.0), (99.8, 10.0), (99.0, 10.0)))
+
+    outcomes = _outcomes([before, after], [_trade(1, NOW + 1, price=99.5, qty=9, maker=True)])
+
+    assert [item["price"] for item in outcomes["исполнен"]] == [99.5]
+
+
+def test_c5_3_disappeared_level_touched_with_small_flow_is_removed_at_price():
+    before = _watch_snapshot(NOW, bids=((100.0, 10.0), (99.5, 10.0), (99.0, 10.0)))
+    after = _watch_snapshot(NOW + 5_000, bids=((100.0, 10.0), (99.8, 10.0), (99.0, 10.0)))
+
+    outcomes = _outcomes([before, after], [_trade(1, NOW + 1, price=99.5, qty=1, maker=True)])
+
+    assert [item["price"] for item in outcomes["снят у цены"]] == [99.5]
+
+
+def test_c5_4_far_level_that_vanishes_before_price_approaches_is_removed_early():
+    before = _watch_snapshot(NOW, asks=((100.1, 10.0), (101.0, 10.0), (102.0, 10.0)))
+    after = _watch_snapshot(NOW + 5_000, asks=((100.1, 10.0), (102.0, 10.0)))
+    near = _watch_snapshot(NOW + 10_000, mid=101.05)
+
+    outcomes = _outcomes([before, after, near])
+
+    assert [item["price"] for item in outcomes["снят заранее"]] == [101.0]
+
+
+def test_c5_4_near_level_is_not_classified_as_removed_early():
+    before = _watch_snapshot(NOW, asks=((100.1, 10.0), (100.2, 10.0), (101.0, 10.0)))
+    after = _watch_snapshot(NOW + 5_000, asks=((100.1, 10.0), (101.0, 10.0)))
+    near = _watch_snapshot(NOW + 10_000, mid=100.2)
+
+    outcomes = _outcomes([before, after, near])
+
+    assert not outcomes["снят заранее"]
+
+
+def test_c5_5_flow_above_visible_size_on_remaining_level_is_iceberg_sign():
+    before = _watch_snapshot(NOW)
+    after = _watch_snapshot(NOW + 5_000)
+
+    outcomes = _outcomes([before, after], [_trade(1, NOW + 1, price=100, qty=15, maker=True)])
+
+    assert [item["price"] for item in outcomes["похоже на айсберг"]] == [100.0]
+
+
+def test_c5_6_buyer_taker_at_bid_does_not_count_as_bid_execution():
+    before = _watch_snapshot(NOW)
+    after = _watch_snapshot(NOW + 5_000)
+
+    outcomes = _outcomes([before, after], [_trade(1, NOW + 1, price=100, qty=15, maker=False)])
+
+    assert not outcomes["устоял"]
+
+
+def test_c5_7_trade_gap_makes_level_outcome_na_with_reason():
+    before = _watch_snapshot(NOW)
+    after = _watch_snapshot(NOW + 5_000)
+    gaps = [{"started_at": NOW + 1, "ended_at": NOW + 2}]
+
+    outcomes = _outcomes([before, after], gaps=gaps)
+
+    assert outcomes["n/a"]
+    assert outcomes["n/a"][0]["reason"] == "пропуск aggTrades в интервале снимков"
+
+
+def test_storage_size_is_calculated_from_saved_payloads(db):
+    """Важное 7: размер сессии не оценивается выдуманными КБ на снимок."""
+    session = _start(db)
+    record_snapshot(db, session["watch_id"], _book())
+    record_trades(
+        db,
+        session["watch_id"],
+        [{"a": 1, "T": NOW + 1, "p": "100", "q": "2", "m": False}],
+        request_count=1,
+        extra_pages=0,
+    )
+
+    listed = list_watches(db)[0]
+    assert listed["storage_bytes"] == storage_bytes(db, session["watch_id"])
+    assert listed["storage_bytes"] > 0
