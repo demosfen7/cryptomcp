@@ -12,6 +12,7 @@ from cryptomcp.markets import FUTURES
 from cryptomcp.orderbook import build_order_book
 from cryptomcp.render import MAX_WATCH_RESPONSE_CHARS, render_order_book_watch_data
 from cryptomcp.server import (
+    _record_order_book_watch_trades,
     _watch_tasks,
     get_order_book_watch_data,
     start_order_book_watch,
@@ -60,15 +61,25 @@ def _watch_db(monkeypatch, tmp_path):
 
 def _ctx(monkeypatch):
     registry = SimpleNamespace()
+    client = SimpleNamespace()
 
     async def get(symbol):
         return SimpleNamespace(symbol=symbol.upper())
 
     registry.get = get
 
+    async def ticker_24hr(_symbol):
+        return {"quoteVolume": "5000000"}
+
+    async def now_ms():
+        return NOW
+
+    client.ticker_24hr = ticker_24hr
+    client.now_ms = now_ms
+
     async def fake_ctx(market):
         assert market == "futures"
-        return SimpleNamespace(), None, registry, None, FUTURES
+        return client, None, registry, None, FUTURES
 
     monkeypatch.setattr("cryptomcp.server._ctx", fake_ctx)
 
@@ -151,10 +162,8 @@ async def test_shifted_limit_window_does_not_render_appeared_or_disappeared(monk
 async def test_b10_7_budget_rejects_fast_watch_and_accepts_fitting_one(monkeypatch, tmp_path):
     """B.10 №7: проверка использует остаток рынка до первого снимка, не 429 постфактум.
 
-    При реальном futures-весе 5 и минимальном интервале 1с один watch просит
-    300 ед/мин. В сочетании с лимитом в 10 сессий буквально занять половину
-    потолка и одновременно отвергнуть более быстрый watch невозможно, поэтому
-    ряд оставляет 60 ед/мин: 300 отклоняются, 60 принимаются.
+    После С2 watch 5с просит 300 ед/мин, а watch 1с — 540. Три обычных
+    сессии занимают 900: быстрая не помещается, четвёртая обычная — ровно да.
     """
     _, connect = _watch_db(monkeypatch, tmp_path)
     _ctx(monkeypatch)
@@ -162,15 +171,9 @@ async def test_b10_7_budget_rejects_fast_watch_and_accepts_fitting_one(monkeypat
     try:
         for index in range(3):
             watch.start(
-                con, symbol=f"FAST{index}USDT", market="futures", interval_sec=1,
-                duration_min=60, depth_pcts=(0.25,), depth_weight=5,
-                market_weight_limit=2400, started_at=NOW,
-            )
-        for index in range(4):
-            watch.start(
                 con, symbol=f"NORMAL{index}USDT", market="futures", interval_sec=5,
                 duration_min=60, depth_pcts=(0.25,), depth_weight=5,
-                market_weight_limit=2400, started_at=NOW,
+                trade_weight=20, market_weight_limit=2400, started_at=NOW,
             )
     finally:
         con.close()
@@ -185,8 +188,49 @@ async def test_b10_7_budget_rejects_fast_watch_and_accepts_fitting_one(monkeypat
     await _watch_tasks.pop(accepted_id)
 
     assert json.loads(rejected)["error"]["kind"] == "bad_params"
-    assert "просит 300 ед/мин" in rejected
+    assert "просит 540 ед/мин" in rejected
     assert accepted.startswith("Сессия watch_")
+
+
+@pytest.mark.asyncio
+async def test_c1_full_agg_trade_page_fetches_and_counts_next_page(monkeypatch, tmp_path):
+    """С1, С5 №8: ответ из 1000 сделок немедленно дочитывается по fromId."""
+    _, connect = _watch_db(monkeypatch, tmp_path)
+    con = connect(str(tmp_path / "order_book_watch.sqlite"))
+    try:
+        session = watch.start(
+            con, symbol="ARBUSDT", market="futures", interval_sec=5,
+            duration_min=60, depth_pcts=(0.25,), depth_weight=5, trade_weight=20,
+            market_weight_limit=2400, started_at=NOW,
+        )
+    finally:
+        con.close()
+
+    class FakeClient:
+        calls: list[int | None] = []
+
+        async def agg_trades(self, _symbol, *, limit, from_id):
+            assert limit == 1000
+            self.calls.append(from_id)
+            if from_id is None:
+                return [
+                    {"a": index, "T": NOW + index, "p": "100", "q": "1", "m": False}
+                    for index in range(1000)
+                ]
+            return [{"a": 1000, "T": NOW + 1000, "p": "100", "q": "1", "m": False}]
+
+    client = FakeClient()
+    await _record_order_book_watch_trades(client, session, fetched_at=NOW + 5_000)
+
+    con = connect(str(tmp_path / "order_book_watch.sqlite"))
+    try:
+        stored = watch.get_watch(con, session["watch_id"])
+        assert client.calls == [None, 1000]
+        assert stored["trade_request_count"] == 2
+        assert stored["trade_extra_page_count"] == 1
+        assert con.execute("SELECT COUNT(*) FROM watch_trades").fetchone()[0] == 1001
+    finally:
+        con.close()
 
 
 def test_watch_output_is_paginated_below_context_limit_for_every_format():
