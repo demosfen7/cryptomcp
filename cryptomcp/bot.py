@@ -671,22 +671,72 @@ def render_manual_message(
     return "\n".join(lines)
 
 
+#: Главное меню одним списком: из него собираются и кнопки под полем ввода,
+#: и inline-меню, и разбор нажатой подписи. Два списка разъехались бы на
+#: первой же новой кнопке, и одна из них перестала бы работать молча.
+MENU_ROWS: tuple[tuple[tuple[str, str], ...], ...] = (
+    (("📋 Список наблюдения", "watchlist"), ("🌅 Утренний обзор 🧠", "morning")),
+    (("🔍 Разбор монеты 🧠", "analyse"), ("✅ Перед сделкой 🧠", "before")),
+    (("📊 Стакан", "book"), ("👁 Наблюдение", "observe")),
+    (("🕵 Тихий набор 🧠", "quiet"), ("⏪ Задним числом 🧠", "history")),
+    (("📈 Итоги недели 🧠", "weekly"), ("⭐ Мои находки", "manual")),
+)
+
+#: Подпись кнопки под полем ввода приходит обычным текстом сообщения — по ней
+#: и узнаём сценарий.
+MENU_ACTIONS: dict[str, str] = {
+    text: action for row in MENU_ROWS for text, action in row
+}
+
+BACK_LABEL = "⬅️ Главное меню"
+
+#: Команды в кнопке «Меню» рядом с полем ввода. Нужны, чтобы меню было под
+#: рукой и в группе, где кнопок под полем не бывает.
+BOT_COMMANDS = (
+    ("menu", "главное меню"),
+    ("list", "список наблюдения"),
+    ("book", "стакан монеты"),
+    ("morning", "утренний обзор"),
+    ("id", "показать мой id"),
+)
+
+COMMAND_ACTIONS = {"/list": "watchlist", "/book": "book", "/morning": "morning"}
+
+
 def main_menu() -> list[list[dict[str, str]]]:
-    """Макет главного меню из MOCKUPS.md §2, без скрытых сценариев."""
-    rows = (
-        (("📋 Список наблюдения", "watchlist"), ("🌅 Утренний обзор 🧠", "morning")),
-        (("🔍 Разбор монеты 🧠", "analyse"), ("✅ Перед сделкой 🧠", "before")),
-        (("📊 Стакан", "book"), ("👁 Наблюдение за стаканом", "observe")),
-        (("🕵 Тихий набор 🧠", "quiet"), ("⏪ Задним числом 🧠", "history")),
-        (("📈 Итоги недели 🧠", "weekly"), ("⭐ Мои находки", "manual")),
-    )
+    """Inline-меню: то же, что под полем ввода, но внутри сообщения."""
     return [
         [
             {"text": text, "callback_data": encode_callback(action)}
             for text, action in row
         ]
-        for row in rows
+        for row in MENU_ROWS
     ]
+
+
+def reply_menu() -> dict[str, Any]:
+    """Кнопки под полем ввода: меню видно всегда, вызывать его не нужно.
+
+    `is_persistent` оставляет клавиатуру на экране, `resize_keyboard` делает
+    кнопки в одну строку по высоте текста. Это и есть ответ на просьбу
+    владельца «чтобы не нажимать /start каждый раз»: клавиатура ставится один
+    раз и живёт в чате, пока её не убрать.
+    """
+    return {
+        "keyboard": [[{"text": text} for text, _ in row] for row in MENU_ROWS],
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "input_field_placeholder": "Выберите кнопку или напишите тикер",
+    }
+
+
+def with_back(
+    rows: list[list[dict[str, str]]] | None = None,
+) -> list[list[dict[str, str]]]:
+    """Дописать возврат в главное меню последней строкой любого экрана."""
+    result = [list(row) for row in (rows or [])]
+    result.append([{"text": BACK_LABEL, "callback_data": encode_callback("menu")}])
+    return result
 
 
 class TelegramAPI:
@@ -722,11 +772,14 @@ class TelegramAPI:
         chat_id: int,
         text: str,
         *,
-        reply_markup: list[list[dict[str, str]]] | None = None,
+        reply_markup: list[list[dict[str, str]]] | dict[str, Any] | None = None,
         force_reply: bool = False,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-        if reply_markup is not None:
+        if isinstance(reply_markup, dict):
+            # Клавиатура под полем ввода приходит готовой структурой.
+            payload["reply_markup"] = reply_markup
+        elif reply_markup is not None:
             payload["reply_markup"] = {"inline_keyboard": reply_markup}
         elif force_reply:
             payload["reply_markup"] = {"force_reply": True, "selective": True}
@@ -741,6 +794,14 @@ class TelegramAPI:
         if reply_markup is not None:
             payload["reply_markup"] = {"inline_keyboard": reply_markup}
         await self.call("editMessageText", payload)
+
+    async def set_my_commands(self, commands: tuple[tuple[str, str], ...]) -> None:
+        """Список команд в кнопке «Меню» — ставится один раз при старте."""
+        await self.call("setMyCommands", {
+            "commands": [
+                {"command": name, "description": about} for name, about in commands
+            ]
+        })
 
     async def answer_callback(self, callback_id: str, text: str | None = None) -> None:
         payload: dict[str, Any] = {"callback_query_id": callback_id}
@@ -972,6 +1033,7 @@ class Bot:
     async def run(self) -> None:
         if not self.config.token:
             raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
+        await self._publish_commands()
         await self._recover_interrupted_watches()
         while True:
             try:
@@ -987,6 +1049,16 @@ class Bot:
             except Exception as error:  # noqa: BLE001 - сеть не должна завершить polling
                 log.warning("getUpdates не удался: %s", error)
                 await asyncio.sleep(2)
+
+    async def _publish_commands(self) -> None:
+        """Список команд в кнопке «Меню». Сбой здесь не стоит опроса."""
+        publish = getattr(self.telegram, "set_my_commands", None)
+        if publish is None:
+            return
+        try:
+            await publish(BOT_COMMANDS)
+        except Exception as error:  # noqa: BLE001 - меню не важнее работы бота
+            log.warning("не удалось опубликовать команды: %s", error)
 
     async def handle_update(self, update: dict[str, Any]) -> None:
         if "callback_query" in update:
@@ -1006,11 +1078,22 @@ class Bot:
         if not is_allowed(user_id, self.config.allowed_user_ids):
             await self.telegram.send_message(chat_id, access_denied_text(user_id))
             return
+        # Чат владельца запоминается при любом его обращении, а не только на
+        # /start: иначе утренний обзор некуда слать после того, как человек
+        # один раз нажал кнопку вместо команды.
+        self.store.remember_user(user_id, chat_id, now_ms())
         if command in {"/start", "/menu"}:
-            self.store.remember_user(user_id, chat_id, now_ms())
-            await self.telegram.send_message(
-                chat_id, "Выберите сценарий.", reply_markup=main_menu()
-            )
+            await self._show_menu(chat_id, greeting=command == "/start")
+            return
+        if command in COMMAND_ACTIONS:
+            await self._dispatch_action(chat_id, user_id, COMMAND_ACTIONS[command])
+            return
+        action = MENU_ACTIONS.get(text)
+        if action is not None:
+            await self._dispatch_action(chat_id, user_id, action)
+            return
+        if text == BACK_LABEL:
+            await self._show_menu(chat_id)
             return
         note = self._pending_note.pop(user_id, None)
         if note is not None:
@@ -1025,7 +1108,27 @@ class Bot:
         if pending and text:
             await self._use_symbol(chat_id, user_id, pending, _normalise_symbol(text))
             return
-        await self.telegram.send_message(chat_id, "Нажмите /menu, чтобы выбрать сценарий.")
+        await self._show_menu(chat_id)
+
+    async def _show_menu(self, chat_id: int, *, greeting: bool = False) -> None:
+        """Показать меню: кнопки под полем ввода плюс те же кнопки в сообщении.
+
+        Клавиатура под полем остаётся в чате навсегда, поэтому вызывать меню
+        командой больше не нужно — ровно то, о чём просил владелец.
+        """
+        if greeting:
+            await self.telegram.send_message(
+                chat_id,
+                "Меню всегда под полем ввода — вызывать его командой не нужно.",
+                reply_markup=reply_menu(),
+            )
+        else:
+            await self.telegram.send_message(
+                chat_id, "Меню под полем ввода.", reply_markup=reply_menu()
+            )
+        await self.telegram.send_message(
+            chat_id, "Выберите сценарий.", reply_markup=main_menu()
+        )
 
     async def _handle_callback(self, callback: dict[str, Any]) -> None:
         # Ответить надо ДО любой работы: Telegram иначе оставляет спиннер на
@@ -1039,6 +1142,7 @@ class Bot:
         if not is_allowed(user_id, self.config.allowed_user_ids):
             await self.telegram.send_message(chat_id, access_denied_text(user_id))
             return
+        self.store.remember_user(user_id, chat_id, now_ms())
         action = str(callback.get("data") or "")
         notification_match = re.fullmatch(r"a:([^:]+):([^:]+):([abm])", action)
         if notification_match:
@@ -1076,25 +1180,10 @@ class Bot:
                 chat_id, "Напишите тикер: можно ID или IDUSDT.", force_reply=True
             )
             return
-        if action == "watchlist":
-            text = await self.templates.watchlist()
-            await self.telegram.send_message(chat_id, text, reply_markup=_watchlist_keyboard())
-            return
-        if action == "manual":
-            text = await self.templates.manual()
-            await self.telegram.send_message(chat_id, text, reply_markup=_manual_keyboard())
-            return
-        if action == "manual-add":
-            await self._ask_symbol(chat_id, "manual-add")
-            return
-        if action == "manual-remove":
-            await self._ask_symbol(chat_id, "manual-remove")
-            return
-        if action in {"analyse", "before", "book", "observe", "history"}:
-            await self._ask_symbol(chat_id, action)
-            return
-        if action in {"morning", "quiet", "weekly"}:
-            await self._run_scenario(chat_id, user_id, action)
+        if action in MENU_ACTIONS.values() or action in {
+            "menu", "manual-add", "manual-remove",
+        }:
+            await self._dispatch_action(chat_id, user_id, action)
             return
         explain_match = re.fullmatch(r"explain-(book|watch):(.+)", action)
         if explain_match:
@@ -1117,7 +1206,42 @@ class Bot:
                 as_of_ms=now_ms() - days * 86_400_000,
             )
             return
-        await self.telegram.send_message(chat_id, "Сценарий будет доступен после настройки данных.")
+        await self.telegram.send_message(
+            chat_id, "Не понял кнопку.", reply_markup=with_back(),
+        )
+
+    async def _dispatch_action(self, chat_id: int, user_id: int, action: str) -> None:
+        """Один разбор действия для кнопок меню, подписей под полем и команд."""
+        if action == "menu":
+            await self._show_menu(chat_id)
+            return
+        if action == "watchlist":
+            text = await self.templates.watchlist()
+            await self.telegram.send_message(
+                chat_id, text, reply_markup=_watchlist_keyboard(),
+            )
+            return
+        if action == "manual":
+            text = await self.templates.manual()
+            await self.telegram.send_message(
+                chat_id, text, reply_markup=_manual_keyboard(),
+            )
+            return
+        if action == "manual-add":
+            await self._ask_symbol(chat_id, "manual-add")
+            return
+        if action == "manual-remove":
+            await self._ask_symbol(chat_id, "manual-remove")
+            return
+        if action in {"analyse", "before", "book", "observe", "history"}:
+            await self._ask_symbol(chat_id, action)
+            return
+        if action in {"morning", "quiet", "weekly"}:
+            await self._run_scenario(chat_id, user_id, action)
+            return
+        await self.telegram.send_message(
+            chat_id, "Такого сценария нет.", reply_markup=with_back(),
+        )
 
     async def _ask_symbol(self, chat_id: int, action: str) -> None:
         # Первые восемь берём из текущего списка только на этапе UI; когда
@@ -1137,7 +1261,7 @@ class Bot:
         await self.telegram.send_message(
             chat_id,
             "Напишите тикер: можно ID или IDUSDT.",
-            reply_markup=rows,
+            reply_markup=with_back(rows),
         )
 
     async def _use_symbol(self, chat_id: int, user_id: int, action: str, symbol: str) -> None:
@@ -1365,27 +1489,27 @@ def _normalise_symbol(text: str) -> str:
 
 
 def _watchlist_keyboard() -> list[list[dict[str, str]]]:
-    return [
+    return with_back([
         [
             {"text": "Все монеты", "callback_data": encode_callback("watchlist")},
             {"text": "🌅 Утренний обзор 🧠", "callback_data": encode_callback("morning")},
         ]
-    ]
+    ])
 
 
 def _manual_keyboard() -> list[list[dict[str, str]]]:
-    return [[
+    return with_back([[
         {"text": "➕ Добавить", "callback_data": encode_callback("manual-add")},
         {"text": "➖ Убрать", "callback_data": encode_callback("manual-remove")},
-    ]]
+    ]])
 
 
 def _manual_timeframe_keyboard(symbol: str) -> list[list[dict[str, str]]]:
-    return [[
+    return with_back([[
         {"text": "1d", "callback_data": encode_callback("manual-tf-1d", symbol)},
         {"text": "4h", "callback_data": encode_callback("manual-tf-4h", symbol)},
         {"text": "1h", "callback_data": encode_callback("manual-tf-1h", symbol)},
-    ]]
+    ]])
 
 
 def _book_keyboard(symbol: str) -> list[list[dict[str, str]]]:
@@ -1399,43 +1523,44 @@ def _book_keyboard(symbol: str) -> list[list[dict[str, str]]]:
             {"text": "60 мин", "callback_data": encode_callback("observe-60", symbol)},
         ],
         [{"text": "🧠 Объяснить", "callback_data": encode_callback("explain-book", symbol)}],
+        [{"text": BACK_LABEL, "callback_data": encode_callback("menu")}],
     ]
 
 
 def _history_keyboard(symbol: str) -> list[list[dict[str, str]]]:
-    return [[
+    return with_back([[
         {"text": "Сутки назад", "callback_data": encode_callback("hist-1", symbol)},
         {"text": "Неделю назад", "callback_data": encode_callback("hist-7", symbol)},
-    ]]
+    ]])
 
 
 def _scenario_keyboard(name: str, symbol: str | None) -> list[list[dict[str, str]]] | None:
     """Следующий шаг под ответом: разбор ведёт к проверке и стакану."""
     if symbol is None:
-        return None
+        return with_back()
     book = {"text": "📊 Стакан", "callback_data": encode_callback("symbol-book", symbol)}
     if name == "analyse":
         before = encode_callback("symbol-before", symbol)
-        return [[{"text": "✅ Перед сделкой 🧠", "callback_data": before}, book]]
+        return with_back([[{"text": "✅ Перед сделкой 🧠", "callback_data": before}, book]])
     if name in {"before", "history"}:
         analyse = encode_callback("symbol-analyse", symbol)
-        return [[{"text": "🔍 Разбор 🧠", "callback_data": analyse}, book]]
-    return None
+        return with_back([[{"text": "🔍 Разбор 🧠", "callback_data": analyse}, book]])
+    return with_back()
 
 
 def _observe_keyboard(symbol: str) -> list[list[dict[str, str]]]:
-    return [[
+    return with_back([[
         {"text": "15 мин", "callback_data": encode_callback("observe-15", symbol)},
         {"text": "30 мин", "callback_data": encode_callback("observe-30", symbol)},
         {"text": "60 мин", "callback_data": encode_callback("observe-60", symbol)},
-    ]]
+    ]])
 
 
 def _watch_summary_keyboard(symbol: str) -> list[list[dict[str, str]]]:
-    return [[
+    return with_back([[
         {"text": "🧠 Объяснить", "callback_data": encode_callback("explain-watch", symbol)},
         {"text": "👁 Ещё 30 мин", "callback_data": encode_callback("observe-30", symbol)},
-    ]]
+    ]])
 
 
 def health(

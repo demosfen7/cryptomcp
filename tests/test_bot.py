@@ -636,3 +636,131 @@ async def test_claude_failure_says_no_money_was_spent(tmp_path):
     assert "Claude не ответил" in text and "не списаны" in text
     from cryptomcp.bot import day_start_ms, now_ms
     assert worker.store.spent_since(day_start_ms("Europe/Berlin", now_ms())) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_start_puts_a_persistent_keyboard_under_the_input(bot):
+    """Меню живёт под полем ввода: вызывать его командой больше не нужно."""
+    worker, telegram = bot
+
+    await worker.handle_update(message(42, "/start"))
+
+    keyboard = telegram.messages[0]["reply_markup"]
+    assert keyboard["is_persistent"] is True
+    assert keyboard["resize_keyboard"] is True
+    labels = [button["text"] for row in keyboard["keyboard"] for button in row]
+    assert "📋 Список наблюдения" in labels and "⭐ Мои находки" in labels
+    assert telegram.messages[1]["reply_markup"][0][0]["text"].startswith("📋")
+
+
+@pytest.mark.asyncio
+async def test_pressing_a_keyboard_label_runs_the_scenario(tmp_path):
+    """Кнопка под полем присылает обычный текст — по нему и узнаём сценарий."""
+    class Templates:
+        async def watchlist(self):
+            return "📋 Список наблюдения · пусто"
+
+    from cryptomcp.bot import Bot, BotConfig
+
+    telegram = FakeTelegram()
+    worker = Bot(
+        BotConfig(token="x", allowed_user_ids=(42,),
+                  database_path=str(tmp_path / "bot.sqlite")),
+        telegram=telegram, templates=Templates(), assistant=None,
+    )
+
+    await worker.handle_update(message(42, "📋 Список наблюдения"))
+
+    assert telegram.messages[-1]["text"].startswith("📋 Список наблюдения")
+
+
+@pytest.mark.asyncio
+async def test_any_message_remembers_the_chat_for_the_morning(bot):
+    """Утренний обзор некуда слать, если запоминать чат только на /start."""
+    worker, telegram = bot
+
+    await worker.handle_update(message(42, "привет", chat_id=555))
+
+    assert worker.store.chat_for_user(42) == 555
+
+
+@pytest.mark.asyncio
+async def test_every_screen_has_a_way_back_to_the_menu(tmp_path):
+    from cryptomcp.bot import (
+        BACK_LABEL,
+        _book_keyboard,
+        _history_keyboard,
+        _manual_keyboard,
+        _manual_timeframe_keyboard,
+        _observe_keyboard,
+        _scenario_keyboard,
+        _watch_summary_keyboard,
+        _watchlist_keyboard,
+    )
+
+    screens = [
+        _watchlist_keyboard(),
+        _manual_keyboard(),
+        _manual_timeframe_keyboard("IDUSDT"),
+        _book_keyboard("IDUSDT"),
+        _observe_keyboard("IDUSDT"),
+        _watch_summary_keyboard("IDUSDT"),
+        _history_keyboard("IDUSDT"),
+        _scenario_keyboard("analyse", "IDUSDT"),
+        _scenario_keyboard("morning", None),
+    ]
+
+    for screen in screens:
+        assert screen[-1][-1]["text"] == BACK_LABEL, screen
+
+
+@pytest.mark.asyncio
+async def test_back_button_shows_the_menu_again(bot):
+    worker, telegram = bot
+
+    await worker.handle_update(callback(42, "menu"))
+
+    assert telegram.messages[-1]["text"] == "Выберите сценарий."
+    assert telegram.messages[-2]["reply_markup"]["is_persistent"] is True
+
+
+@pytest.mark.asyncio
+async def test_commands_are_published_once_at_start(tmp_path):
+    """Кнопка «Меню» рядом с полем: список команд ставится при запуске."""
+    from cryptomcp.bot import BOT_COMMANDS, Bot, BotConfig
+
+    published = []
+
+    class Telegram(FakeTelegram):
+        async def set_my_commands(self, commands):
+            published.append(commands)
+
+    worker = Bot(
+        BotConfig(token="x", allowed_user_ids=(42,),
+                  database_path=str(tmp_path / "bot.sqlite")),
+        telegram=Telegram(), assistant=None,
+    )
+
+    await worker._publish_commands()
+
+    assert published == [BOT_COMMANDS]
+
+
+@pytest.mark.asyncio
+async def test_command_shortcut_runs_the_scenario(tmp_path):
+    class Templates:
+        async def watchlist(self):
+            return "📋 Список наблюдения · пусто"
+
+    from cryptomcp.bot import Bot, BotConfig
+
+    telegram = FakeTelegram()
+    worker = Bot(
+        BotConfig(token="x", allowed_user_ids=(42,),
+                  database_path=str(tmp_path / "bot.sqlite")),
+        telegram=telegram, templates=Templates(), assistant=None,
+    )
+
+    await worker.handle_update(message(42, "/list"))
+
+    assert telegram.messages[-1]["text"].startswith("📋 Список наблюдения")
