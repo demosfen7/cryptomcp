@@ -23,11 +23,26 @@ NOW = 1_789_870_000_000
 def _book(ts=NOW, *, extra_bid=False):
     bids = [["100", "10"], ["99.8", "20"]]
     if extra_bid:
-        bids.append(["99.6", "7"])
+        bids[1] = ["99.8", "27"]
     return build_order_book(
         {"bids": bids, "asks": [["100.2", "15"], ["100.4", "25"]]},
         timestamp_ms=ts,
         last_price=100.1,
+        limit=100,
+        depth_pcts=(0.25,),
+        turnover_24h_usdt=5_000_000,
+    )
+
+
+def _shifted_book(ts, *, shift: float):
+    """Та же ликвидность, но край limit-окна сдвинут одним тиком."""
+    return build_order_book(
+        {
+            "bids": [[str(100.0 + shift), "10"], [str(99.8 + shift), "10"]],
+            "asks": [[str(100.2 + shift), "15"], [str(100.4 + shift), "15"]],
+        },
+        timestamp_ms=ts,
+        last_price=100.1 + shift,
         limit=100,
         depth_pcts=(0.25,),
         turnover_24h_usdt=5_000_000,
@@ -105,8 +120,31 @@ async def test_b10_6_diff_format_uses_written_events(monkeypatch, tmp_path):
     text = await get_order_book_watch_data(session["watch_id"], format="diff")
 
     assert "Diff между последовательными снимками" in text
-    assert "appeared · bid 99.6" in text
+    assert "grew · bid 99.8" in text
     assert "Сырые снимки:" not in text
+
+
+@pytest.mark.asyncio
+async def test_shifted_limit_window_does_not_render_appeared_or_disappeared(monkeypatch, tmp_path):
+    """Блокер 2: край двух L2-окон не превращается в биржевое событие."""
+    _, connect = _watch_db(monkeypatch, tmp_path)
+    con = connect(str(tmp_path / "order_book_watch.sqlite"))
+    try:
+        session = watch.start(
+            con, symbol="ARBUSDT", market="futures", interval_sec=5,
+            duration_min=60, depth_pcts=(0.25,), depth_weight=5,
+            market_weight_limit=2400, started_at=NOW,
+        )
+        watch.record_snapshot(con, session["watch_id"], _shifted_book(NOW, shift=0.0))
+        watch.record_snapshot(con, session["watch_id"], _shifted_book(NOW + 5_000, shift=0.2))
+    finally:
+        con.close()
+
+    text = await get_order_book_watch_data(session["watch_id"], format="diff")
+
+    assert "appeared ·" not in text
+    assert "disappeared ·" not in text
+    assert "событий пока нет" in text
 
 
 @pytest.mark.asyncio
