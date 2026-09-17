@@ -36,6 +36,9 @@ VANISHED_BEFORE_TOUCH_SNAPSHOTS = 3
 NEAR_PRICE_PCT = 0.3
 FILL_SHARE = 0.8
 SUMMARY_TOP_LEVELS = 10
+#: asyncio может начать следующий плановый тик на несколько миллисекунд раньше.
+#: Такой джиттер не должен откладывать polling trades ещё на весь интервал.
+TRADE_POLL_JITTER_MS = 50
 
 DEFAULT_PATH = os.environ.get("CRYPTOMCP_ORDER_BOOK_WATCH_DB") or os.path.join(
     os.path.dirname(storage.DEFAULT_PATH) or ".", "order_book_watch.sqlite"

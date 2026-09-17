@@ -274,6 +274,36 @@ async def test_c1_trade_polling_uses_client_clock_not_futures_matching_timestamp
 
 
 @pytest.mark.asyncio
+async def test_c1_trade_polling_does_not_skip_a_tick_for_one_millisecond_jitter(
+    monkeypatch, tmp_path
+):
+    """C1: разница 4.999 с — это плановый 5-секундный тик, а не новый 10-секундный."""
+    _, connect = _watch_db(monkeypatch, tmp_path)
+    con = connect(str(tmp_path / "order_book_watch.sqlite"))
+    try:
+        session = watch.start(
+            con, symbol="ARBUSDT", market="futures", interval_sec=5,
+            duration_min=60, depth_pcts=(0.25,), depth_weight=5, trade_weight=20,
+            market_weight_limit=2400, started_at=NOW,
+        )
+        watch.mark_trade_fetch(con, session["watch_id"], NOW)
+        session = watch.get_watch(con, session["watch_id"])
+
+        class FakeClient:
+            calls: list[int | None] = []
+
+            async def agg_trades(self, _symbol, *, limit, from_id):
+                self.calls.append(from_id)
+                return []
+
+        client = FakeClient()
+        await _record_order_book_watch_trades(client, session, fetched_at=NOW + 4_999)
+        assert client.calls == [None]
+    finally:
+        con.close()
+
+
+@pytest.mark.asyncio
 async def test_boundary_snapshot_expires_watch_without_counting_an_error(monkeypatch, tmp_path):
     """Мелкое 12: ответ, пришедший после ends_at, штатно завершает сессию."""
     _, connect = _watch_db(monkeypatch, tmp_path)
