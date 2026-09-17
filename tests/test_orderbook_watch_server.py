@@ -10,6 +10,7 @@ import pytest
 from cryptomcp import orderbook_watch as watch
 from cryptomcp.markets import FUTURES
 from cryptomcp.orderbook import build_order_book
+from cryptomcp.render import MAX_WATCH_RESPONSE_CHARS, render_order_book_watch_data
 from cryptomcp.server import (
     _watch_tasks,
     get_order_book_watch_data,
@@ -148,3 +149,65 @@ async def test_b10_7_budget_rejects_fast_watch_and_accepts_fitting_one(monkeypat
     assert json.loads(rejected)["error"]["kind"] == "bad_params"
     assert "просит 300 ед/мин" in rejected
     assert accepted.startswith("Сессия watch_")
+
+
+def test_watch_output_is_paginated_below_context_limit_for_every_format():
+    """Блокер 1: текст, а не объект, остаётся читаемым на сотнях снимков."""
+    levels = [
+        {
+            "price": 100 - index / 100,
+            "qty": 1.0,
+            "notional_usdt": 100.0,
+            "cum_notional_usdt": (index + 1) * 100.0,
+        }
+        for index in range(100)
+    ]
+    snapshots = [
+        {
+            "ts": NOW + index * 5_000,
+            "mid_price": 100.0,
+            "best_bid": 99.99,
+            "best_ask": 100.01,
+            "spread_pct": 0.02,
+            "bids": levels,
+            "asks": levels,
+        }
+        for index in range(300)
+    ]
+    events = [
+        {
+            "ts": NOW + index * 5_000,
+            "side": "bid",
+            "price": 99.0,
+            "qty_before": 1.0,
+            "qty_after": 0.0,
+            "event_type": "disappeared",
+        }
+        for index in range(300)
+    ]
+    session = {
+        "watch_id": "watch_page",
+        "symbol": "ARBUSDT",
+        "market": "futures",
+        "interval_sec": 5,
+        "duration_min": 60,
+        "started_at": NOW,
+        "ends_at": NOW + 3_600_000,
+        "status": "active",
+        "last_snapshot_at": NOW,
+    }
+
+    for format in ("summary", "raw", "diff", "both"):
+        text = render_order_book_watch_data(
+            session,
+            snapshots,
+            events,
+            format=format,
+            now_ms=NOW,
+            total_snapshots=300,
+            total_events=300,
+        )
+        assert len(text) <= MAX_WATCH_RESPONSE_CHARS
+        assert "снимков 300 · событий 300" in text
+        if format in {"raw", "diff", "both"}:
+            assert "показано " in text

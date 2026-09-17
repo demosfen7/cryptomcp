@@ -626,6 +626,9 @@ async def list_order_book_watches() -> str:
     description=(
         "Возвращает накопленные данные сессии стакана. format=raw — снимки, "
         "format=diff — события, посчитанные при записи, format=both — оба блока; "
+        "по умолчанию format=summary: только сводка и счётчики. Сырые блоки "
+        "постраничны и ограничены по размеру ответа; строка подсказывает from_ts "
+        "для следующей страницы. "
         "from_ts/to_ts ограничивают окно в миллисекундах Unix. Сводка показывает "
         "долгоживущие уровни и кандидатов на спуфинг, но честно предупреждает: "
         "без потока сделок filled и cancelled не различить."
@@ -635,11 +638,11 @@ async def get_order_book_watch_data(
     watch_id: str,
     from_ts: int | None = None,
     to_ts: int | None = None,
-    format: str = "both",
+    format: str = "summary",
 ) -> str:
     try:
-        if format not in {"raw", "diff", "both"}:
-            raise bad_params("format должен быть raw, diff или both", format=format)
+        if format not in {"summary", "raw", "diff", "both"}:
+            raise bad_params("format должен быть summary, raw, diff или both", format=format)
         if from_ts is not None and to_ts is not None and from_ts > to_ts:
             raise bad_params("from_ts не может быть больше to_ts")
         con = watch.read_only()
@@ -647,12 +650,18 @@ async def get_order_book_watch_data(
             session = watch.get_watch(con, watch_id)
             if session is None:
                 raise bad_params(f"Сессия {watch_id!r} не найдена", watch_id=watch_id)
+            snapshot_count = watch.snapshot_count(
+                con, watch_id, from_ts=from_ts, to_ts=to_ts
+            )
+            diff_count = watch.diff_count(con, watch_id, from_ts=from_ts, to_ts=to_ts)
             return render_order_book_watch_data(
                 session,
                 watch.snapshots(con, watch_id, from_ts=from_ts, to_ts=to_ts),
                 watch.diffs(con, watch_id, from_ts=from_ts, to_ts=to_ts),
                 format=format,
                 now_ms=watch.now_ms(),
+                total_snapshots=snapshot_count,
+                total_events=diff_count,
             )
         finally:
             if con is not None:

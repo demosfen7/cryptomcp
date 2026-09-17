@@ -342,6 +342,33 @@ def diffs(
     return [dict(row) for row in rows]
 
 
+def snapshot_count(
+    con: sqlite3.Connection | None,
+    watch_id: str,
+    *,
+    from_ts: int | None = None,
+    to_ts: int | None = None,
+) -> int:
+    if con is None:
+        return 0
+    where, params = _window_where(watch_id, from_ts, to_ts)
+    row = con.execute("SELECT COUNT(*) FROM watch_snapshots WHERE " + where, params).fetchone()
+    return int(row[0])
+
+
+def diff_count(
+    con: sqlite3.Connection | None,
+    watch_id: str,
+    *,
+    from_ts: int | None = None,
+    to_ts: int | None = None,
+) -> int:
+    if con is None:
+        return 0
+    where, params = _window_where(watch_id, from_ts, to_ts)
+    return int(con.execute("SELECT COUNT(*) FROM watch_diffs WHERE " + where, params).fetchone()[0])
+
+
 def cleanup(path: str = DEFAULT_PATH, *, current_ms: int | None = None) -> dict[str, int]:
     """Истечь зависшие сессии и удалить завершённые данные после retention (B.6)."""
     if not os.path.exists(path):
