@@ -55,7 +55,13 @@ CREATE TABLE IF NOT EXISTS order_book_watches (
     snapshot_count          INTEGER NOT NULL DEFAULT 0,
     error_count             INTEGER NOT NULL DEFAULT 0,
     last_snapshot_at        INTEGER,
-    weight_per_min          REAL NOT NULL
+    weight_per_min          REAL NOT NULL,
+    turnover_24h            REAL,
+    turnover_taken_at       INTEGER,
+    trade_last_id           INTEGER,
+    trade_request_count     INTEGER NOT NULL DEFAULT 0,
+    trade_extra_page_count  INTEGER NOT NULL DEFAULT 0,
+    trade_gap_count         INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS order_book_watches_status_end
@@ -88,6 +94,27 @@ CREATE TABLE IF NOT EXISTS watch_diffs (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS watch_diffs_window ON watch_diffs (watch_id, ts);
+
+CREATE TABLE IF NOT EXISTS watch_trades (
+    watch_id       TEXT NOT NULL REFERENCES order_book_watches(watch_id) ON DELETE CASCADE,
+    agg_id         INTEGER NOT NULL,
+    ts             INTEGER NOT NULL,
+    price          REAL NOT NULL,
+    qty            REAL NOT NULL,
+    buyer_is_maker INTEGER NOT NULL CHECK (buyer_is_maker IN (0, 1)),
+    PRIMARY KEY (watch_id, agg_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS watch_trades_window ON watch_trades (watch_id, ts);
+
+CREATE TABLE IF NOT EXISTS watch_trade_gaps (
+    watch_id      TEXT NOT NULL REFERENCES order_book_watches(watch_id) ON DELETE CASCADE,
+    before_agg_id INTEGER NOT NULL,
+    after_agg_id  INTEGER NOT NULL,
+    started_at    INTEGER NOT NULL,
+    ended_at      INTEGER NOT NULL,
+    PRIMARY KEY (watch_id, before_agg_id, after_agg_id)
+) WITHOUT ROWID;
 """
 
 
@@ -113,8 +140,28 @@ def connect(path: str = DEFAULT_PATH) -> sqlite3.Connection:
     con.execute("PRAGMA journal_mode = WAL")
     con.execute("PRAGMA synchronous = NORMAL")
     con.executescript(SCHEMA)
+    _migrate_session_columns(con)
     con.commit()
     return con
+
+
+def _migrate_session_columns(con: sqlite3.Connection) -> None:
+    """Добавить поля С1--С3 в уже созданный временный файл без потери сессий."""
+    existing = {
+        str(row["name"])
+        for row in con.execute("PRAGMA table_info(order_book_watches)")
+    }
+    additions = {
+        "turnover_24h": "REAL",
+        "turnover_taken_at": "INTEGER",
+        "trade_last_id": "INTEGER",
+        "trade_request_count": "INTEGER NOT NULL DEFAULT 0",
+        "trade_extra_page_count": "INTEGER NOT NULL DEFAULT 0",
+        "trade_gap_count": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, definition in additions.items():
+        if name not in existing:
+            con.execute(f"ALTER TABLE order_book_watches ADD COLUMN {name} {definition}")
 
 
 def read_only(path: str = DEFAULT_PATH) -> sqlite3.Connection | None:
@@ -127,8 +174,12 @@ def read_only(path: str = DEFAULT_PATH) -> sqlite3.Connection | None:
     return con
 
 
-def weight_per_minute(interval_sec: int, depth_weight: int) -> float:
-    return 60.0 / interval_sec * depth_weight
+def weight_per_minute(interval_sec: int, depth_weight: int, trade_weight: int = 0) -> float:
+    """Вес стакана и aggTrades из формулы С2, на IP-минуту."""
+    return (
+        60.0 / interval_sec * depth_weight
+        + 60.0 / max(5, interval_sec) * trade_weight
+    )
 
 
 def start(
@@ -141,7 +192,10 @@ def start(
     depth_pcts: tuple[float, ...],
     depth_weight: int,
     market_weight_limit: int,
+    trade_weight: int = 0,
     started_at: int | None = None,
+    turnover_24h: float | None = None,
+    turnover_taken_at: int | None = None,
 ) -> dict[str, Any]:
     """Атомарно допустить сессию либо отказать ДО первого снимка (B.4)."""
     if interval_sec < 1:
@@ -151,7 +205,7 @@ def start(
             f"duration_min должен быть в диапазоне 1..{MAX_DURATION_MIN}"
         )
     started_at = now_ms() if started_at is None else started_at
-    requested = weight_per_minute(interval_sec, depth_weight)
+    requested = weight_per_minute(interval_sec, depth_weight, trade_weight)
     ceiling = market_weight_limit * SESSION_WEIGHT_SHARE
 
     # Проверка и INSERT одной транзакцией: два одновременных start не должны
@@ -193,16 +247,22 @@ def start(
             "error_count": 0,
             "last_snapshot_at": None,
             "weight_per_min": requested,
+            "turnover_24h": turnover_24h,
+            "turnover_taken_at": turnover_taken_at,
+            "trade_last_id": None,
+            "trade_request_count": 0,
+            "trade_extra_page_count": 0,
+            "trade_gap_count": 0,
         }
         con.execute(
             "INSERT INTO order_book_watches "
             "(watch_id, symbol, market, interval_sec, duration_min, depth_pcts, "
-            "started_at, ends_at, status, retention_after_end_min, weight_per_min) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "started_at, ends_at, status, retention_after_end_min, weight_per_min, "
+            "turnover_24h, turnover_taken_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 watch_id, row["symbol"], market, interval_sec, duration_min,
                 json.dumps(row["depth_pcts"]), started_at, ends_at, "active",
-                RETENTION_AFTER_END_MIN, requested,
+                RETENTION_AFTER_END_MIN, requested, turnover_24h, turnover_taken_at,
             ),
         )
         con.commit()
@@ -310,6 +370,91 @@ def record_error(con: sqlite3.Connection, watch_id: str) -> None:
         (watch_id,),
     )
     con.commit()
+
+
+def record_trades(
+    con: sqlite3.Connection,
+    watch_id: str,
+    rows: Iterable[dict[str, Any]],
+    *,
+    request_count: int,
+    extra_pages: int,
+) -> dict[str, int]:
+    """Сохранить сырые aggTrades и явные разрывы их сквозного номера (С1--С3)."""
+    session = con.execute(
+        "SELECT trade_last_id FROM order_book_watches WHERE watch_id = ?", (watch_id,)
+    ).fetchone()
+    if session is None:
+        raise ValueError(f"сессия {watch_id} не найдена")
+    last_id = session["trade_last_id"]
+    last_ts: int | None = None
+    if last_id is not None:
+        previous = con.execute(
+            "SELECT ts FROM watch_trades WHERE watch_id = ? AND agg_id = ?",
+            (watch_id, last_id),
+        ).fetchone()
+        last_ts = int(previous["ts"]) if previous else None
+
+    trades = sorted((_trade(row) for row in rows), key=lambda item: item["agg_id"])
+    stored = gaps = 0
+    for trade in trades:
+        if last_id is not None and trade["agg_id"] > last_id + 1:
+            con.execute(
+                "INSERT OR IGNORE INTO watch_trade_gaps "
+                "(watch_id, before_agg_id, after_agg_id, started_at, ended_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    watch_id, last_id, trade["agg_id"],
+                    last_ts if last_ts is not None else trade["ts"], trade["ts"],
+                ),
+            )
+            gaps += 1
+        cursor = con.execute(
+            "INSERT OR IGNORE INTO watch_trades "
+            "(watch_id, agg_id, ts, price, qty, buyer_is_maker) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                watch_id, trade["agg_id"], trade["ts"], trade["price"], trade["qty"],
+                int(trade["buyer_is_maker"]),
+            ),
+        )
+        stored += int(cursor.rowcount)
+        if last_id is None or trade["agg_id"] > last_id:
+            last_id, last_ts = trade["agg_id"], trade["ts"]
+
+    con.execute(
+        "UPDATE order_book_watches SET trade_last_id = ?, "
+        "trade_request_count = trade_request_count + ?, "
+        "trade_extra_page_count = trade_extra_page_count + ?, "
+        "trade_gap_count = trade_gap_count + ? WHERE watch_id = ?",
+        (last_id, request_count, extra_pages, gaps, watch_id),
+    )
+    con.commit()
+    return {"stored": stored, "gaps": gaps}
+
+
+def trades(
+    con: sqlite3.Connection | None, watch_id: str, *, from_ts: int, to_ts: int
+) -> list[dict[str, Any]]:
+    if con is None:
+        return []
+    rows = con.execute(
+        "SELECT * FROM watch_trades WHERE watch_id = ? AND ts > ? AND ts <= ? ORDER BY agg_id",
+        (watch_id, from_ts, to_ts),
+    )
+    return [dict(row) for row in rows]
+
+
+def trade_gaps(
+    con: sqlite3.Connection | None, watch_id: str, *, from_ts: int, to_ts: int
+) -> list[dict[str, Any]]:
+    if con is None:
+        return []
+    rows = con.execute(
+        "SELECT * FROM watch_trade_gaps WHERE watch_id = ? "
+        "AND ended_at > ? AND started_at <= ? ORDER BY ended_at",
+        (watch_id, from_ts, to_ts),
+    )
+    return [dict(row) for row in rows]
 
 
 def snapshots(
@@ -424,6 +569,17 @@ def _window_where(
 
 def _levels_json(levels: Iterable[BookLevel]) -> str:
     return json.dumps([asdict(level) for level in levels], separators=(",", ":"))
+
+
+def _trade(row: dict[str, Any]) -> dict[str, Any]:
+    """Нормализовать ответ aggTrades, не выкидывая цену, количество или сторону."""
+    return {
+        "agg_id": int(row["a"]),
+        "ts": int(row["T"]),
+        "price": float(row["p"]),
+        "qty": float(row["q"]),
+        "buyer_is_maker": bool(row["m"]),
+    }
 
 
 def _diff(
