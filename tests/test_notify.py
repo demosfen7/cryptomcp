@@ -103,17 +103,17 @@ class TestRender:
 
         assert "#ONDOUSDT" in text
         assert ">ONDOUSDT</a>" not in text
-        assert ">график</a>" in text
+        assert "https://tradingview.com/chart/?symbol=BINANCE:ONDOUSDT" in text
 
-    def test_symbol_is_a_link_to_the_same_timeframe(self):
-        """Смысл ссылки — открыть тот же контракт и тот же таймфрейм."""
+    def test_link_is_plain_text_in_the_format_the_owner_chose(self):
+        """Формат 17.09.2026: видимый адрес, без www и без экранирования."""
         text = render_watchlist_delta(
             {"entered": [entry("ONDOUSDT", "4h", rank=2, market="futures")]}
         )
 
-        assert '<a href="https://www.tradingview.com/chart/?' in text
-        assert "symbol=BINANCE%3AONDOUSDT.P" in text
-        assert "interval=240" in text
+        assert "https://tradingview.com/chart/?symbol=BINANCE:ONDOUSDT.P" in text
+        assert "<a href=" not in text, "ссылка приходит текстом, а не тегом"
+        assert "www." not in text and "%3A" not in text
 
     def test_link_follows_the_market_of_the_episode(self):
         """Отобрали по споту — вести на спот: ряды расходятся вдвое."""
@@ -121,7 +121,7 @@ class TestRender:
             {"entered": [entry("HOMEUSDT", "4h", rank=2, market="spot")]}
         )
 
-        assert "symbol=BINANCE%3AHOMEUSDT&" in text
+        assert "symbol=BINANCE:HOMEUSDT" in text
         assert ".P" not in text
         assert "4h спот" in text
 
@@ -161,25 +161,22 @@ class TestTradingViewUrl:
     def test_perpetual_gets_the_suffix(self):
         url = tradingview_url("ONDOUSDT", market="futures")
 
-        assert "symbol=BINANCE%3AONDOUSDT.P" in url
+        assert url == "https://tradingview.com/chart/?symbol=BINANCE:ONDOUSDT.P"
 
     def test_spot_has_no_suffix(self):
-        assert "symbol=BINANCE%3AONDOUSDT&" in tradingview_url(
-            "ONDOUSDT", "4h", "spot"
+        assert tradingview_url("ONDOUSDT", "4h", "spot") == (
+            "https://tradingview.com/chart/?symbol=BINANCE:ONDOUSDT"
         )
 
     def test_unknown_market_goes_to_spot(self):
         """У старых эпизодов рынка нет; спотовый тикер есть у любой пары."""
         assert ".P" not in tradingview_url("ONDOUSDT", "4h", None)
 
-    def test_known_timeframes(self):
-        assert "interval=240" in tradingview_url("ONDOUSDT", "4h")
-        assert "interval=D" in tradingview_url("ONDOUSDT", "1d")
+    def test_timeframe_is_not_in_the_address(self):
+        """Формат владельца без параметра таймфрейма: график откроется своим."""
+        assert "interval" not in tradingview_url("ONDOUSDT", "4h")
+        assert "interval" not in tradingview_url("ONDOUSDT", "1d")
 
-    def test_unknown_timeframe_is_omitted(self):
-        """Лучше график на умолчании биржи, чем ссылка, которую отвергнут."""
-        assert "interval" not in tradingview_url("ONDOUSDT", "17m")
-        assert "interval" not in tradingview_url("ONDOUSDT")
 
 
 class TestFromEnv:

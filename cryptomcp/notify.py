@@ -22,7 +22,6 @@ import datetime as dt
 import html
 import logging
 import os
-from urllib.parse import quote
 
 import httpx
 
@@ -63,23 +62,28 @@ TV_EXCHANGE = "BINANCE"
 #: старых эпизодов) ведёт на спотовый тикер — он существует у любой пары, а
 #: перпетуала может не быть вовсе.
 
-#: Таймфрейм в параметрах TradingView: минуты числом, дневки и старше — буквой.
-#: Чего нет в таблице, то и не передаём — график откроется на своём умолчании,
-#: это лучше отвергнутой ссылки.
-TV_INTERVALS = {"1h": "60", "4h": "240", "1d": "D", "1w": "W"}
+#: Основание ссылки. Владелец выбрал короткий вид без ``www`` (17.09.2026).
+TV_BASE = "https://tradingview.com/chart/"
 
 
 def tradingview_url(
     symbol: str, tf: str | None = None, market: str | None = None
 ) -> str:
-    """Ссылка на график того рынка, по которому монета отобрана."""
+    """Ссылка на график того рынка, по которому монета отобрана.
+
+    Формат выбран владельцем 17.09.2026 и показан скриншотом:
+    ``https://tradingview.com/chart/?symbol=BINANCE:COTIUSDT`` — без ``www``,
+    с обычным двоеточием вместо ``%3A`` и без параметра таймфрейма. Ссылка
+    приходит видимым текстом, а не словом-ссылкой: так её видно целиком,
+    можно скопировать, и она одинаково выглядит на телефоне и в вебе.
+
+    Суффикс рынка сохранён: у перпетуала и спота разные графики, а числа
+    эпизода относятся ровно к тому ряду, по которому монета отобрана
+    (на HOMEUSDT 4h вышло 17 против 36 на одной свече).
+    """
     described = MARKETS.get(market or "")
     suffix = described.suffix if described else ""
-    query = f"symbol={quote(f'{TV_EXCHANGE}:{symbol}{suffix}')}"
-    interval = TV_INTERVALS.get((tf or "").lower())
-    if interval:
-        query += f"&interval={interval}"
-    return f"https://www.tradingview.com/chart/?{query}"
+    return f"{TV_BASE}?symbol={TV_EXCHANGE}:{symbol}{suffix}"
 
 
 def _head(entry: dict) -> str:
@@ -102,9 +106,13 @@ def _tag(symbol: str) -> str:
 
 
 def _chart(entry: dict) -> str:
-    """Ссылка на график отдельным словом в конце строки."""
-    return " · " + _link(
-        entry["symbol"], entry.get("tf"), entry.get("market"), label="график"
+    """Ссылка на график отдельной строкой под записью.
+
+    Раньше это было слово «график», обёрнутое в тег: коротко, но ссылку не
+    видно и не скопировать. Теперь — сам адрес, как попросил владелец.
+    """
+    return "\n      " + tradingview_url(
+        entry["symbol"], entry.get("tf"), entry.get("market")
     )
 
 
@@ -120,20 +128,6 @@ def _squeeze(entry: dict) -> str:
         return ""
     days = int(bars) * interval_ms(entry["tf"]) / 86_400_000
     return f" · узк {bars} ({days:.1f} сут)"
-
-
-def _link(
-    symbol: str,
-    tf: str | None = None,
-    market: str | None = None,
-    *,
-    label: str | None = None,
-) -> str:
-    """Ссылка на график. Экранируется и текст, и адрес."""
-    return (
-        f'<a href="{html.escape(tradingview_url(symbol, tf, market), quote=True)}">'
-        f"{html.escape(str(label or symbol))}</a>"
-    )
 
 
 def _trim(text: str) -> str:

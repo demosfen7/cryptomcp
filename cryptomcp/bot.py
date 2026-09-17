@@ -29,6 +29,7 @@ from . import assistant as claude
 from . import manual, storage
 from . import orderbook_watch as watch
 from .errors import ToolError
+from .notify import tradingview_url
 from .orderbook import OrderBook, build_order_book
 from .symbols import format_price
 
@@ -574,6 +575,8 @@ def render_order_book_message(
     lines += [
         "Крупные заявки: пока не оцениваем — нет истории",
         "для сравнения.",
+        "",
+        tradingview_url(symbol, market="futures"),
     ]
     return "\n".join(lines)
 
@@ -1249,8 +1252,10 @@ class Bot:
             cost_usd=answer.cost_usd, stamp_ms=stamp,
         )
         today = self.store.spent_since(day_start_ms(self.config.timezone, stamp))
+        chart = f"{tradingview_url(symbol, market='futures')}" if symbol else ""
         footer = (
-            f"\n\n─ {scenario.title} {claude.cost_words(answer.cost_usd)} · "
+            (f"\n\n{chart}" if chart else "")
+            + f"\n\n─ {scenario.title} {claude.cost_words(answer.cost_usd)} · "
             f"сегодня {claude.cost_words(today)} из ${self.config.daily_budget_usd:.0f}"
         )
         text = (answer.text or "Claude вернул пустой ответ.") + footer
