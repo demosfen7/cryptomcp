@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS order_book_watches (
     turnover_24h            REAL,
     turnover_taken_at       INTEGER,
     trade_last_id           INTEGER,
+    last_trade_fetch_at     INTEGER,
     trade_request_count     INTEGER NOT NULL DEFAULT 0,
     trade_extra_page_count  INTEGER NOT NULL DEFAULT 0,
     trade_gap_count         INTEGER NOT NULL DEFAULT 0
@@ -155,6 +156,7 @@ def _migrate_session_columns(con: sqlite3.Connection) -> None:
         "turnover_24h": "REAL",
         "turnover_taken_at": "INTEGER",
         "trade_last_id": "INTEGER",
+        "last_trade_fetch_at": "INTEGER",
         "trade_request_count": "INTEGER NOT NULL DEFAULT 0",
         "trade_extra_page_count": "INTEGER NOT NULL DEFAULT 0",
         "trade_gap_count": "INTEGER NOT NULL DEFAULT 0",
@@ -250,6 +252,7 @@ def start(
             "turnover_24h": turnover_24h,
             "turnover_taken_at": turnover_taken_at,
             "trade_last_id": None,
+            "last_trade_fetch_at": None,
             "trade_request_count": 0,
             "trade_extra_page_count": 0,
             "trade_gap_count": 0,
@@ -430,6 +433,26 @@ def record_trades(
     )
     con.commit()
     return {"stored": stored, "gaps": gaps}
+
+
+def mark_trade_fetch(con: sqlite3.Connection, watch_id: str, fetched_at: int) -> None:
+    con.execute(
+        "UPDATE order_book_watches SET last_trade_fetch_at = ? WHERE watch_id = ?",
+        (fetched_at, watch_id),
+    )
+    con.commit()
+
+
+def expire(con: sqlite3.Connection, watch_id: str, *, expired_at: int | None = None) -> bool:
+    """Пометить закончившуюся сессию сразу, не оставляя active до часа уборки."""
+    expired_at = now_ms() if expired_at is None else expired_at
+    cursor = con.execute(
+        "UPDATE order_book_watches SET status = 'expired', stopped_at = ? "
+        "WHERE watch_id = ? AND status = 'active' AND ends_at <= ?",
+        (expired_at, watch_id, expired_at),
+    )
+    con.commit()
+    return bool(cursor.rowcount)
 
 
 def trades(

@@ -557,8 +557,11 @@ async def start_order_book_watch(
             depth_pcts = normalise_depth_pcts(depth_pct)
         except ValueError as exc:
             raise bad_params(str(exc), depth_pct=depth_pct) from exc
-        _, _, registry, _, _ = await _ctx(mkt.name)
+        client, _, registry, _, _ = await _ctx(mkt.name)
         info = await registry.get(symbol)
+        turnover, started_at = await asyncio.gather(
+            client.ticker_24hr(info.symbol), client.now_ms()
+        )
         con = watch.connect()
         try:
             session = watch.start(
@@ -570,6 +573,10 @@ async def start_order_book_watch(
                 depth_pcts=depth_pcts,
                 depth_weight=mkt.depth_weight(watch.WATCH_LIMIT),
                 market_weight_limit=mkt.weight_limit,
+                trade_weight=mkt.agg_trades_weight,
+                started_at=started_at,
+                turnover_24h=float(turnover["quoteVolume"]),
+                turnover_taken_at=started_at,
             )
         finally:
             con.close()
@@ -718,14 +725,23 @@ async def _record_order_book_watch_snapshot(watch_id: str) -> bool:
     finally:
         if con is not None:
             con.close()
-    if session is None or session["status"] != "active" or watch.now_ms() >= session["ends_at"]:
+    if session is None or session["status"] != "active":
+        return False
+    if watch.now_ms() >= session["ends_at"]:
+        con = watch.connect()
+        try:
+            watch.expire(con, watch_id)
+        finally:
+            con.close()
         return False
     try:
-        client, _, _, _, _ = await _ctx(session["market"])
+        client, _, _, _, market = await _ctx(session["market"])
         snapshot = await client.order_book(session["symbol"], limit=watch.WATCH_LIMIT)
-        turnover, snapshot_ms = await asyncio.gather(
-            client.ticker_24hr(session["symbol"]), client.now_ms()
-        )
+        if market.name == "futures" and snapshot.get("T") is not None:
+            snapshot_ms = int(snapshot["T"])
+        else:
+            snapshot_ms = await client.now_ms()
+        await _record_order_book_watch_trades(client, session, fetched_at=snapshot_ms)
         # В тике last_price не запрашивается (Р5). Поле OrderBook нужно ядру,
         # но в БД и выдачу сессии не попадает; середина того же снимка честнее.
         bids, asks = snapshot.get("bids", ()), snapshot.get("asks", ())
@@ -736,7 +752,7 @@ async def _record_order_book_watch_snapshot(watch_id: str) -> bool:
             last_price=last_price,
             limit=watch.WATCH_LIMIT,
             depth_pcts=tuple(session["depth_pcts"]),
-            turnover_24h_usdt=float(turnover["quoteVolume"]),
+            turnover_24h_usdt=float(session["turnover_24h"] or 0.0),
         )
         con = watch.connect()
         try:
@@ -753,6 +769,48 @@ async def _record_order_book_watch_snapshot(watch_id: str) -> bool:
         finally:
             con.close()
         return True
+
+
+async def _record_order_book_watch_trades(
+    client: BinanceClient, session: dict[str, Any], *, fetched_at: int
+) -> None:
+    """Забрать новые aggTrades, дочитать полную страницу и сохранить пропуски С1."""
+    previous_fetch = session.get("last_trade_fetch_at")
+    trade_interval_ms = max(5, int(session["interval_sec"])) * 1000
+    if previous_fetch is not None and fetched_at - int(previous_fetch) < trade_interval_ms:
+        return
+
+    next_id = (
+        int(session["trade_last_id"]) + 1
+        if session.get("trade_last_id") is not None
+        else None
+    )
+    pages: list[dict[str, Any]] = []
+    requests = extra_pages = 0
+    while True:
+        page = await client.agg_trades(session["symbol"], limit=1000, from_id=next_id)
+        requests += 1
+        if requests > 1:
+            extra_pages += 1
+        pages.extend(page)
+        if len(page) < 1000:
+            break
+        next_id = int(page[-1]["a"]) + 1
+
+    if session.get("trade_last_id") is None:
+        pages = [row for row in pages if int(row["T"]) >= int(session["started_at"])]
+    con = watch.connect()
+    try:
+        watch.record_trades(
+            con,
+            session["watch_id"],
+            pages,
+            request_count=requests,
+            extra_pages=extra_pages,
+        )
+        watch.mark_trade_fetch(con, session["watch_id"], fetched_at)
+    finally:
+        con.close()
 
 
 def _cancel_order_book_watch(watch_id: str) -> None:
