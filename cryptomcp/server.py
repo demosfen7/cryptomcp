@@ -813,7 +813,10 @@ async def _record_order_book_watch_trades(
     """Забрать новые aggTrades, дочитать полную страницу и сохранить пропуски С1."""
     previous_fetch = session.get("last_trade_fetch_at")
     trade_interval_ms = max(5, int(session["interval_sec"])) * 1000
-    if previous_fetch is not None and fetched_at - int(previous_fetch) < trade_interval_ms:
+    if (
+        previous_fetch is not None
+        and fetched_at - int(previous_fetch) < trade_interval_ms - watch.TRADE_POLL_JITTER_MS
+    ):
         return
 
     next_id = (
