@@ -12,6 +12,7 @@ from cryptomcp.markets import FUTURES
 from cryptomcp.orderbook import build_order_book
 from cryptomcp.render import MAX_WATCH_RESPONSE_CHARS, render_order_book_watch_data
 from cryptomcp.server import (
+    _record_order_book_watch_snapshot,
     _record_order_book_watch_trades,
     _watch_tasks,
     get_order_book_watch_data,
@@ -206,7 +207,7 @@ async def test_c1_full_agg_trade_page_fetches_and_counts_next_page(monkeypatch, 
     finally:
         con.close()
 
-    class FakeClient:
+    class FakeAggTradesClient:
         calls: list[int | None] = []
 
         async def agg_trades(self, _symbol, *, limit, from_id):
@@ -219,7 +220,7 @@ async def test_c1_full_agg_trade_page_fetches_and_counts_next_page(monkeypatch, 
                 ]
             return [{"a": 1000, "T": NOW + 1000, "p": "100", "q": "1", "m": False}]
 
-    client = FakeClient()
+    client = FakeAggTradesClient()
     await _record_order_book_watch_trades(client, session, fetched_at=NOW + 5_000)
 
     con = connect(str(tmp_path / "order_book_watch.sqlite"))
@@ -229,6 +230,87 @@ async def test_c1_full_agg_trade_page_fetches_and_counts_next_page(monkeypatch, 
         assert stored["trade_request_count"] == 2
         assert stored["trade_extra_page_count"] == 1
         assert con.execute("SELECT COUNT(*) FROM watch_trades").fetchone()[0] == 1001
+    finally:
+        con.close()
+
+
+@pytest.mark.asyncio
+async def test_c1_trade_polling_uses_client_clock_not_futures_matching_timestamp(
+    monkeypatch, tmp_path
+):
+    """C1: джиттер `T` снимка на миллисекунду не пропускает следующий trade-poll."""
+    _, connect = _watch_db(monkeypatch, tmp_path)
+    con = connect(str(tmp_path / "order_book_watch.sqlite"))
+    try:
+        session = watch.start(
+            con, symbol="ARBUSDT", market="futures", interval_sec=5,
+            duration_min=60, depth_pcts=(0.25,), depth_weight=5, trade_weight=20,
+            market_weight_limit=2400, started_at=NOW,
+        )
+    finally:
+        con.close()
+
+    class FakeClient:
+        async def order_book(self, _symbol, *, limit):
+            assert limit == 100
+            return {"T": NOW + 4_999, "bids": [["100", "10"]], "asks": [["100.2", "10"]]}
+
+        async def now_ms(self):
+            return NOW + 5_000
+
+    async def fake_ctx(_market):
+        return FakeClient(), None, None, None, FUTURES
+
+    fetched: list[int] = []
+
+    async def fake_trades(_client, _session, *, fetched_at):
+        fetched.append(fetched_at)
+
+    monkeypatch.setattr("cryptomcp.server._ctx", fake_ctx)
+    monkeypatch.setattr("cryptomcp.server._record_order_book_watch_trades", fake_trades)
+
+    assert await _record_order_book_watch_snapshot(session["watch_id"])
+    assert fetched == [NOW + 5_000]
+
+
+@pytest.mark.asyncio
+async def test_boundary_snapshot_expires_watch_without_counting_an_error(monkeypatch, tmp_path):
+    """Мелкое 12: ответ, пришедший после ends_at, штатно завершает сессию."""
+    _, connect = _watch_db(monkeypatch, tmp_path)
+    con = connect(str(tmp_path / "order_book_watch.sqlite"))
+    try:
+        session = watch.start(
+            con, symbol="ARBUSDT", market="futures", interval_sec=5,
+            duration_min=1, depth_pcts=(0.25,), depth_weight=5, trade_weight=20,
+            market_weight_limit=2400, started_at=NOW,
+        )
+    finally:
+        con.close()
+
+    class FakeClient:
+        async def order_book(self, _symbol, *, limit):
+            assert limit == 100
+            return {
+                "T": NOW + 60_000,
+                "bids": [["100", "10"]],
+                "asks": [["100.2", "10"]],
+            }
+
+        async def now_ms(self):
+            return NOW + 60_000
+
+    async def fake_ctx(_market):
+        return FakeClient(), None, None, None, FUTURES
+
+    monkeypatch.setattr("cryptomcp.server._ctx", fake_ctx)
+
+    assert not await _record_order_book_watch_snapshot(session["watch_id"])
+    con = connect(str(tmp_path / "order_book_watch.sqlite"))
+    try:
+        stored = watch.get_watch(con, session["watch_id"])
+        assert stored["status"] == "expired"
+        assert stored["error_count"] == 0
+        assert stored["snapshot_count"] == 0
     finally:
         con.close()
 

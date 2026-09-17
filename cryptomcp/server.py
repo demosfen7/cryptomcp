@@ -534,13 +534,14 @@ async def get_order_book(
 @server.tool(
     description=(
         "Начинает временную сессию наблюдения за L2-стаканом: каждые "
-        "interval_sec секунд сохраняется REST-снимок limit=100 и готовый diff "
-        "к предыдущему. duration_min от 1 до 240, по умолчанию 60; общий вес "
-        "активных сессий ограничен половиной IP-лимита каждого рынка, максимум "
-        "10 сессий. Тикер живёт ВНУТРИ процесса сервера: после рестарта сервера "
-        "сессия не продолжится, строка останется active и будет помечена "
-        "просроченной часовым сборщиком. Событие короче interval_sec невидимо; "
-        "исчезновение уровня не доказывает отмену без потока сделок."
+        "interval_sec секунд сохраняется REST-снимок limit=100; каждые max(5, "
+        "interval_sec) секунд — сырые aggTrades. По ним сессия отличает "
+        "устоявший, исполненный и снятый уровень, но не приписывает намерение. "
+        "duration_min от 1 до 240, по умолчанию 60; общий вес активных сессий "
+        "ограничен половиной IP-лимита своего рынка, максимум 10 сессий. Тикер "
+        "живёт внутри процесса сервера: после рестарта он не продолжится. "
+        "Заявка короче интервала снимка не видна, а частично исполненную и затем "
+        "снятую заявку различить можно лишь приблизительно."
     )
 )
 async def start_order_book_watch(
@@ -637,8 +638,8 @@ async def list_order_book_watches() -> str:
         "постраничны и ограничены по размеру ответа; строка подсказывает from_ts "
         "для следующей страницы. "
         "from_ts/to_ts ограничивают окно в миллисекундах Unix. Сводка показывает "
-        "долгоживущие уровни и кандидатов на спуфинг, но честно предупреждает: "
-        "без потока сделок filled и cancelled не различить."
+        "исходы уровней по сохранённым aggTrades, айсберги, долгоживущие уровни "
+        "и качество потока: пропуск сделок не превращается в догадку."
     )
 )
 async def get_order_book_watch_data(
@@ -757,11 +758,26 @@ async def _record_order_book_watch_snapshot(watch_id: str) -> bool:
     try:
         client, _, _, _, market = await _ctx(session["market"])
         snapshot = await client.order_book(session["symbol"], limit=watch.WATCH_LIMIT)
+        # Интервал опроса trades — это реальное время процесса, а не `T`
+        # стакана. T у futures — время матчинга и между двумя снимками может
+        # отличаться от плановых 5 с на миллисекунду; иначе такой джиттер
+        # пропускает целый следующий опрос aggTrades.
+        trade_fetched_at = await client.now_ms()
         if market.name == "futures" and snapshot.get("T") is not None:
             snapshot_ms = int(snapshot["T"])
         else:
-            snapshot_ms = await client.now_ms()
-        await _record_order_book_watch_trades(client, session, fetched_at=snapshot_ms)
+            snapshot_ms = trade_fetched_at
+        # Между проверкой до HTTP-вызова и самим снимком могла закончиться
+        # сессия. Это штатная граница, а не ошибка Binance: не записываем
+        # снимок за сроком и не увеличиваем error_count.
+        if snapshot_ms >= int(session["ends_at"]):
+            con = watch.connect()
+            try:
+                watch.expire(con, watch_id, expired_at=snapshot_ms)
+            finally:
+                con.close()
+            return False
+        await _record_order_book_watch_trades(client, session, fetched_at=trade_fetched_at)
         # В тике last_price не запрашивается (Р5). Поле OrderBook нужно ядру,
         # но в БД и выдачу сессии не попадает; середина того же снимка честнее.
         bids, asks = snapshot.get("bids", ()), snapshot.get("asks", ())
