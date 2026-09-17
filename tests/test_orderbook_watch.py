@@ -15,7 +15,10 @@ from cryptomcp.orderbook_watch import (
     diffs,
     get_watch,
     record_snapshot,
+    record_trades,
     start,
+    trade_gaps,
+    trades,
 )
 
 NOW = 1_789_870_000_000
@@ -108,3 +111,44 @@ def test_watch_database_sets_busy_timeout_for_server_and_collector_writers(db):
     """Р3: отдельный файл имеет busy_timeout, иначе уборка может сорвать тик."""
     assert db.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
     assert isinstance(db, sqlite3.Connection)
+
+
+def test_c2_four_futures_watches_at_five_seconds_fit_but_fifth_is_rejected(db):
+    """С2 №9: 60 веса depth + 240 веса aggTrades = 300 на сессию."""
+    for index in range(4):
+        _start(db, symbol=f"ARB{index}USDT", trade_weight=20)
+
+    with pytest.raises(WatchAdmissionError, match=r"просит 300 .*занято 1200.*потолок.*1200"):
+        _start(db, symbol="TOOFASTUSDT", trade_weight=20)
+
+
+def test_c3_stores_raw_trades_and_records_aggregate_id_gap(db):
+    """С1--С3: ручная сверка уровня видит сделки и недостающий интервал a."""
+    session = _start(db)
+    result = record_trades(
+        db,
+        session["watch_id"],
+        [
+            {"a": 10, "T": NOW + 1, "p": "100", "q": "2", "m": False},
+            {"a": 12, "T": NOW + 3, "p": "100", "q": "3", "m": True},
+        ],
+        request_count=2,
+        extra_pages=1,
+    )
+
+    assert result == {"stored": 2, "gaps": 1}
+    stored_trades = trades(db, session["watch_id"], from_ts=NOW, to_ts=NOW + 5)
+    assert [row["agg_id"] for row in stored_trades] == [10, 12]
+    assert trade_gaps(db, session["watch_id"], from_ts=NOW, to_ts=NOW + 5) == [
+        {
+            "watch_id": session["watch_id"],
+            "before_agg_id": 10,
+            "after_agg_id": 12,
+            "started_at": NOW + 1,
+            "ended_at": NOW + 3,
+        }
+    ]
+    stored = get_watch(db, session["watch_id"])
+    assert stored["trade_request_count"] == 2
+    assert stored["trade_extra_page_count"] == 1
+    assert stored["trade_gap_count"] == 1
