@@ -40,7 +40,8 @@ def _futures_depth_weight(limit: int) -> int:
 
     Таблица из документации Binance оказалась таблицей спота: у фьючерсов
     уровни 5--50 стоят 2, 100 -- 5, 500 -- 10, 1000 -- 20 единиц. Значение
-    5000 futures отвергает ещё до расхода веса, поэтому его нет в enum рынка.
+    Futures limit=5000 биржа отвергает, но всё равно списывает около 100 ед.
+    Локальный enum не даёт послать этот дорогой заведомо неверный запрос.
     """
     if limit <= 50:
         return 2
@@ -78,6 +79,8 @@ class Market:
     ticker_all_weight: int
     #: Вес /ticker/price для одного символа.
     ticker_price_weight: int
+    #: Вес REST /aggTrades: не зависит от limit и fromId (замер 17.09.2026).
+    agg_trades_weight: int
     #: Как рынок называется в выдаче и что дописывается к символу.
     label: str
     #: То же имя в одну колонку таблицы: «USDⓈ-M perp» в строку списка не
@@ -105,6 +108,7 @@ FUTURES = Market(
     ticker_one_weight=1,
     ticker_all_weight=40,
     ticker_price_weight=1,
+    agg_trades_weight=20,
     label="USDⓈ-M perp",
     short="перп",
     suffix=".P",
@@ -124,6 +128,7 @@ SPOT = Market(
     ticker_one_weight=2,
     ticker_all_weight=80,
     ticker_price_weight=2,
+    agg_trades_weight=4,
     label="спот",
     short="спот",
     suffix="",

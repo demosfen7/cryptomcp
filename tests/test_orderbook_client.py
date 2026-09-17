@@ -36,6 +36,12 @@ def test_futures_depth_rejects_spot_only_limit_5000():
     assert 5000 in SPOT.depth_limits
 
 
+@pytest.mark.parametrize(("market", "expected"), [(FUTURES, 20), (SPOT, 4)])
+def test_agg_trades_weight_uses_1709_measurement(market, expected):
+    """С1--С2: вес сделок не зависит от limit и принадлежит рынку."""
+    assert market.agg_trades_weight == expected
+
+
 @pytest.mark.asyncio
 async def test_order_book_reserves_measured_depth_weight_before_request():
     """Неверный резерв позволил бы сессиям исчерпать общий IP-бюджет внезапно."""
@@ -76,5 +82,25 @@ async def test_ticker_price_uses_separate_measured_weight():
     try:
         assert (await client.ticker_price("ARBUSDT"))["price"] == "1.25"
         assert client.budget.snapshot()["used"] == 2
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_agg_trades_reserves_measured_weight_and_passes_from_id():
+    """С1: следующая страница запрашивается по сквозному agg id без сети в тесте."""
+    seen: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=[{"a": 101, "p": "1", "q": "2", "T": 5, "m": False}])
+
+    client = BinanceClient(FUTURES, transport=httpx.MockTransport(handler))
+    try:
+        trades = await client.agg_trades("ARBUSDT", from_id=101)
+        assert trades[0]["a"] == 101
+        assert seen[0].url.path == "/fapi/v1/aggTrades"
+        assert seen[0].url.params["fromId"] == "101"
+        assert client.budget.snapshot()["used"] == 20
     finally:
         await client.aclose()
