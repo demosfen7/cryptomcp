@@ -216,6 +216,54 @@ def test_c5_3_disappeared_level_touched_with_small_flow_is_removed_at_price():
     assert [item["price"] for item in outcomes["снят у цены"]] == [99.5]
 
 
+def test_best_ask_price_moved_through_with_full_flow_is_filled():
+    """Ближний край окна: цена прошла сквозь лучший аск, и его съели.
+
+    Это самый частый исход в живом стакане, и его нельзя отсекать вместе с
+    дальним краем: на ARBUSDT двустороннее пересечение окон выбрасывало 55
+    исполненных уровней за две минуты, и блок «исполнен» был пуст всегда.
+    """
+    before = _watch_snapshot(NOW, asks=((100.1, 10.0), (100.2, 10.0), (101.0, 10.0)))
+    after = _watch_snapshot(
+        NOW + 5_000, asks=((100.2, 10.0), (101.0, 10.0), (101.5, 10.0)), mid=100.15
+    )
+
+    outcomes = _outcomes([before, after], [_trade(1, NOW + 1, price=100.1, qty=10, maker=False)])
+
+    assert [item["price"] for item in outcomes["исполнен"]] == [100.1]
+
+
+def test_best_ask_price_moved_through_with_little_flow_is_removed_at_price():
+    """Ближний край окна: цена дошла до лучшего аска, но по нему почти ничего не прошло."""
+    before = _watch_snapshot(NOW, asks=((100.1, 10.0), (100.2, 10.0), (101.0, 10.0)))
+    after = _watch_snapshot(
+        NOW + 5_000, asks=((100.2, 10.0), (101.0, 10.0), (101.5, 10.0)), mid=100.15
+    )
+    rows = [
+        _trade(1, NOW + 1, price=100.1, qty=1, maker=False),
+        _trade(2, NOW + 2, price=100.2, qty=1, maker=False),
+    ]
+
+    outcomes = _outcomes([before, after], rows)
+
+    assert [item["price"] for item in outcomes["снят у цены"]] == [100.1]
+
+
+def test_level_beyond_far_edge_is_not_classified():
+    """Дальний край: уровень, выпавший за сто уровней, не получает исхода."""
+    before = _watch_snapshot(NOW, asks=((100.1, 10.0), (101.0, 10.0), (102.0, 10.0)))
+    after = _watch_snapshot(NOW + 5_000, asks=((100.05, 10.0), (100.1, 10.0), (101.0, 10.0)))
+
+    result = classify_liquidity([before, after], [], [])
+
+    assert all(
+        item["price"] != 102.0
+        for items in result["outcomes"].values()
+        for item in items
+    )
+    assert result["ignored"] == 0
+
+
 def test_c5_4_far_level_that_vanishes_before_price_approaches_is_removed_early():
     before = _watch_snapshot(NOW, asks=((100.1, 10.0), (101.0, 10.0), (102.0, 10.0)))
     after = _watch_snapshot(NOW + 5_000, asks=((100.1, 10.0), (102.0, 10.0)))

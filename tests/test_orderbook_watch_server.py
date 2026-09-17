@@ -36,15 +36,15 @@ def _book(ts=NOW, *, extra_bid=False):
     )
 
 
-def _shifted_book(ts, *, shift: float):
-    """Та же ликвидность, но край limit-окна сдвинут одним тиком."""
+def _far_edge_book(ts, *, bids):
+    """Стакан с заданными бидами и неизменными асками."""
     return build_order_book(
         {
-            "bids": [[str(100.0 + shift), "10"], [str(99.8 + shift), "10"]],
-            "asks": [[str(100.2 + shift), "15"], [str(100.4 + shift), "15"]],
+            "bids": [[str(price), "10"] for price in bids],
+            "asks": [["100.2", "15"], ["100.4", "15"]],
         },
         timestamp_ms=ts,
-        last_price=100.1 + shift,
+        last_price=100.1,
         limit=100,
         depth_pcts=(0.25,),
         turnover_24h_usdt=5_000_000,
@@ -137,8 +137,12 @@ async def test_b10_6_diff_format_uses_written_events(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_shifted_limit_window_does_not_render_appeared_or_disappeared(monkeypatch, tmp_path):
-    """Блокер 2: край двух L2-окон не превращается в биржевое событие."""
+async def test_level_beyond_far_edge_of_limit_window_is_not_an_event(monkeypatch, tmp_path):
+    """Блокер 2: уровень, выпавший за ДАЛЬНИЙ край окна limit, — не событие.
+
+    Новый бид сверху вытесняет нижний за край ста уровней. Появление сверху
+    настоящее и печатается; исчезновение снизу — артефакт окна и не печатается.
+    """
     _, connect = _watch_db(monkeypatch, tmp_path)
     con = connect(str(tmp_path / "order_book_watch.sqlite"))
     try:
@@ -147,16 +151,19 @@ async def test_shifted_limit_window_does_not_render_appeared_or_disappeared(monk
             duration_min=60, depth_pcts=(0.25,), depth_weight=5,
             market_weight_limit=2400, started_at=NOW,
         )
-        watch.record_snapshot(con, session["watch_id"], _shifted_book(NOW, shift=0.0))
-        watch.record_snapshot(con, session["watch_id"], _shifted_book(NOW + 5_000, shift=0.2))
+        watch.record_snapshot(
+            con, session["watch_id"], _far_edge_book(NOW, bids=(100.0, 99.8, 99.6))
+        )
+        watch.record_snapshot(
+            con, session["watch_id"], _far_edge_book(NOW + 5_000, bids=(100.1, 100.0, 99.8))
+        )
     finally:
         con.close()
 
     text = await get_order_book_watch_data(session["watch_id"], format="diff")
 
-    assert "appeared ·" not in text
-    assert "disappeared ·" not in text
-    assert "событий пока нет" in text
+    assert "appeared · bid 100.1" in text
+    assert "disappeared" not in text
 
 
 @pytest.mark.asyncio
