@@ -298,6 +298,28 @@ class TestVersionBumpIsExplained:
         )
         assert "колонки скана пусты" not in text
 
+    def test_trend_is_printed_as_a_mark_not_a_filter(self):
+        """Пометка тренда: «ниже обеих EMA» печатается, но строку не убирает."""
+        from cryptomcp.render import render_watchlist
+
+        scan = {"symbol": "BTCUSDT", "price": 90123.45, "narrow_bars": 11,
+                "ema_state": "below", "closed_through_ms": self.NOW - 3_600_000}
+        text = render_watchlist(
+            [self.episode()], {("BTCUSDT", "1d"): scan}, now_ms=self.NOW,
+        )
+
+        assert "тренд" in text.splitlines()[1]
+        assert "ниже" in text
+        assert "BTCUSDT" in text
+        assert "ПОМЕТКА, а не фильтр" in text
+
+    def test_trend_without_a_scan_row_is_a_dash(self):
+        from cryptomcp.render import render_watchlist
+
+        text = render_watchlist([self.episode()], {}, now_ms=self.NOW)
+
+        assert "тренд" in text.splitlines()[1]
+
     def test_nothing_is_said_without_earlier_generations(self):
         """Пустой журнал без прежних поколений — это другое, и лечится другим."""
         from cryptomcp.render import render_watchlist

@@ -1158,6 +1158,25 @@ def known_symbols(con: sqlite3.Connection, market: str) -> dict[str, int | None]
     return {row["symbol"]: row["first_kline_ms"] for row in rows}
 
 
+def recent_universe_volume(
+    con: sqlite3.Connection, *, days: int
+) -> dict[str, float]:
+    """Максимальный суточный оборот символа по последним ``days`` снимкам.
+
+    Нужен для гистерезиса универсума: монета выбывает из архива не за один
+    тихий день, а за несколько подряд. Максимум, а не среднее: одно провальное
+    воскресенье не должно выселять монету, по которой копятся невосстановимые
+    деривативы.
+    """
+    rows = con.execute(
+        "SELECT symbol, MAX(quote_volume_24h) AS peak FROM universe_daily "
+        "WHERE date IN (SELECT DISTINCT date FROM universe_daily "
+        "ORDER BY date DESC LIMIT ?) GROUP BY symbol",
+        (days,),
+    ).fetchall()
+    return {row["symbol"]: float(row["peak"] or 0.0) for row in rows}
+
+
 def last_ts(con: sqlite3.Connection, table: str, symbol: str) -> int | None:
     """Последняя записанная точка — отсюда продолжается инкрементальная догрузка."""
     if table not in {"derivatives", "funding"}:

@@ -198,6 +198,21 @@ CORE_MAX_SYMBOLS = _env_int("COLLECTOR_MAX_SYMBOLS", 60)
 #: десяткам сделок, и метрики шумят.
 ARCHIVE_MIN_VOLUME = _env_float("COLLECTOR_ARCHIVE_MIN_VOLUME", 3_000_000)
 
+#: Порог удержания: монета, уже попавшая в архив, выбывает только ниже него, и
+#: только если держится ниже ``ARCHIVE_KEEP_DAYS`` суток подряд (PLAN §4.40).
+#:
+#: Причина замерена на ONEUSDT: 06–10.09 оборот 3.0–3.7M, дальше 2.27, 1.87,
+#: 2.07, 2.07M — монета выпала из скана ровно на тихой фазе перед выстрелом
+#: 16.09 (+56% за сутки, к утру вдвое), а 15.09 вернулась с 3.05M. Тишина в
+#: обороте — то самое состояние, которое сканер и ищет, поэтому выселять за
+#: неё нельзя. Симметричный порог входа оставлен на 3M: пускать в архив по
+#: 2M значило бы принять ещё 65 пар разом.
+ARCHIVE_KEEP_VOLUME = _env_float("COLLECTOR_ARCHIVE_KEEP_VOLUME", 2_000_000)
+
+#: Сколько суток подряд оборот должен быть ниже порога удержания, чтобы монета
+#: выбыла. Два дня истории универсума плюс сегодняшний оборот.
+ARCHIVE_KEEP_DAYS = _env_int("COLLECTOR_ARCHIVE_KEEP_DAYS", 3)
+
 #: Сколько НОВЫХ символов впускать в архив за один прогон.
 #:
 #: Понижение порога сразу приводит сотню незнакомых монет, и первый же прогон
@@ -1154,6 +1169,34 @@ def archived_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if row["quote_volume_24h"] >= ARCHIVE_MIN_VOLUME]
 
 
+def kept_rows(
+    rows: list[dict[str, Any]],
+    known: dict[str, int | None],
+    peaks: dict[str, float],
+) -> list[dict[str, Any]]:
+    """Архивный слой с гистерезисом: вход по 3M, выход ниже 2M и не сразу.
+
+    Новая монета входит по ``ARCHIVE_MIN_VOLUME``. Знакомая остаётся, пока её
+    оборот не опустится ниже ``ARCHIVE_KEEP_VOLUME`` и сегодня, и в последних
+    снимках универсума. Выселение стоит дорого: по выбывшей монете перестают
+    писаться деривативы, которых биржа не отдаёт задним числом, и обрывается
+    журнал скана — именно это случилось с ONEUSDT 11–14.09.
+    """
+    kept = []
+    for row in rows:
+        volume = row["quote_volume_24h"]
+        if volume >= ARCHIVE_MIN_VOLUME:
+            kept.append(row)
+            continue
+        if row["symbol"] not in known:
+            continue
+        # Сегодня ниже порога удержания — смотрим, был ли выше в последние
+        # снимки. Монеты без истории снимков (принята сегодня) остаются.
+        if volume >= ARCHIVE_KEEP_VOLUME or peaks.get(row["symbol"], 0.0) >= ARCHIVE_KEEP_VOLUME:
+            kept.append(row)
+    return kept
+
+
 def admit(
     con: sqlite3.Connection,
     rows: list[dict[str, Any]],
@@ -1229,7 +1272,9 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
         cleanup_order_book_watches()
         rows = await universe_rows(client)
         core = core_symbols(rows)
-        archived, waiting = admit(con, archived_rows(rows))
+        known = storage.known_symbols(con, FUTURES.name)
+        peaks = storage.recent_universe_volume(con, days=ARCHIVE_KEEP_DAYS - 1)
+        archived, waiting = admit(con, kept_rows(rows, known, peaks))
         if waiting:
             log.info(
                 "новых символов в очереди: %d — впускаются по %d за прогон, "

@@ -1227,6 +1227,65 @@ class TestAccumulationLogging:
         assert by_tf.get("1h") is None
 
 
+class TestUniverseHysteresis:
+    """Гистерезис архивного слоя: вход по 3M, выход ниже 2M и не за один день.
+
+    Замер на ONEUSDT: 11–14.09 оборот 2.27, 1.87, 2.07, 2.07M — монета выпала
+    из скана на тихой фазе перед выстрелом 16.09.
+    """
+
+    @staticmethod
+    def rows(*pairs):
+        return [{"symbol": s, "quote_volume_24h": v} for s, v in pairs]
+
+    def test_new_symbol_needs_the_entry_threshold(self):
+        from cryptomcp.collector import kept_rows
+
+        kept = kept_rows(self.rows(("НОВАЯUSDT", 2_500_000.0)), {}, {})
+
+        assert kept == []
+
+    def test_known_symbol_stays_above_keep_threshold(self):
+        from cryptomcp.collector import kept_rows
+
+        kept = kept_rows(
+            self.rows(("ONEUSDT", 2_270_000.0)), {"ONEUSDT": 1}, {"ONEUSDT": 3_000_000.0}
+        )
+
+        assert [row["symbol"] for row in kept] == ["ONEUSDT"]
+
+    def test_single_quiet_day_does_not_evict(self):
+        """12.09 у ONEUSDT было 1.87M, но соседние дни выше порога удержания."""
+        from cryptomcp.collector import kept_rows
+
+        kept = kept_rows(
+            self.rows(("ONEUSDT", 1_870_000.0)), {"ONEUSDT": 1}, {"ONEUSDT": 2_270_000.0}
+        )
+
+        assert [row["symbol"] for row in kept] == ["ONEUSDT"]
+
+    def test_three_quiet_days_in_a_row_evict(self):
+        from cryptomcp.collector import kept_rows
+
+        kept = kept_rows(
+            self.rows(("DEADUSDT", 1_500_000.0)), {"DEADUSDT": 1}, {"DEADUSDT": 1_800_000.0}
+        )
+
+        assert kept == []
+
+    def test_peak_of_recent_snapshots_is_what_holds(self, con):
+        """Оконный максимум берётся из снимков универсума, а не из среднего."""
+        con.execute(
+            "INSERT INTO universe_daily (date, symbol, quote_volume_24h) VALUES "
+            "('2026-09-15', 'ONEUSDT', 3050000), ('2026-09-16', 'ONEUSDT', 1900000)"
+        )
+        con.commit()
+
+        peaks = storage.recent_universe_volume(con, days=2)
+
+        assert peaks["ONEUSDT"] == pytest.approx(3_050_000.0)
+
+
 class TestAdmission:
     """Понижение порога приводит сотню новых монет разом (PLAN §4.30).
 
