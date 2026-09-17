@@ -298,3 +298,42 @@ class TestNotifyWatchlist:
             {"entered": [entry("CAKEUSDT", "4h", rank=3, market="spot")]}
         ) is False
         assert transport.calls == []
+
+
+class TestAccumulationDelta:
+    """Дельта второго списка уходит своим сообщением (PLAN §4.43)."""
+
+    NOW = 1_788_400_000_000
+
+    def test_silence_when_nothing_changed(self):
+        from cryptomcp.notify import render_accumulation_delta
+
+        assert render_accumulation_delta({"entered": [], "exited": []}) is None
+
+    def test_entered_and_exited_are_named(self):
+        from cryptomcp.notify import render_accumulation_delta
+
+        text = render_accumulation_delta(
+            {
+                "entered": [{"symbol": "IDUSDT", "tf": "1d", "market": "spot",
+                             "rank": 2, "narrow_bars": 21}],
+                "exited": [{"symbol": "UBUSDT", "tf": "1d", "market": "futures",
+                            "reason": "кластер пропал", "narrow_bars": 3}],
+            },
+            now_ms=self.NOW,
+        )
+
+        assert text.startswith("Накопление ·")
+        assert "IDUSDT" in text and "ранг 2" in text
+        assert "UBUSDT" in text and "кластер пропал" in text
+
+    def test_it_is_not_mixed_into_the_watchlist_message(self):
+        """Два списка — два сообщения: иначе не сравнить, какой полезнее."""
+        from cryptomcp.notify import render_accumulation_delta, render_watchlist_delta
+
+        changes = {"entered": [{"symbol": "IDUSDT", "tf": "1d", "market": "spot",
+                                "rank": 1, "narrow_bars": 21}], "exited": [],
+                   "promoted": []}
+
+        assert "Накопление" in render_accumulation_delta(changes, now_ms=self.NOW)
+        assert "Накопление" not in render_watchlist_delta(changes, now_ms=self.NOW)

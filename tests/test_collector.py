@@ -514,6 +514,31 @@ class TestScanTwin:
         assert set(measured) == {"C0USDT", "C1USDT"}, "мерился только верх списка"
 
     @pytest.mark.asyncio
+    async def test_twin_volume_and_flow_are_recorded(self, con):
+        """Объёмные признаки соседнего рынка — то, ради чего проход расширен.
+
+        У 152 архивных монет из 183 спот даёт меньше 30% оборота фьючерсов
+        (замер 17.09.2026), то есть объём и поток основного ряда считаются по
+        меньшинству торговли.
+        """
+        from cryptomcp.collector import scan_twin
+
+        self.scan(con, "HOMEUSDT", 0.9, source="spot")
+        client = FakeKlineClient(NOW - 3000 * self.STEP, NOW, self.STEP, page=1500)
+
+        await scan_twin(
+            {"spot": client, "futures": client}, con, timeframes=("4h",), now_ms=NOW,
+        )
+
+        row = con.execute(
+            "SELECT twin_ma_ratio, twin_vol_ratio_12_30, twin_delta_quadrant, "
+            "twin_delta_share_30, twin_flow_change_30 FROM scan_log"
+        ).fetchone()
+        assert row["twin_ma_ratio"] is not None
+        assert row["twin_vol_ratio_12_30"] is not None
+        assert row["twin_delta_quadrant"] is not None
+
+    @pytest.mark.asyncio
     async def test_twin_of_spot_is_the_perpetual(self, con):
         from cryptomcp.collector import scan_twin
 
@@ -1225,6 +1250,116 @@ class TestAccumulationLogging:
         ).fetchall()
         by_tf = {row["tf"]: row["absorption_tf"] for row in rows}
         assert by_tf.get("1h") is None
+
+
+class TestAccumulationList:
+    """Второй список: отбор по кластеру набора, а не по тишине (PLAN §4.43).
+
+    Замер 17.09.2026: верхушка индекса на исходах не отличается от базы (72ч,
+    доля от +10%: 1d 44% против 45% у всех), а кластер даёт 51% против 39%.
+    Кластер есть лишь у 6% строк верхушки, поэтому он не ворота к первому
+    списку, а основание второго.
+    """
+
+    NOW = 1_788_400_000_000
+
+    def scan(self, con, symbol, index, *, clusters, change=0.0, ts=None):
+        con.execute(
+            "INSERT INTO scan_log (ts_ms, symbol, source, tf, formula_version, "
+            "squeeze_index, closed_through_ms, absorption_clusters, absorption_tf, "
+            "change_24h_pct, price) VALUES (?, ?, 'spot', '1d', ?, ?, ?, ?, '1h', ?, 1.0)",
+            (ts or self.NOW, symbol, SQUEEZE_FORMULA_VERSION, index,
+             (ts or self.NOW) - 1, clusters, change),
+        )
+        con.commit()
+
+    def names(self, con, status="active"):
+        return [row["symbol"] for row in storage.accumulation_entries(con, status=status)]
+
+    def test_only_coins_with_a_cluster_enter(self, con):
+        from cryptomcp.collector import update_accumulation
+
+        self.scan(con, "CLUSTERUSDT", 0.40, clusters=1)
+        self.scan(con, "QUIETUSDT", 0.95, clusters=0)
+
+        changes = update_accumulation(con, now_ms=self.NOW)
+
+        assert self.names(con) == ["CLUSTERUSDT"]
+        assert [e["symbol"] for e in changes["entered"]] == ["CLUSTERUSDT"]
+
+    def test_coin_already_in_motion_is_not_taken(self, con):
+        """Ворота хода за сутки те же, что у первого списка: +20% — не набор."""
+        from cryptomcp.collector import update_accumulation
+
+        self.scan(con, "FLYINGUSDT", 0.80, clusters=2, change=20.0)
+
+        update_accumulation(con, now_ms=self.NOW)
+
+        assert self.names(con) == []
+
+    def test_short_squeeze_duration_does_not_block(self, con):
+        """Порог семи суток сжатия сюда не переносится: накопление бывает коротким."""
+        from cryptomcp.collector import update_accumulation
+
+        self.scan(con, "FRESHUSDT", 0.30, clusters=1)
+
+        update_accumulation(con, now_ms=self.NOW)
+
+        assert self.names(con) == ["FRESHUSDT"]
+
+    def test_entry_closes_when_the_cluster_is_gone(self, con):
+        from cryptomcp.collector import update_accumulation
+
+        self.scan(con, "CLUSTERUSDT", 0.80, clusters=1)
+        update_accumulation(con, now_ms=self.NOW)
+
+        later = self.NOW + 86_400_000
+        self.scan(con, "CLUSTERUSDT", 0.80, clusters=0, ts=later)
+        changes = update_accumulation(con, now_ms=later)
+
+        assert self.names(con) == []
+        assert changes["exited"][0]["reason"] == "кластер пропал"
+
+    def test_hysteresis_keeps_a_slipping_entry(self, con):
+        """Вход в топ-15, выход из топ-25 — иначе запись мигала бы у границы."""
+        from cryptomcp.collector import update_accumulation
+
+        self.scan(con, "SLIPUSDT", 0.90, clusters=1)
+        update_accumulation(con, now_ms=self.NOW)
+
+        later = self.NOW + 86_400_000
+        for i in range(20):
+            self.scan(con, f"BETTER{i}USDT", 0.95, clusters=1, ts=later)
+        self.scan(con, "SLIPUSDT", 0.10, clusters=1, ts=later)
+
+        update_accumulation(con, now_ms=later)
+
+        assert "SLIPUSDT" in self.names(con), "ранг 21 ещё внутри топ-25"
+
+    def test_entry_closes_below_the_exit_rank(self, con):
+        from cryptomcp.collector import update_accumulation
+
+        self.scan(con, "SLIPUSDT", 0.90, clusters=1)
+        update_accumulation(con, now_ms=self.NOW)
+
+        later = self.NOW + 86_400_000
+        for i in range(30):
+            self.scan(con, f"BETTER{i}USDT", 0.95, clusters=1, ts=later)
+        self.scan(con, "SLIPUSDT", 0.10, clusters=1, ts=later)
+
+        changes = update_accumulation(con, now_ms=later)
+
+        assert "SLIPUSDT" not in self.names(con)
+        assert any(e["symbol"] == "SLIPUSDT" for e in changes["exited"])
+
+    def test_watchlist_is_untouched(self, con):
+        """Второй список ничего не меняет в первом — сравнение должно быть честным."""
+        from cryptomcp.collector import update_accumulation
+
+        self.scan(con, "CLUSTERUSDT", 0.90, clusters=1)
+        update_accumulation(con, now_ms=self.NOW)
+
+        assert con.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0] == 0
 
 
 class TestUniverseHysteresis:

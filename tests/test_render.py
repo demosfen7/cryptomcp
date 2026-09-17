@@ -313,6 +313,21 @@ class TestVersionBumpIsExplained:
         assert "BTCUSDT" in text
         assert "ПОМЕТКА, а не фильтр" in text
 
+    def test_twin_flow_quadrant_is_printed_short(self):
+        """Поток соседнего рынка печатается справкой, одним словом."""
+        from cryptomcp.render import render_watchlist
+
+        scan = {"symbol": "BTCUSDT", "price": 90123.45, "narrow_bars": 11,
+                "twin_delta_quadrant": "поглощение",
+                "closed_through_ms": self.NOW - 3_600_000}
+        text = render_watchlist(
+            [self.episode()], {("BTCUSDT", "1d"): scan}, now_ms=self.NOW,
+        )
+
+        assert "поток²" in text.splitlines()[1]
+        assert "погл" in text
+        assert "в ранг не входит" in text
+
     def test_trend_without_a_scan_row_is_a_dash(self):
         from cryptomcp.render import render_watchlist
 
@@ -736,3 +751,55 @@ class TestAbsoluteTurnover:
         assert "110.27M USDT за 30 свечей" in text
         assert "3.68M на свечу" in text
         assert "куплено по рынку 52.52M (48%)" in text
+
+
+class TestAccumulationList:
+    """Второй список печатает кластер первым: он основание отбора."""
+
+    NOW = 1_788_400_000_000
+
+    def entry(self, **fields):
+        row = {
+            "symbol": "IDUSDT", "tf": "1d", "market": "spot", "status": "active",
+            "entered_at": self.NOW - 86_400_000, "entered_index": 0.80,
+            "entered_clusters": 2, "entered_bars": 3, "price_at_entry": 0.0324,
+            "rank_at_entry": 3, "last_rank": 1, "last_index": 0.85,
+            "last_clusters": 2, "exited_at": None, "exit_reason": None,
+        }
+        row.update(fields)
+        return row
+
+    def test_empty_list_says_why(self):
+        from cryptomcp.render import render_accumulation
+
+        text = render_accumulation([], {}, now_ms=self.NOW)
+
+        assert "кластером набора" in text
+
+    def test_columns_and_move_from_entry(self):
+        from cryptomcp.render import render_accumulation
+
+        scan = {"symbol": "IDUSDT", "price": 0.0356, "ema_state": "mixed",
+                "twin_delta_quadrant": "поглощение"}
+        text = render_accumulation(
+            [self.entry()], {("IDUSDT", "1d"): scan}, now_ms=self.NOW, version="v9",
+        )
+
+        header = text.splitlines()[1]
+        assert "клст" in header and "бары" in header and "поток²" in header
+        assert "+9.9%" in text, "ход от цены входа"
+        assert "3→1" in text
+        assert "погл" in text and "смеш" in text
+        assert "outcomes" in text, "в подписи сказано, ради чего список ведётся"
+
+    def test_closed_entry_prints_the_reason(self):
+        from cryptomcp.render import render_accumulation
+
+        text = render_accumulation(
+            [self.entry(exited_at=self.NOW, exit_reason="кластера набора больше нет",
+                        status="exited")],
+            {}, now_ms=self.NOW,
+        )
+
+        assert "чем кончилось" in text.splitlines()[1]
+        assert "кластера набора больше нет" in text

@@ -48,6 +48,7 @@ from .render import (
     closed_through,
     render_absorption,
     render_absorption_events,
+    render_accumulation,
     render_derivatives,
     render_distribution,
     render_flow,
@@ -1460,6 +1461,47 @@ def _watchlist_text(
         )
     finally:
         con.close()
+
+
+@server.tool(
+    description=(
+        "Второй список сканера — отбор по НАКОПЛЕНИЮ, а не по тишине. В него "
+        "попадают монеты, у которых на младшем ряду есть кластер набора "
+        "(серия свечей с повышенным объёмом, за которую цена никуда не ушла); "
+        "внутри списка порядок по индексу сжатия, вход в топ-15, выход из "
+        "топ-25. Ведётся параллельно get_watchlist и ничего в нём не меняет: "
+        "замер 17.09.2026 показал, что верхушка индекса на исходах не лучше "
+        "базы, а кластер — лучше (51% исходов от +10% за 72ч против 39%). "
+        "Смотреть вместе со списком наблюдения: это два разных ответа на "
+        "вопрос «что смотреть», и какой лучше — покажут outcomes. "
+        "status: active, exited, all; по умолчанию открытые записи."
+    )
+)
+async def get_accumulation(status: str = "active", limit: int = 30) -> str:
+    try:
+        if status not in ("active", "exited", "all"):
+            raise bad_params(
+                f"Неизвестный статус {status!r}. Доступны: active, exited, all",
+                status=status,
+            )
+        now_ms = await _now_ms()
+        con = _archive()
+        try:
+            entries = storage.accumulation_entries(
+                con, status=status, limit=max(1, min(limit, 200))
+            )
+            scans = {
+                (row["symbol"], tf): row
+                for tf in {str(entry["tf"]) for entry in entries}
+                for row in storage.latest_scan(con, tf)
+            }
+            return render_accumulation(
+                entries, scans, now_ms=now_ms, version=SQUEEZE_FORMULA_VERSION,
+            )
+        finally:
+            con.close()
+    except ToolError as error:
+        return _fail(error)
 
 
 @server.tool(

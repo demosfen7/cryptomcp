@@ -278,6 +278,55 @@ def render_watchlist_delta(
     return "\n".join(lines)
 
 
+def render_accumulation_delta(
+    changes: dict[str, list], now_ms: int | None = None
+) -> str | None:
+    """Текст дельты второго списка или None, если писать не о чем.
+
+    Отдельным сообщением, а не строкой в дельте списка наблюдения: списки
+    отбирают по разным основаниям, и смешать их в одном уведомлении значило бы
+    сделать невозможным вопрос «а какой из двух списков оказался полезнее».
+    """
+    entered = changes.get("entered") or []
+    exited = changes.get("exited") or []
+    if not (entered or exited):
+        return None
+
+    now_ms = now_ms or int(dt.datetime.now(dt.UTC).timestamp() * 1000)
+    stamp = dt.datetime.fromtimestamp(now_ms / 1000, dt.UTC).strftime("%d.%m %H:%M")
+
+    lines = [f"Накопление · {stamp} UTC"]
+    if entered:
+        lines.append(f"\nВошли ({len(entered)})")
+        lines += [
+            f"  + {_head(e)} · ранг {e['rank']}{_squeeze(e)}{_chart(e)}"
+            for e in entered
+        ]
+    if exited:
+        lines.append(f"\nВышли ({len(exited)})")
+        lines += [
+            f"  − {_head(e)} · {html.escape(str(e['reason']))}{_chart(e)}"
+            for e in exited
+        ]
+    return "\n".join(lines)
+
+
+async def notify_accumulation(
+    changes: dict[str, list],
+    now_ms: int | None = None,
+    sender: Telegram | None = None,
+) -> bool:
+    """Уведомить о дельте второго списка, если есть о чём и есть куда."""
+    text = render_accumulation_delta(changes, now_ms)
+    if text is None:
+        return False
+    sender = sender or Telegram.from_env()
+    if sender is None:
+        log.debug("telegram не настроен: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID пусты")
+        return False
+    return await sender.send(text)
+
+
 async def notify_watchlist(
     changes: dict[str, list],
     now_ms: int | None = None,

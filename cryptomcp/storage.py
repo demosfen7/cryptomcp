@@ -150,6 +150,16 @@ CREATE TABLE IF NOT EXISTS scan_log (
     -- Своё «закрыты по»: у рынков разная свежесть последней свечи, и
     -- сравнивать величины, снятые с разных свечей, нельзя.
     twin_closed_through_ms INTEGER,
+    -- Объём и поток на СОСЕДНЕМ рынке (PLAN §4.42). Ради них проход и
+    -- расширен: индексу рынок почти безразличен (замер 17.09.2026 на 25
+    -- монетах: медиана расхождения 0.02, верхушка восьми совпала на семь), а
+    -- объёмные признаки считаются по меньшинству торговли — у 152 из 183
+    -- архивных монет спот даёт меньше 30% оборота фьючерсов.
+    twin_ma_ratio       REAL,
+    twin_vol_ratio_12_30 REAL,
+    twin_delta_quadrant TEXT,
+    twin_delta_share_30 REAL,
+    twin_flow_change_30 REAL,
     -- Ход цены за сутки по закрытым свечам. Пишется ВСЕГДА, в том числе у
     -- монет, которые из-за него в список не попали (§4.35): иначе через два
     -- месяца нечем будет проверить, верен ли сам порог.
@@ -240,6 +250,34 @@ CREATE TABLE IF NOT EXISTS watchlist (
 CREATE UNIQUE INDEX IF NOT EXISTS watchlist_open
     ON watchlist (symbol, tf) WHERE exited_at IS NULL;
 
+-- Второй список: монеты с кластером набора, независимо от ранга сжатия
+-- (PLAN §4.43). Отдельная таблица, а не строка в `watchlist`: у списков разные
+-- правила отбора, и монета может стоять в обоих сразу. Слить их в одну таблицу
+-- значило бы потерять возможность честно сравнить два подхода по исходам —
+-- ради этого сравнения второй список и заводится.
+CREATE TABLE IF NOT EXISTS accumulation (
+    id               INTEGER PRIMARY KEY,
+    symbol           TEXT    NOT NULL,
+    tf               TEXT    NOT NULL,
+    market           TEXT,
+    status           TEXT    NOT NULL,
+    entered_at       INTEGER NOT NULL,
+    entered_index    REAL,
+    entered_clusters INTEGER,
+    entered_bars     INTEGER,
+    price_at_entry   REAL,
+    rank_at_entry    INTEGER,
+    last_rank        INTEGER,
+    last_index       REAL,
+    last_clusters    INTEGER,
+    exited_at        INTEGER,
+    exit_reason      TEXT
+);
+
+-- Открытая запись на пару может быть только одна; закрытых — сколько угодно.
+CREATE UNIQUE INDEX IF NOT EXISTS accumulation_open
+    ON accumulation (symbol, tf) WHERE exited_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS collector_runs (
     ts_ms   INTEGER PRIMARY KEY,
     kind    TEXT NOT NULL,
@@ -312,6 +350,11 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("scan_log", "twin_range_width_pct", "REAL"),
     ("scan_log", "twin_narrow_bars", "INTEGER"),
     ("scan_log", "twin_closed_through_ms", "INTEGER"),
+    ("scan_log", "twin_ma_ratio", "REAL"),
+    ("scan_log", "twin_vol_ratio_12_30", "REAL"),
+    ("scan_log", "twin_delta_quadrant", "TEXT"),
+    ("scan_log", "twin_delta_share_30", "REAL"),
+    ("scan_log", "twin_flow_change_30", "REAL"),
     ("scan_log", "change_24h_pct", "REAL"),
     ("scan_log", "absorption_tf", "TEXT"),
     ("scan_log", "absorption_bars", "INTEGER"),
@@ -635,7 +678,12 @@ def earlier_versions(con: sqlite3.Connection, tf: str) -> list[str]:
 
 
 def record_twin(
-    con: sqlite3.Connection, scan_id: int, *, market: str, view: Any
+    con: sqlite3.Connection,
+    scan_id: int,
+    *,
+    market: str,
+    view: Any,
+    flow: Mapping[str, Any] | None = None,
 ) -> None:
     """Дописать в готовую строку скана те же величины с соседнего рынка.
 
@@ -644,16 +692,24 @@ def record_twin(
     лежит вовсе — за ним нужен запрос. Связывать их в одну запись значило бы
     поставить дешёвый проход в зависимость от дорогого.
     """
+    flow = flow or {}
     con.execute(
         "UPDATE scan_log SET twin_market = ?, twin_index = ?, "
         "twin_range_width_pct = ?, twin_narrow_bars = ?, "
-        "twin_closed_through_ms = ? WHERE id = ?",
+        "twin_closed_through_ms = ?, twin_ma_ratio = ?, "
+        "twin_vol_ratio_12_30 = ?, twin_delta_quadrant = ?, "
+        "twin_delta_share_30 = ?, twin_flow_change_30 = ? WHERE id = ?",
         (
             market,
             view.squeeze_index,
             round(view.range_width * 100, 4),
             view.narrow_bars,
             view.meta.get("closed_through_ms"),
+            _round(view.volume.ma_ratio, 4),
+            flow.get("vol_ratio_12_30"),
+            flow.get("delta_quadrant"),
+            flow.get("delta_share_30"),
+            flow.get("flow_change_30"),
             scan_id,
         ),
     )
@@ -998,6 +1054,80 @@ def open_episode(
         ),
     )
     return int(cursor.lastrowid or 0) if cursor.rowcount else 0
+
+
+def open_accumulation(
+    con: sqlite3.Connection,
+    symbol: str,
+    tf: str,
+    *,
+    entered_at: int,
+    scan: dict[str, Any],
+    rank: int | None = None,
+) -> int:
+    """Завести запись второго списка (PLAN §4.43).
+
+    Кластер и бары на входе запоминаются и не пересчитываются: вопрос, ради
+    которого список заведён, звучит «что было в момент отбора», и текущее
+    значение на него не отвечает. То же правило, что у `open_episode`.
+    """
+    cursor = con.execute(
+        "INSERT OR IGNORE INTO accumulation (symbol, tf, market, status, entered_at, "
+        "entered_index, entered_clusters, entered_bars, price_at_entry, rank_at_entry, "
+        "last_rank, last_index, last_clusters) "
+        "VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            symbol, tf, scan.get("source"), entered_at,
+            scan.get("squeeze_index"), scan.get("absorption_clusters"),
+            scan.get("absorption_bars"), scan.get("price"), rank,
+            rank, scan.get("squeeze_index"), scan.get("absorption_clusters"),
+        ),
+    )
+    return int(cursor.lastrowid or 0) if cursor.rowcount else 0
+
+
+def touch_accumulation(
+    con: sqlite3.Connection,
+    entry_id: int,
+    *,
+    rank: int | None,
+    index: float | None,
+    clusters: int | None,
+) -> None:
+    con.execute(
+        "UPDATE accumulation SET last_rank = ?, last_index = ?, last_clusters = ? "
+        "WHERE id = ?",
+        (rank, index, clusters, entry_id),
+    )
+
+
+def close_accumulation(
+    con: sqlite3.Connection, entry_id: int, *, reason: str, ts_ms: int
+) -> None:
+    con.execute(
+        "UPDATE accumulation SET status = 'exited', exit_reason = ?, exited_at = ? "
+        "WHERE id = ?",
+        (reason, ts_ms, entry_id),
+    )
+
+
+def accumulation_entries(
+    con: sqlite3.Connection,
+    *,
+    status: str = "active",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Записи второго списка: открытые, закрытые или все, свежие сверху."""
+    sql = "SELECT * FROM accumulation"
+    params: list[Any] = []
+    if status == "active":
+        sql += " WHERE exited_at IS NULL"
+    elif status != "all":
+        sql += " WHERE status = ?"
+        params.append(status)
+    sql += " ORDER BY COALESCE(last_index, entered_index) DESC, entered_at DESC LIMIT ?"
+    params.append(limit)
+    return [dict(row) for row in con.execute(sql, params)]
 
 
 def close_episode(

@@ -46,7 +46,7 @@ from .derivatives import build_open_interest, side_of_flow
 from .errors import ToolError
 from .indicators import atr
 from .markets import FUTURES, SPOT
-from .notify import Telegram, notify_watchlist
+from .notify import Telegram, notify_accumulation, notify_watchlist
 from .reader import WARMUP
 from .series import build_series, interval_ms, series_from_records
 from .volume import absorption
@@ -271,6 +271,18 @@ WATCH_MIN_INDEX = _env_float("WATCH_MIN_INDEX", 0.0)
 
 #: Границы ранга для списка наблюдения. Вход выше выхода — гистерезис: при
 #: одинаковых порогах монеты у границы входили бы и выходили каждый прогон.
+#: Второй список — «накопление» (PLAN §4.43). Отбор не по тишине, а по
+#: кластеру набора: замер 17.09.2026 показал, что верхушка индекса на исходах
+#: не лучше базы (72ч, доля от +10%: 1d 44% против 45% у всех, 4h 29% против
+#: 42%), а кластер — лучше (51% против 39% на своевременных строках).
+#: Кластер редок: в верхушке индекса он есть у 6% строк, поэтому воротами к
+#: первому списку его делать нельзя — там осталась бы одна монета из
+#: пятнадцати. Отсюда отдельный список: свои правила, свои уведомления и
+#: честное сравнение двух подходов по `outcomes` через два-три месяца.
+ACCUMULATION_TIMEFRAMES = ("1d",)
+ACCUMULATION_ENTER_RANK = _env_int("ACCUMULATION_ENTER_RANK", 15)
+ACCUMULATION_EXIT_RANK = _env_int("ACCUMULATION_EXIT_RANK", 25)
+
 WATCH_ENTER_RANK = _env_int("WATCH_ENTER_RANK", 15)
 WATCH_EXIT_RANK = _env_int("WATCH_EXIT_RANK", 40)
 
@@ -821,6 +833,11 @@ async def scan_twin(
             storage.record_twin(
                 con, int(row["id"]), market=twin,
                 view=analyse_timeframe(series, config),
+                # Объём и поток соседнего рынка — то, ради чего проход и
+                # расширен: у 152 архивных монет из 183 спот даёт меньше 30%
+                # оборота фьючерсов, и объёмные признаки считаются по
+                # меньшинству торговли (PLAN §4.42).
+                flow=_flow_row(series),
             )
             written += 1
     con.commit()
@@ -1056,6 +1073,86 @@ def update_watchlist(con: sqlite3.Connection, now_ms: int | None = None) -> dict
                 entered_by="scanner", scan=row, rank=position,
             )
             if episode_id:
+                changes["entered"].append(
+                    _delta_entry(row["symbol"], tf, row["source"], row, rank=position)
+                )
+
+    con.commit()
+    return changes
+
+
+def update_accumulation(
+    con: sqlite3.Connection, now_ms: int | None = None
+) -> dict[str, list]:
+    """Пересчитать второй список и вернуть дельту (PLAN §4.43).
+
+    Кандидаты — монеты, у которых в последней живой записи скана есть кластер
+    набора на младшем ряду. Порядок внутри — по индексу сжатия: тишина сама по
+    себе выбирает не лучше базы, но среди монет с признаком набора она остаётся
+    разумным способом расставить их по очереди.
+
+    Гистерезис тот же по смыслу, что у первого списка, но уже: вход в топ-15,
+    выход из топ-25 множества монет С КЛАСТЕРОМ. Множество меньше — значит и
+    границы теснее.
+
+    Ворота на вход одни: монета, уже прошедшая за сутки больше
+    ``WATCH_MAX_CHANGE_24H``, не кандидат на накопление. Порог семи суток
+    сжатия сюда НЕ переносится: накопление бывает и коротким, а тишина здесь
+    не является основанием отбора.
+    """
+    now_ms = now_ms or int(dt.datetime.now(dt.UTC).timestamp() * 1000)
+    changes: dict[str, list] = {"entered": [], "exited": []}
+
+    for tf in ACCUMULATION_TIMEFRAMES:
+        fresh = [
+            row for row in storage.latest_scan(con, tf, fresh_as_of_ms=now_ms)
+            if (row.get("absorption_clusters") or 0) > 0
+        ]
+        ranks = {row["symbol"]: position for position, row in enumerate(fresh, start=1)}
+        by_symbol = {row["symbol"]: row for row in fresh}
+
+        for entry in storage.accumulation_entries(con, status="active", limit=200):
+            if entry["tf"] != tf:
+                continue
+            symbol = entry["symbol"]
+            scan = by_symbol.get(symbol)
+            position = ranks.get(symbol)
+            if position is None:
+                # Кластер исчез или монета перестала сканироваться — для
+                # второго списка это одно и то же: признака, по которому она
+                # отобрана, больше нет.
+                storage.close_accumulation(
+                    con, entry["id"], reason="кластера набора больше нет", ts_ms=now_ms,
+                )
+                changes["exited"].append(
+                    _delta_entry(symbol, tf, entry.get("market"), None,
+                                 reason="кластер пропал")
+                )
+                continue
+            if position > ACCUMULATION_EXIT_RANK:
+                storage.close_accumulation(
+                    con, entry["id"],
+                    reason=f"ранг {position} ниже {ACCUMULATION_EXIT_RANK}", ts_ms=now_ms,
+                )
+                changes["exited"].append(
+                    _delta_entry(symbol, tf, entry.get("market"), scan,
+                                 reason="выпала по рангу")
+                )
+                continue
+            storage.touch_accumulation(
+                con, entry["id"], rank=position,
+                index=scan.get("squeeze_index"),
+                clusters=scan.get("absorption_clusters"),
+            )
+
+        for position, row in enumerate(fresh[:ACCUMULATION_ENTER_RANK], start=1):
+            change = row.get("change_24h_pct")
+            if change is not None and abs(change) > WATCH_MAX_CHANGE_24H:
+                continue
+            entry_id = storage.open_accumulation(
+                con, row["symbol"], tf, entered_at=now_ms, scan=row, rank=position,
+            )
+            if entry_id:
                 changes["entered"].append(
                     _delta_entry(row["symbol"], tf, row["source"], row, rank=position)
                 )
@@ -1359,6 +1456,7 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
         twins = await scan_twin({SPOT.name: spot, FUTURES.name: client}, con)
         settled = settle_outcomes(con)
         changes = update_watchlist(con)
+        accumulated = update_accumulation(con)
         storage.record_run(
             con, "scan", symbols=scanned, rows=scanned + settled,
             seconds=time.monotonic() - started,
@@ -1386,8 +1484,14 @@ async def run_once(con: sqlite3.Connection, *, backfill_days: float | None) -> N
         # Telegram — потеря уведомления, молчащий сборщик — потеря часа
         # открытого интереса навсегда. notify_watchlist исключений не
         # поднимает и молчит, когда состав списка не изменился.
+        log.info(
+            "накопление: вошло %d, вышло %d",
+            len(accumulated["entered"]), len(accumulated["exited"]),
+        )
         if await notify_watchlist(changes):
             log.info("telegram: дельта отправлена")
+        if await notify_accumulation(accumulated):
+            log.info("telegram: дельта накопления отправлена")
     finally:
         await client.aclose()
         await spot.aclose()
