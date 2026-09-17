@@ -439,7 +439,19 @@ def _diff(
     ):
         old = {float(item["price"]): float(item["qty"]) for item in before}
         new = {float(item["price"]): float(item["qty"]) for item in after}
+        # limit=100 задаёт подвижное ценовое окно. Уровень на дальнем краю,
+        # который оказался только в одном ответе Binance, не появился и не
+        # исчез — он просто перестал быть виден. Сравниваем лишь пересечение
+        # двух окон каждой стороны (приёмка 17.09, блокер 2).
+        if not old or not new:
+            continue
+        lower = max(min(old), min(new))
+        upper = min(max(old), max(new))
+        if lower > upper:
+            continue
         for price in sorted(set(old) | set(new), reverse=side == "bid"):
+            if not lower <= price <= upper:
+                continue
             qty_before, qty_after = old.get(price, 0.0), new.get(price, 0.0)
             if price not in old:
                 event_type = "appeared"
