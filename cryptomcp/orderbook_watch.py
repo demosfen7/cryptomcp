@@ -12,7 +12,7 @@ import os
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict
 from typing import Any
 
@@ -524,11 +524,9 @@ def classify_liquidity(
             new = {float(item["price"]): item for item in new_levels}
             if not old or not new:
                 continue
-            lower, upper = max(min(old), min(new)), min(max(old), max(new))
-            if lower > upper:
-                continue
+            visible = _within_far_edge(side, old, new)
             for price, level in old.items():
-                if not lower <= price <= upper:
+                if not visible(price):
                     continue
                 item = _level_outcome(side, price, level, before, after, interval_trades)
                 if has_gap:
@@ -788,6 +786,29 @@ def _vanished_before_touch(
     )
 
 
+def _within_far_edge(
+    side: str, old: dict[float, Any], new: dict[float, Any]
+) -> Callable[[float], bool]:
+    """Отсечь только ДАЛЬНИЙ край окна limit=100, ближний оставить.
+
+    Окно из ста уровней ездит вместе с ценой. Уровень, выпавший за дальний
+    край, не появился и не исчез — его просто не видно, и сравнивать его
+    нельзя (приёмка 17.09, блокер 2): живая сессия ARBUSDT дала 442 таких
+    артефакта из 444 событий.
+
+    Ближний край — другое дело. Лучший аск, через который прошла цена, исчез
+    по-настоящему: его исполнили или сняли у цены, и различают это как раз
+    сделки. Двустороннее пересечение окон выбрасывало ровно эти уровни, и на
+    живой сессии ARBUSDT за две минуты «исполнен» и «снят у цены» оставались
+    пустыми, хотя по сделкам 55 уровней были исполнены и 50 сняты у цены.
+    """
+    if side == "ask":
+        far = min(max(old), max(new))
+        return lambda price: price <= far
+    far = max(min(old), min(new))
+    return lambda price: price >= far
+
+
 def _diff(
     before_bids: list[dict[str, Any]],
     before_asks: list[dict[str, Any]],
@@ -801,18 +822,11 @@ def _diff(
     ):
         old = {float(item["price"]): float(item["qty"]) for item in before}
         new = {float(item["price"]): float(item["qty"]) for item in after}
-        # limit=100 задаёт подвижное ценовое окно. Уровень на дальнем краю,
-        # который оказался только в одном ответе Binance, не появился и не
-        # исчез — он просто перестал быть виден. Сравниваем лишь пересечение
-        # двух окон каждой стороны (приёмка 17.09, блокер 2).
         if not old or not new:
             continue
-        lower = max(min(old), min(new))
-        upper = min(max(old), max(new))
-        if lower > upper:
-            continue
+        visible = _within_far_edge(side, old, new)
         for price in sorted(set(old) | set(new), reverse=side == "bid"):
-            if not lower <= price <= upper:
+            if not visible(price):
                 continue
             qty_before, qty_after = old.get(price, 0.0), new.get(price, 0.0)
             if price not in old:
