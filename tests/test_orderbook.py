@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from cryptomcp.markets import FUTURES, SPOT
 from cryptomcp.orderbook import build_order_book, normalise_depth_pcts
 from cryptomcp.render import render_order_book
@@ -37,15 +39,34 @@ def test_a9_2_incomplete_depth_coverage_is_printed_with_reason():
     assert "дальше уровней в ответе Binance нет" in text
 
 
-def test_a9_3_cumulative_notional_matches_manual_sum_inside_depth():
-    """A.9 №3: по сырому блоку вручную проверяется любая производная величина."""
-    book = _book(depth_pcts=(0.25,))
-    threshold = book.mid_price * (1 - 0.25 / 100)
-    levels = [level for level in book.bids if level.price >= threshold]
-    manually_summed = sum(level.notional_usdt for level in levels)
+def test_a9_3_rendered_boundaries_make_cumulative_notional_reproducible_from_text():
+    """Блокер 4: границы и середина из текста выбирают те же сырые уровни."""
+    book = build_order_book(
+        {
+            "bids": [["0.16472", "100000"], ["0.16431", "200000"]],
+            "asks": [["0.16473", "100000"], ["0.16514", "200000"]],
+        },
+        timestamp_ms=NOW,
+        last_price=0.16472,
+        limit=100,
+        depth_pcts=(0.25,),
+        turnover_24h_usdt=5_000_000,
+    )
+    text = render_order_book(book, "ARBUSDT", precision=5)
 
-    assert levels[-1].cum_notional_usdt == manually_summed
-    assert book.ranges[0].bid_notional_usdt == manually_summed
+    mid = re.search(r"середина книги ([0-9.]+)", text)
+    bounds = re.search(r"bid ≥ ([0-9.]+); ask ≤ ([0-9.]+)", text)
+    bid_block = re.search(r"Сырые уровни bids.*?\n\nСырые уровни asks", text, re.S)
+
+    assert mid and mid.group(1) == "0.164725"
+    assert bounds and bid_block
+    lower = float(bounds.group(1))
+    raw_prices = [
+        float(item)
+        for item in re.findall(r"^  ([0-9.]+) · qty", bid_block.group(0), re.M)
+    ]
+    assert [price for price in raw_prices if price >= lower] == [0.16472]
+    assert "bid 16.47K" in text
 
 
 def test_a9_4_low_turnover_makes_imbalance_na_but_keeps_raw_book():

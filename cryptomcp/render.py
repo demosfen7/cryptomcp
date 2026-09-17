@@ -140,24 +140,30 @@ def render_order_book(
     book: OrderBook, symbol: str, *, market: Market = FUTURES, precision: int = 2
 ) -> str:
     """Выдать L2-снимок с сырым блоком, агрегатами и честными n/a (A.4--A.8)."""
+    # Середина может лежать между тиками, поэтому точности самого символа
+    # недостаточно для ручной проверки выбранных диапазонов (приёмка 17.09).
+    range_precision = precision + 1
     lines = [
         f"Стакан {symbol}{market.suffix} ({market.label}), снапшот "
         f"{utc(book.timestamp_ms)} UTC · limit={book.limit}",
         f"last_price {format_price(book.last_price, precision)} (live, отдельный тикер) "
-        f"· середина книги {format_price(book.mid_price, precision)}",
+        f"· середина книги {format_price(book.mid_price, range_precision)}",
         f"best_bid {format_price(book.best_bid, precision)} · best_ask "
         f"{format_price(book.best_ask, precision)} · spread "
         f"{format_price(book.spread, precision)} ({book.spread_pct:.3f}% к середине)",
         "",
     ]
     for depth in book.ranges:
+        lower = book.mid_price * (1.0 - depth.depth_pct / 100.0)
+        upper = book.mid_price * (1.0 + depth.depth_pct / 100.0)
         imbalance = (
             f"{depth.imbalance:+.2f}"
             if depth.imbalance is not None
             else f"n/a — {depth.imbalance_reason}"
         )
         lines.append(
-            f"Диапазон ±{depth.depth_pct:g}%   bid {usdt(depth.bid_notional_usdt)} "
+            f"Диапазон ±{depth.depth_pct:g}% (bid ≥ {format_price(lower, range_precision)}; "
+            f"ask ≤ {format_price(upper, range_precision)})   bid {usdt(depth.bid_notional_usdt)} "
             f"· ask {usdt(depth.ask_notional_usdt)} · imbalance {imbalance}"
         )
         if not depth.fully_covered:
