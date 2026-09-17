@@ -87,6 +87,39 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Бот не является потоком сборщика: ошибка Telegram или сценария не должна
+  # стоить часа невосстановимых деривативов.  Рыночный архив он только читает;
+  # его bot.sqlite лежит рядом в том же томе (README Б1, Б6).
+  bot:
+    build: .
+    container_name: cryptomcp-bot
+    restart: unless-stopped
+    command: ["python", "-m", "cryptomcp.bot", "loop"]
+    environment:
+      CRYPTOMCP_LOG_LEVEL: INFO
+      CRYPTOMCP_DB: /app/data/market.sqlite
+      CRYPTOMCP_BOT_DB: /app/data/bot.sqlite
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      BOT_ALLOWED_USER_IDS: ${BOT_ALLOWED_USER_IDS:-}
+      BOT_DAILY_BUDGET_USD: ${BOT_DAILY_BUDGET_USD:-1.0}
+      BOT_TIMEZONE: ${BOT_TIMEZONE:-Europe/Berlin}
+      BOT_MORNING_TIME: ${BOT_MORNING_TIME:-08:00}
+    volumes:
+      - cryptomcp_data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-m", "cryptomcp.bot", "health", "--db", "/app/data/bot.sqlite"]
+      interval: 1m
+      timeout: 10s
+      start_period: 1m
+      retries: 3
+    networks:
+      - briefgenerator_internal
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   cryptomcp_journal:
   cryptomcp_data:
