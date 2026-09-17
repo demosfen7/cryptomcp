@@ -102,8 +102,10 @@ async def test_start_remembers_private_chat_of_allowed_owner_and_shows_exact_men
     await worker.handle_update(message(42, "/start", chat_id=4242))
 
     assert worker.store.chat_for_user(42) == 4242
-    assert telegram.messages[-1]["reply_markup"] == main_menu()
-    assert telegram.messages[-1]["reply_markup"][0][0]["text"] == "📋 Список наблюдения"
+    menu = telegram.messages[-1]["reply_markup"]
+    assert menu[:len(main_menu())] == main_menu()
+    assert menu[0][0]["text"] == "📋 Список наблюдения"
+    assert menu[-1][0]["text"] == "⌨️ Убрать кнопки", "переключатель клавиатуры"
 
 
 def test_empty_allowlist_is_safe_default():
@@ -716,12 +718,14 @@ async def test_every_screen_has_a_way_back_to_the_menu(tmp_path):
 
 @pytest.mark.asyncio
 async def test_back_button_shows_the_menu_again(bot):
+    """Возврат в меню — одно сообщение, без повторной клавиатуры под полем."""
     worker, telegram = bot
 
     await worker.handle_update(callback(42, "menu"))
 
+    assert len(telegram.messages) == 1
     assert telegram.messages[-1]["text"] == "Выберите сценарий."
-    assert telegram.messages[-2]["reply_markup"]["is_persistent"] is True
+    assert isinstance(telegram.messages[-1]["reply_markup"], list)
 
 
 @pytest.mark.asyncio
@@ -764,3 +768,60 @@ async def test_command_shortcut_runs_the_scenario(tmp_path):
     await worker.handle_update(message(42, "/list"))
 
     assert telegram.messages[-1]["text"].startswith("📋 Список наблюдения")
+
+
+@pytest.mark.asyncio
+async def test_keyboard_can_be_hidden_by_its_own_button(bot):
+    """Клавиатура занимает пол-экрана: убрать её можно прямо оттуда."""
+    from cryptomcp.bot import HIDE_LABEL
+
+    worker, telegram = bot
+
+    await worker.handle_update(message(42, HIDE_LABEL))
+
+    assert telegram.messages[0]["reply_markup"] == {"remove_keyboard": True}
+    assert "Кнопки убраны" in telegram.messages[0]["text"]
+    assert telegram.messages[-1]["reply_markup"][-1][0]["text"] == "⌨️ Показать кнопки"
+
+
+@pytest.mark.asyncio
+async def test_hidden_keyboard_comes_back_by_the_button(bot):
+    from cryptomcp.bot import HIDE_LABEL
+
+    worker, telegram = bot
+    await worker.handle_update(message(42, HIDE_LABEL))
+    telegram.messages.clear()
+
+    await worker.handle_update(callback(42, "kb-show"))
+
+    assert telegram.messages[0]["reply_markup"]["is_persistent"] is True
+    assert telegram.messages[-1]["reply_markup"][-1][0]["text"] == HIDE_LABEL
+
+
+@pytest.mark.asyncio
+async def test_menu_does_not_push_the_keyboard_back_after_it_was_hidden(bot):
+    """Убрал — значит убрал: меню не возвращает клавиатуру само."""
+    from cryptomcp.bot import HIDE_LABEL
+
+    worker, telegram = bot
+    await worker.handle_update(message(42, HIDE_LABEL))
+    telegram.messages.clear()
+
+    await worker.handle_update(callback(42, "menu"))
+
+    assert all(
+        message["reply_markup"] != {"remove_keyboard": True}
+        for message in telegram.messages
+    )
+    assert len(telegram.messages) == 1
+    assert telegram.messages[0]["reply_markup"][-1][0]["text"] == "⌨️ Показать кнопки"
+
+
+@pytest.mark.asyncio
+async def test_start_still_brings_the_keyboard(bot):
+    worker, telegram = bot
+
+    await worker.handle_update(message(42, "/start"))
+
+    assert telegram.messages[0]["reply_markup"]["is_persistent"] is True
+    assert "Убрать их можно кнопкой" in telegram.messages[0]["text"]

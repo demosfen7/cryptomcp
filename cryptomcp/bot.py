@@ -689,6 +689,7 @@ MENU_ACTIONS: dict[str, str] = {
 }
 
 BACK_LABEL = "⬅️ Главное меню"
+HIDE_LABEL = "⌨️ Убрать кнопки"
 
 #: Команды в кнопке «Меню» рядом с полем ввода. Нужны, чтобы меню было под
 #: рукой и в группе, где кнопок под полем не бывает.
@@ -718,16 +719,23 @@ def reply_menu() -> dict[str, Any]:
     """Кнопки под полем ввода: меню видно всегда, вызывать его не нужно.
 
     `is_persistent` оставляет клавиатуру на экране, `resize_keyboard` делает
-    кнопки в одну строку по высоте текста. Это и есть ответ на просьбу
-    владельца «чтобы не нажимать /start каждый раз»: клавиатура ставится один
-    раз и живёт в чате, пока её не убрать.
+    кнопки по высоте текста. Последней строкой — «убрать кнопки»: клавиатура
+    занимает пол-экрана телефона, и у человека должен быть способ её свернуть
+    прямо там, где она мешает.
     """
+    rows = [[{"text": text} for text, _ in row] for row in MENU_ROWS]
+    rows.append([{"text": HIDE_LABEL}])
     return {
-        "keyboard": [[{"text": text} for text, _ in row] for row in MENU_ROWS],
+        "keyboard": rows,
         "resize_keyboard": True,
         "is_persistent": True,
         "input_field_placeholder": "Выберите кнопку или напишите тикер",
     }
+
+
+def hide_keyboard() -> dict[str, Any]:
+    """Свернуть клавиатуру под полем ввода."""
+    return {"remove_keyboard": True}
 
 
 def with_back(
@@ -1095,6 +1103,9 @@ class Bot:
         if text == BACK_LABEL:
             await self._show_menu(chat_id)
             return
+        if text == HIDE_LABEL:
+            await self._hide_keyboard(chat_id)
+            return
         note = self._pending_note.pop(user_id, None)
         if note is not None:
             symbol, timeframe, operation = note
@@ -1110,24 +1121,54 @@ class Bot:
             return
         await self._show_menu(chat_id)
 
-    async def _show_menu(self, chat_id: int, *, greeting: bool = False) -> None:
-        """Показать меню: кнопки под полем ввода плюс те же кнопки в сообщении.
+    def _keyboard_hidden(self, chat_id: int) -> bool:
+        return self.store.get_meta(f"keyboard_hidden:{chat_id}") == "1"
 
-        Клавиатура под полем остаётся в чате навсегда, поэтому вызывать меню
-        командой больше не нужно — ровно то, о чём просил владелец.
+    def _remember_keyboard(self, chat_id: int, *, hidden: bool) -> None:
+        self.store.set_meta(f"keyboard_hidden:{chat_id}", "1" if hidden else "0")
+
+    async def _show_menu(
+        self, chat_id: int, *, greeting: bool = False, keyboard: bool | None = None
+    ) -> None:
+        """Показать меню одним сообщением.
+
+        Клавиатура под полем ввода присылается только когда её просят: на
+        `/start` и по кнопке «показать кнопки». Иначе каждое возвращение в
+        меню давало два сообщения подряд и то же самое меню дважды — в
+        сообщении и под полем (замечание владельца 17.09.2026).
         """
-        if greeting:
+        show_keyboard = greeting if keyboard is None else keyboard
+        if show_keyboard:
             await self.telegram.send_message(
                 chat_id,
-                "Меню всегда под полем ввода — вызывать его командой не нужно.",
+                "Кнопки под полем ввода. Убрать их можно кнопкой "
+                f"«{HIDE_LABEL}», вернуть — командой /menu.",
                 reply_markup=reply_menu(),
             )
-        else:
-            await self.telegram.send_message(
-                chat_id, "Меню под полем ввода.", reply_markup=reply_menu()
-            )
+            self._remember_keyboard(chat_id, hidden=False)
         await self.telegram.send_message(
-            chat_id, "Выберите сценарий.", reply_markup=main_menu()
+            chat_id, "Выберите сценарий.",
+            reply_markup=main_menu() + [[self._keyboard_button(chat_id)]],
+        )
+
+    def _keyboard_button(self, chat_id: int) -> dict[str, str]:
+        """Одна кнопка-переключатель: что сейчас можно сделать с клавиатурой."""
+        if self._keyboard_hidden(chat_id):
+            return {
+                "text": "⌨️ Показать кнопки",
+                "callback_data": encode_callback("kb-show"),
+            }
+        return {"text": HIDE_LABEL, "callback_data": encode_callback("kb-hide")}
+
+    async def _hide_keyboard(self, chat_id: int) -> None:
+        self._remember_keyboard(chat_id, hidden=True)
+        await self.telegram.send_message(
+            chat_id,
+            "Кнопки убраны. Вернуть — командой /menu или кнопкой ниже.",
+            reply_markup=hide_keyboard(),
+        )
+        await self.telegram.send_message(
+            chat_id, "Меню:", reply_markup=main_menu() + [[self._keyboard_button(chat_id)]],
         )
 
     async def _handle_callback(self, callback: dict[str, Any]) -> None:
@@ -1179,6 +1220,12 @@ class Bot:
             await self.telegram.send_message(
                 chat_id, "Напишите тикер: можно ID или IDUSDT.", force_reply=True
             )
+            return
+        if action == "kb-hide":
+            await self._hide_keyboard(chat_id)
+            return
+        if action == "kb-show":
+            await self._show_menu(chat_id, keyboard=True)
             return
         if action in MENU_ACTIONS.values() or action in {
             "menu", "manual-add", "manual-remove",
