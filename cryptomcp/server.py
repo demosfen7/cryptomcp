@@ -193,7 +193,7 @@ _clients: dict[str, BinanceClient] = {}
 _lock = asyncio.Lock()
 
 #: Тикеры принадлежат процессу сервера. После его рестарта эти задачи исчезают,
-#: а строка в отдельной БД остаётся active до уборки collector (решение Р2).
+#: а строка в отдельной БД остаётся active до уборки collector (PLAN §4.38).
 _watch_tasks: dict[str, asyncio.Task[None]] = {}
 
 
@@ -778,7 +778,7 @@ async def _record_order_book_watch_snapshot(watch_id: str) -> bool:
                 con.close()
             return False
         await _record_order_book_watch_trades(client, session, fetched_at=trade_fetched_at)
-        # В тике last_price не запрашивается (Р5). Поле OrderBook нужно ядру,
+        # В тике last_price не запрашивается (PLAN §4.38). Поле OrderBook нужно ядру,
         # но в БД и выдачу сессии не попадает; середина того же снимка честнее.
         bids, asks = snapshot.get("bids", ()), snapshot.get("asks", ())
         last_price = (float(bids[0][0]) + float(asks[0][0])) / 2.0

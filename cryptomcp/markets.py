@@ -36,7 +36,7 @@ def _spot_klines_weight(limit: int) -> int:
 
 
 def _futures_depth_weight(limit: int) -> int:
-    """Вес /fapi/v1/depth, замеренный 16.09.2026 (README задания).
+    """Вес /fapi/v1/depth, замеренный 16.09.2026 (PLAN §4.37).
 
     Таблица из документации Binance оказалась таблицей спота: у фьючерсов
     уровни 5--50 стоят 2, 100 -- 5, 500 -- 10, 1000 -- 20 единиц. Значение
@@ -53,7 +53,7 @@ def _futures_depth_weight(limit: int) -> int:
 
 
 def _spot_depth_weight(limit: int) -> int:
-    """Вес /api/v3/depth, замеренный 16.09.2026 (README задания)."""
+    """Вес /api/v3/depth, замеренный 16.09.2026 (PLAN §4.37)."""
     if limit <= 100:
         return 5
     if limit == 500:
@@ -90,7 +90,7 @@ class Market:
     has_derivatives: bool
     klines_weight: Callable[[int], int] = field(compare=False)
     #: Допустимые значения limit и функция веса L2-стакана. Это свойства
-    #: рынка: futures и spot расходятся по обоим пунктам (README задания).
+    #: рынка: futures и spot расходятся по обоим пунктам (PLAN §4.37).
     depth_limits: frozenset[int] = field(default_factory=frozenset)
     depth_weight: Callable[[int], int] = field(default=lambda _: 1, compare=False)
 
