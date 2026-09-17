@@ -34,6 +34,8 @@ SESSION_WEIGHT_SHARE = 0.5
 LONG_LIVED_FRACTION = 0.5
 VANISHED_BEFORE_TOUCH_SNAPSHOTS = 3
 NEAR_PRICE_PCT = 0.3
+FILL_SHARE = 0.8
+SUMMARY_TOP_LEVELS = 10
 
 DEFAULT_PATH = os.environ.get("CRYPTOMCP_ORDER_BOOK_WATCH_DB") or os.path.join(
     os.path.dirname(storage.DEFAULT_PATH) or ".", "order_book_watch.sqlite"
@@ -287,9 +289,12 @@ def get_watch(con: sqlite3.Connection | None, watch_id: str) -> dict[str, Any] |
 def list_watches(con: sqlite3.Connection | None) -> list[dict[str, Any]]:
     if con is None:
         return []
-    return [_watch_row(row) for row in con.execute(
+    watches = [_watch_row(row) for row in con.execute(
         "SELECT * FROM order_book_watches ORDER BY started_at DESC"
     )]
+    for watch in watches:
+        watch["storage_bytes"] = storage_bytes(con, watch["watch_id"])
+    return watches
 
 
 def stop(con: sqlite3.Connection, watch_id: str, *, stopped_at: int | None = None) -> bool:
@@ -480,6 +485,132 @@ def trade_gaps(
     return [dict(row) for row in rows]
 
 
+def classify_liquidity(
+    snapshots: list[dict[str, Any]],
+    trade_rows: list[dict[str, Any]],
+    gaps: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Разобрать судьбу видимых уровней по снимкам и aggTrades (С4).
+
+    Это не оценка намерений участника. Результат отвечает только, удержала ли
+    заявка поток, была ли исполнена, ушла у цены или ушла перед подходом.
+    """
+    outcomes: dict[str, list[dict[str, Any]]] = {
+        "устоял": [],
+        "исполнен": [],
+        "снят у цены": [],
+        "снят заранее": [],
+        "похоже на айсберг": [],
+        "n/a": [],
+    }
+    ignored = 0
+    trades_by_interval = sorted(trade_rows, key=lambda item: int(item["ts"]))
+    for index, (before, after) in enumerate(zip(snapshots, snapshots[1:], strict=False)):
+        start, end = int(before["ts"]), int(after["ts"])
+        interval_trades = [
+            item for item in trades_by_interval if start < int(item["ts"]) <= end
+        ]
+        has_gap = any(
+            int(gap["ended_at"]) > start and int(gap["started_at"]) <= end for gap in gaps
+        )
+        for side, old_levels, new_levels in (
+            ("bid", before["bids"], after["bids"]),
+            ("ask", before["asks"], after["asks"]),
+        ):
+            old = {float(item["price"]): item for item in old_levels}
+            new = {float(item["price"]): item for item in new_levels}
+            if not old or not new:
+                continue
+            lower, upper = max(min(old), min(new)), min(max(old), max(new))
+            if lower > upper:
+                continue
+            for price, level in old.items():
+                if not lower <= price <= upper:
+                    continue
+                item = _level_outcome(side, price, level, before, after, interval_trades)
+                if has_gap:
+                    outcomes["n/a"].append({
+                        **item,
+                        "reason": "пропуск aggTrades в интервале снимков",
+                    })
+                    continue
+                if price in new:
+                    if item["traded_qty"] > 0:
+                        outcomes["устоял"].append(item)
+                        if item["traded_qty"] > item["qty_before"]:
+                            outcomes["похоже на айсберг"].append(item)
+                    continue
+                if item["traded_qty"] >= FILL_SHARE * item["qty_before"]:
+                    outcomes["исполнен"].append(item)
+                elif _was_touched(side, price, interval_trades):
+                    outcomes["снят у цены"].append(item)
+                elif _vanished_before_touch(price, before, after, snapshots[index + 2:]):
+                    outcomes["снят заранее"].append(item)
+                else:
+                    ignored += 1
+    return {"outcomes": outcomes, "ignored": ignored}
+
+
+def long_lived_levels(
+    watch: dict[str, Any], snapshots: list[dict[str, Any]], *, now: int
+) -> list[dict[str, Any]]:
+    """Уровни, реально присутствовавшие большую долю уже прошедшей сессии (п.5)."""
+    if not snapshots:
+        return []
+    interval_ms = int(watch["interval_sec"]) * 1000
+    elapsed = max(interval_ms, min(now, int(watch["ends_at"])) - int(watch["started_at"]))
+    seen: dict[tuple[str, float], tuple[int, dict[str, Any]]] = {}
+    for snapshot in snapshots:
+        for side, levels in (("bid", snapshot["bids"]), ("ask", snapshot["asks"])):
+            for level in levels:
+                key = (side, float(level["price"]))
+                count, _ = seen.get(key, (0, level))
+                seen[key] = (count + 1, level)
+    result = []
+    for (side, price), (count, level) in seen.items():
+        present_ms = count * interval_ms
+        if present_ms / elapsed < LONG_LIVED_FRACTION:
+            continue
+        result.append({
+            "side": side,
+            "price": price,
+            "notional_usdt": float(level["notional_usdt"]),
+            "minutes": present_ms / 60_000,
+            "snapshots": count,
+        })
+    return sorted(result, key=lambda item: (-item["notional_usdt"], item["side"], item["price"]))
+
+
+def storage_bytes(con: sqlite3.Connection | None, watch_id: str) -> int:
+    """Сумма реально сохранённых колонок этой сессии, без выдуманных КБ на тик."""
+    if con is None:
+        return 0
+    snapshot_bytes = con.execute(
+        "SELECT COALESCE(SUM(length(bids_json) + length(asks_json) + length(ranges_json)), 0) "
+        "FROM watch_snapshots WHERE watch_id = ?",
+        (watch_id,),
+    ).fetchone()[0]
+    diff_bytes = con.execute(
+        "SELECT COALESCE(SUM(length(side) + length(CAST(price AS TEXT)) + "
+        "length(CAST(qty_before AS TEXT)) + length(CAST(qty_after AS TEXT)) + "
+        "length(event_type)), 0) FROM watch_diffs WHERE watch_id = ?",
+        (watch_id,),
+    ).fetchone()[0]
+    trade_bytes = con.execute(
+        "SELECT COALESCE(SUM(length(CAST(agg_id AS TEXT)) + length(CAST(ts AS TEXT)) + "
+        "length(CAST(price AS TEXT)) + length(CAST(qty AS TEXT)) + "
+        "length(CAST(buyer_is_maker AS TEXT))), 0) FROM watch_trades WHERE watch_id = ?",
+        (watch_id,),
+    ).fetchone()[0]
+    gap_bytes = con.execute(
+        "SELECT COALESCE(SUM(length(CAST(before_agg_id AS TEXT)) + "
+        "length(CAST(after_agg_id AS TEXT)) + length(CAST(started_at AS TEXT)) + "
+        "length(CAST(ended_at AS TEXT))), 0) FROM watch_trade_gaps WHERE watch_id = ?",
+        (watch_id,),
+    ).fetchone()[0]
+    return int(snapshot_bytes) + int(diff_bytes) + int(trade_bytes) + int(gap_bytes)
+
+
 def snapshots(
     con: sqlite3.Connection | None,
     watch_id: str,
@@ -603,6 +734,55 @@ def _trade(row: dict[str, Any]) -> dict[str, Any]:
         "qty": float(row["q"]),
         "buyer_is_maker": bool(row["m"]),
     }
+
+
+def _level_outcome(
+    side: str,
+    price: float,
+    level: dict[str, Any],
+    before: dict[str, Any],
+    after: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    buyer_taker = side == "ask"
+    traded_qty = sum(
+        float(row["qty"])
+        for row in rows
+        if float(row["price"]) == price and bool(row["buyer_is_maker"]) != buyer_taker
+    )
+    return {
+        "side": side,
+        "price": price,
+        "qty_before": float(level["qty"]),
+        "notional_usdt": float(level["notional_usdt"]),
+        "traded_qty": traded_qty,
+        "from_ts": int(before["ts"]),
+        "to_ts": int(after["ts"]),
+    }
+
+
+def _was_touched(side: str, price: float, rows: list[dict[str, Any]]) -> bool:
+    if side == "ask":
+        return any(float(row["price"]) >= price for row in rows)
+    return any(float(row["price"]) <= price for row in rows)
+
+
+def _vanished_before_touch(
+    price: float,
+    before: dict[str, Any],
+    after: dict[str, Any],
+    later: list[dict[str, Any]],
+) -> bool:
+    def is_far(snapshot: dict[str, Any]) -> bool:
+        distance = abs(float(snapshot["mid_price"]) - price) / float(snapshot["mid_price"])
+        return distance * 100 > NEAR_PRICE_PCT
+
+    if not (is_far(before) and is_far(after)):
+        return False
+    return any(
+        not is_far(snapshot)
+        for snapshot in later[:VANISHED_BEFORE_TOUCH_SNAPSHOTS]
+    )
 
 
 def _diff(

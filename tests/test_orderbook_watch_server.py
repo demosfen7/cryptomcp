@@ -293,3 +293,44 @@ def test_watch_output_is_paginated_below_context_limit_for_every_format():
         assert "снимков 300 · событий 300" in text
         if format in {"raw", "diff", "both"}:
             assert "показано " in text
+
+
+def test_liquidity_summary_text_orders_real_outcomes_before_early_removal():
+    """С4: модель получает вывод о настоящей ликвидности, не ярлык намерения."""
+    level = {"price": 100.0, "qty": 10.0, "notional_usdt": 1000.0, "cum_notional_usdt": 1000.0}
+    snapshot = {
+        "ts": NOW,
+        "mid_price": 100.0,
+        "best_bid": 100.0,
+        "best_ask": 100.1,
+        "spread_pct": 0.1,
+        "bids": [level],
+        "asks": [{**level, "price": 100.1}],
+    }
+    after = {**snapshot, "ts": NOW + 5_000}
+    watch_row = {
+        "watch_id": "watch_text",
+        "symbol": "ARBUSDT",
+        "market": "futures",
+        "interval_sec": 5,
+        "duration_min": 60,
+        "started_at": NOW,
+        "ends_at": NOW + 3_600_000,
+        "status": "active",
+        "last_snapshot_at": NOW + 5_000,
+        "trade_request_count": 1,
+        "trade_extra_page_count": 0,
+        "trade_gap_count": 0,
+    }
+    text = render_order_book_watch_data(
+        watch_row,
+        [snapshot, after],
+        [],
+        format="summary",
+        now_ms=NOW + 5_000,
+        trades=[{"ts": NOW + 1, "price": 100.0, "qty": 3.0, "buyer_is_maker": True}],
+    )
+
+    assert "устоял: 1 уровней" in text
+    assert text.index("устоял:") < text.index("исполнен:") < text.index("снят заранее:")
+    assert "спуфинг" not in text

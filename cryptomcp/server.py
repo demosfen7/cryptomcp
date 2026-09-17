@@ -661,6 +661,24 @@ async def get_order_book_watch_data(
                 con, watch_id, from_ts=from_ts, to_ts=to_ts
             )
             diff_count = watch.diff_count(con, watch_id, from_ts=from_ts, to_ts=to_ts)
+            summary_snapshots = watch.snapshots(con, watch_id)
+            summary_to = (
+                int(summary_snapshots[-1]["ts"])
+                if summary_snapshots
+                else int(session["started_at"])
+            )
+            summary_trades = watch.trades(
+                con,
+                watch_id,
+                from_ts=int(session["started_at"]) - 1,
+                to_ts=summary_to,
+            )
+            summary_gaps = watch.trade_gaps(
+                con,
+                watch_id,
+                from_ts=int(session["started_at"]) - 1,
+                to_ts=summary_to,
+            )
             return render_order_book_watch_data(
                 session,
                 watch.snapshots(con, watch_id, from_ts=from_ts, to_ts=to_ts),
@@ -669,6 +687,8 @@ async def get_order_book_watch_data(
                 now_ms=watch.now_ms(),
                 total_snapshots=snapshot_count,
                 total_events=diff_count,
+                trades=summary_trades,
+                gaps=summary_gaps,
             )
         finally:
             if con is not None:
