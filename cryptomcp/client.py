@@ -351,6 +351,23 @@ class BinanceClient:
             cache_ttl_s=0,
         )
 
+    async def agg_trades(
+        self, symbol: str, *, limit: int = 1000, from_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Сырые агрегированные сделки для проверки судьбы L2-уровней.
+
+        Binance отдаёт не более 1000 строк. Вес измерен 17.09.2026 и не
+        меняется ни от ``limit``, ни от пагинации ``fromId``.
+        """
+        if not 1 <= limit <= 1000:
+            raise bad_params("limit aggTrades должен быть в диапазоне 1..1000", limit=limit)
+        return await self._request(
+            self.market.path("aggTrades"),
+            params={"symbol": symbol.upper(), "limit": limit, "fromId": from_id},
+            weight=self.market.agg_trades_weight,
+            cache_ttl_s=0,
+        )
+
     async def premium_index(self, symbol: str) -> dict[str, Any]:
         return await self._request(
             "/fapi/v1/premiumIndex",
