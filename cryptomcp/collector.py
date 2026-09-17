@@ -812,7 +812,22 @@ async def scan_twin(
         # Верхушка живого списка, а не журнала: соседний рынок считается
         # запросом к бирже, и платить им за символ, который уже не
         # сканируется, незачем.
-        for row in storage.latest_scan(con, tf, fresh_as_of_ms=now_ms)[:limit]:
+        fresh = storage.latest_scan(con, tf, fresh_as_of_ms=now_ms)
+        targets = fresh[:limit]
+        # Плюс монеты второго списка (§4.43): у них объёмные признаки нужнее
+        # всего — отбор идёт по набору, а набор считается по объёму. Без этого
+        # колонка «поток²» у второго списка пуста: в верхушку индекса его
+        # монеты как раз обычно не попадают.
+        wanted = {
+            entry["symbol"]
+            for entry in storage.accumulation_entries(con, status="active", limit=200)
+            if entry["tf"] == tf
+        }
+        seen = {row["symbol"] for row in targets}
+        targets += [
+            row for row in fresh if row["symbol"] in wanted and row["symbol"] not in seen
+        ]
+        for row in targets:
             symbol = row["symbol"]
             twin = SPOT.name if row["source"] == FUTURES.name else FUTURES.name
             client = clients[twin]

@@ -539,6 +539,32 @@ class TestScanTwin:
         assert row["twin_delta_quadrant"] is not None
 
     @pytest.mark.asyncio
+    async def test_accumulation_entries_are_measured_too(self, con):
+        """Монеты второго списка тоже получают соседний рынок (§4.42, §4.43).
+
+        В верхушку индекса они обычно не попадают, а объёмные признаки нужны
+        им больше всех: отбор идёт по набору, а набор считается по объёму.
+        """
+        from cryptomcp.collector import scan_twin
+
+        self.scan(con, "TOPUSDT", 0.9)
+        self.scan(con, "QUIETUSDT", 0.1)
+        con.execute(
+            "INSERT INTO accumulation (symbol, tf, market, status, entered_at) "
+            "VALUES ('QUIETUSDT', '4h', 'spot', 'active', ?)", (NOW,),
+        )
+        con.commit()
+        client = FakeKlineClient(NOW - 3000 * self.STEP, NOW, self.STEP, page=1500)
+
+        await scan_twin(
+            {"spot": client, "futures": client}, con, timeframes=("4h",), limit=1,
+            now_ms=NOW,
+        )
+
+        measured = {s: r for s, r in self.twins(con).items() if r["twin_market"]}
+        assert set(measured) == {"TOPUSDT", "QUIETUSDT"}
+
+    @pytest.mark.asyncio
     async def test_twin_of_spot_is_the_perpetual(self, con):
         from cryptomcp.collector import scan_twin
 
