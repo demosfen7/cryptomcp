@@ -179,7 +179,9 @@ class Telegram:
             return None
         return cls(token, chat_id)
 
-    async def send(self, text: str) -> bool:
+    async def send(
+        self, text: str, *, reply_markup: list[list[dict[str, str]]] | None = None
+    ) -> bool:
         """Отправить сообщение. Никогда не поднимает исключение.
 
         Текст трактуется как HTML: всё, что приходит извне — символ, причина
@@ -202,6 +204,8 @@ class Telegram:
             "parse_mode": PARSE_MODE,
             "disable_web_page_preview": True,
         }
+        if reply_markup is not None:
+            payload["reply_markup"] = {"inline_keyboard": reply_markup}
         for attempt in range(1, ATTEMPTS + 1):
             try:
                 async with httpx.AsyncClient(timeout=self._timeout) as http:
@@ -324,7 +328,38 @@ async def notify_accumulation(
     if sender is None:
         log.debug("telegram не настроен: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID пусты")
         return False
-    return await sender.send(text)
+    return await sender.send(text, reply_markup=watchlist_delta_keyboard(changes))
+
+
+def watchlist_delta_keyboard(changes: dict[str, list]) -> list[list[dict[str, str]]] | None:
+    """Кнопки под дельтой списка, до пяти строк на вошедшие и подтверждённые.
+
+    Строки выхода не получают кнопок: это уже закрытая история, а не следующий
+    шаг.  ``callback_data`` содержит исходный тикер (не короткое имя) и ТФ,
+    чтобы бот не угадывал рынок по тексту уведомления. Telegram ограничивает
+    поле 64 UTF-8-байтами, поэтому размер проверяется в байтах.
+    """
+    rows: list[list[dict[str, str]]] = []
+    for entry in [*(changes.get("entered") or []), *(changes.get("promoted") or [])][:5]:
+        symbol, tf = str(entry["symbol"]), str(entry["tf"])
+        labels = (
+            (f"🔍 Разобрать {symbol.removesuffix('USDT')} 🧠", "a"),
+            (f"📊 Стакан {symbol.removesuffix('USDT')}", "b"),
+            ("⭐ В мои", "m"),
+        )
+        row = []
+        for text, action in labels:
+            callback = f"a:{symbol}:{tf}:{action}"
+            if len(callback.encode("utf-8")) > 64:
+                # Эта ветка означает изменение формата либо биржевой символ
+                # длиннее известного архива. Не теряем уведомление и не
+                # отправляем Telegram заведомый 400 из-за одной кнопки.
+                log.warning("callback_data слишком длинная для %s", symbol)
+                continue
+            row.append({"text": text, "callback_data": callback})
+        if row:
+            rows.append(row)
+    return rows or None
 
 
 async def notify_watchlist(
@@ -340,4 +375,4 @@ async def notify_watchlist(
     if sender is None:
         log.debug("telegram не настроен: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID пусты")
         return False
-    return await sender.send(text)
+    return await sender.send(text, reply_markup=watchlist_delta_keyboard(changes))

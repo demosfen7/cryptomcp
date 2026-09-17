@@ -18,6 +18,7 @@ from cryptomcp.notify import (
     notify_watchlist,
     render_watchlist_delta,
     tradingview_url,
+    watchlist_delta_keyboard,
 )
 
 EMPTY: dict[str, list] = {"entered": [], "exited": [], "promoted": []}
@@ -287,6 +288,9 @@ class TestNotifyWatchlist:
         text = transport.calls[0]["json"]["text"]
         assert "CAKEUSDT" in text
         assert "tradingview.com" in text
+        keyboard = transport.calls[0]["json"]["reply_markup"]["inline_keyboard"]
+        assert keyboard[0][0]["text"] == "🔍 Разобрать CAKE 🧠"
+        assert keyboard[0][1]["callback_data"] == "a:CAKEUSDT:4h:b"
 
     @pytest.mark.asyncio
     async def test_without_secrets_it_is_a_no_op(self, transport, monkeypatch):
@@ -337,3 +341,16 @@ class TestAccumulationDelta:
 
         assert "Накопление" in render_accumulation_delta(changes, now_ms=self.NOW)
         assert "Накопление" not in render_watchlist_delta(changes, now_ms=self.NOW)
+
+
+def test_b9_callbacks_fit_telegram_byte_limit_for_chinese_symbol():
+    """Б9: Telegram измеряет callback_data UTF-8-байтами, не буквами на экране."""
+    keyboard = watchlist_delta_keyboard(
+        {"entered": [entry("币安人生USDT", "1d", rank=1)], "promoted": []}
+    )
+
+    assert keyboard is not None
+    assert all(
+        len(button["callback_data"].encode("utf-8")) <= 64
+        for row in keyboard for button in row
+    )
