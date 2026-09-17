@@ -622,16 +622,27 @@ async def start_order_book_watch(
 )
 async def stop_order_book_watch(watch_id: str) -> str:
     try:
-        con = watch.connect()
-        try:
-            if not watch.stop(con, watch_id):
-                raise bad_params(f"Активная сессия {watch_id!r} не найдена", watch_id=watch_id)
-        finally:
-            con.close()
-        _cancel_order_book_watch(watch_id)
+        if not end_order_book_watch(watch_id):
+            raise bad_params(f"Активная сессия {watch_id!r} не найдена", watch_id=watch_id)
         return f"Сессия {watch_id} остановлена; данные сохранятся до автоматической уборки."
     except ToolError as error:
         return _fail(error)
+
+
+def end_order_book_watch(watch_id: str) -> bool:
+    """Снять сессию: пометить остановленной и погасить её тикер.
+
+    Отдельно от инструмента по той же причине, что и `begin_order_book_watch`:
+    у сессии два вызывающих, и Telegram-боту нужен признак «получилось», а не
+    текст для модели.
+    """
+    con = watch.connect()
+    try:
+        stopped = watch.stop(con, watch_id)
+    finally:
+        con.close()
+    _cancel_order_book_watch(watch_id)
+    return stopped
 
 
 @server.tool(

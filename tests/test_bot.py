@@ -825,3 +825,158 @@ async def test_start_still_brings_the_keyboard(bot):
 
     assert telegram.messages[0]["reply_markup"]["is_persistent"] is True
     assert "Убрать их можно кнопкой" in telegram.messages[0]["text"]
+
+
+class WatchTemplates:
+    """Шаблоны без биржи: итог наблюдения и подсказки монет."""
+
+    def __init__(self):
+        self.asked: list[str] = []
+
+    async def watch_summary(self, watch_id):
+        self.asked.append(watch_id)
+        return f"👁 Наблюдение ARB идёт · 3 мин · 24 снимка ({watch_id})"
+
+    async def symbol_suggestions(self):
+        return []
+
+
+def _watch_bot(tmp_path, monkeypatch, *, running=()):
+    from cryptomcp import bot as module
+    from cryptomcp.bot import Bot, BotConfig
+
+    class FakeWatch:
+        WatchAdmissionError = RuntimeError
+        MAX_DURATION_MIN = 240
+        stopped: list[str] = []
+
+        @staticmethod
+        def read_only():
+            return None
+
+        @staticmethod
+        def list_watches(con):
+            return list(running)
+
+    monkeypatch.setattr(module, "watch", FakeWatch)
+    telegram = FakeTelegram()
+    templates = WatchTemplates()
+    worker = Bot(
+        BotConfig(token="x", allowed_user_ids=(42,),
+                  database_path=str(tmp_path / "bot.sqlite")),
+        telegram=telegram, templates=templates, assistant=None,
+    )
+    return worker, telegram, templates
+
+
+def _session(watch_id="watch_1", symbol="ARBUSDT", left_min=12, snapshots=24):
+    from cryptomcp.bot import now_ms
+
+    return {
+        "watch_id": watch_id, "symbol": symbol, "status": "active",
+        "ends_at": now_ms() + left_min * 60_000, "snapshot_count": snapshots,
+    }
+
+
+@pytest.mark.asyncio
+async def test_running_watches_are_listed_with_controls(tmp_path, monkeypatch):
+    """Замечание владельца: два наблюдения запустились, а снять их нечем."""
+    worker, telegram, _ = _watch_bot(tmp_path, monkeypatch, running=(_session(),))
+    worker.store.remember_watch("watch_1", 777, "ARBUSDT", 1)
+
+    await worker.handle_update(callback(42, "watches"))
+
+    text = telegram.messages[-1]["text"]
+    assert "ARB" in text and "осталось" in text
+    buttons = [
+        button["text"]
+        for row in telegram.messages[-1]["reply_markup"] for button in row
+    ]
+    assert any("📸" in button for button in buttons)
+    assert "⏹ Снять" in buttons
+
+
+@pytest.mark.asyncio
+async def test_snapshot_of_a_running_watch_does_not_stop_it(tmp_path, monkeypatch):
+    worker, telegram, templates = _watch_bot(
+        tmp_path, monkeypatch, running=(_session(),)
+    )
+    worker.store.remember_watch("watch_1", 777, "ARBUSDT", 1)
+
+    await worker.handle_update(callback(42, "watch-now:watch_1"))
+
+    assert templates.asked == ["watch_1"]
+    assert "идёт" in telegram.messages[-1]["text"]
+    assert worker.store.unfinished_watches(), "наблюдение продолжается"
+
+
+@pytest.mark.asyncio
+async def test_stopping_a_watch_ends_it_and_shows_what_was_seen(tmp_path, monkeypatch):
+    from cryptomcp import server
+
+    worker, telegram, templates = _watch_bot(
+        tmp_path, monkeypatch, running=(_session(),)
+    )
+    worker.store.remember_watch("watch_1", 777, "ARBUSDT", 1)
+    ended: list[str] = []
+    monkeypatch.setattr(
+        server, "end_order_book_watch", lambda watch_id: ended.append(watch_id) or True
+    )
+
+    await worker.handle_update(callback(42, "watch-stop:watch_1"))
+
+    assert ended == ["watch_1"]
+    assert "снято" in telegram.messages[-1]["text"]
+    assert templates.asked == ["watch_1"], "итог показан сразу"
+    assert not worker.store.unfinished_watches()
+
+
+@pytest.mark.asyncio
+async def test_custom_duration_is_asked_and_used(tmp_path, monkeypatch):
+    worker, telegram, _ = _watch_bot(tmp_path, monkeypatch)
+    started: list[tuple[str, int]] = []
+
+    async def start(chat_id, symbol, duration_min):
+        started.append((symbol, duration_min))
+
+    monkeypatch.setattr(worker, "_start_watch", start)
+
+    await worker.handle_update(callback(42, "observe-ask:ARBUSDT"))
+    assert telegram.messages[-1]["force_reply"] is True
+
+    await worker.handle_update(message(42, "45"))
+
+    assert started == [("ARBUSDT", 45)]
+
+
+@pytest.mark.asyncio
+async def test_custom_duration_rejects_nonsense(tmp_path, monkeypatch):
+    worker, telegram, _ = _watch_bot(tmp_path, monkeypatch)
+    started: list[tuple[str, int]] = []
+
+    async def start(chat_id, symbol, duration_min):
+        started.append((symbol, duration_min))
+
+    monkeypatch.setattr(worker, "_start_watch", start)
+
+    await worker.handle_update(callback(42, "observe-ask:ARBUSDT"))
+    await worker.handle_update(message(42, "полчаса"))
+
+    assert started == []
+    assert "Нужно число" in telegram.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_second_watch_on_the_same_coin_offers_the_running_one(tmp_path, monkeypatch):
+    worker, telegram, _ = _watch_bot(tmp_path, monkeypatch, running=(_session(),))
+    worker.store.remember_watch("watch_1", 777, "ARBUSDT", 1)
+
+    await worker.handle_update(callback(42, "symbol-observe:ARBUSDT"))
+
+    text = telegram.messages[-1]["text"]
+    assert "уже наблюдаю" in text
+    buttons = [
+        button["text"]
+        for row in telegram.messages[-1]["reply_markup"] for button in row
+    ]
+    assert "⏹ Снять" in buttons

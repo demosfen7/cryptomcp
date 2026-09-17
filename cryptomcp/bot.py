@@ -600,8 +600,12 @@ def render_watch_summary(watch_row: dict[str, Any], *, now: int) -> str:
     # Округление вверх: двухминутная сессия из 24 снимков печаталась как
     # «1 мин» (приёмка 17.09.2026).
     duration = -(-max(0, end - int(watch_row["started_at"])) // 60_000)
+    # Снимок текущего состояния зовут по той же функции, что и итог: разница
+    # только в слове. Обещать «завершено» идущей сессии нельзя.
+    running = str(watch_row.get("status") or "") == "active"
+    state = "идёт" if running else "завершено"
     lines = [
-        f"👁 Наблюдение {short_symbol(str(watch_row['symbol']))} завершено · "
+        f"👁 Наблюдение {short_symbol(str(watch_row['symbol']))} {state} · "
         f"{duration} мин · {len(snapshots)} {_snapshot_word(len(snapshots))}",
         "",
         "Что происходило с заявками рядом с ценой:",
@@ -1035,6 +1039,7 @@ class Bot:
         self._offset: int | None = None
         self._pending_symbol: dict[int, str] = {}
         self._pending_note: dict[int, tuple[str, str, str]] = {}
+        self._pending_minutes: dict[int, str] = {}
         self._busy: set[int] = set()
         self._last_texts: dict[int, tuple[str, str]] = {}
 
@@ -1105,6 +1110,19 @@ class Bot:
             return
         if text == HIDE_LABEL:
             await self._hide_keyboard(chat_id)
+            return
+        minutes_for = self._pending_minutes.pop(user_id, None)
+        if minutes_for is not None:
+            digits = text.strip().replace("мин", "").strip()
+            if not digits.isdigit() or not 1 <= int(digits) <= watch.MAX_DURATION_MIN:
+                await self.telegram.send_message(
+                    chat_id,
+                    f"Нужно число от 1 до {watch.MAX_DURATION_MIN}. "
+                    "Попробуйте ещё раз кнопкой «⌨️ Своё время».",
+                    reply_markup=with_back(),
+                )
+                return
+            await self._start_watch(chat_id, minutes_for, int(digits))
             return
         note = self._pending_note.pop(user_id, None)
         if note is not None:
@@ -1205,9 +1223,31 @@ class Bot:
                 force_reply=True,
             )
             return
-        observe_match = re.fullmatch(r"observe-(15|30|60):(.+)", action)
+        observe_match = re.fullmatch(r"observe-(\d+):(.+)", action)
         if observe_match:
             await self._start_watch(chat_id, observe_match.group(2), int(observe_match.group(1)))
+            return
+        ask_match = re.fullmatch(r"observe-ask:(.+)", action)
+        if ask_match:
+            symbol = ask_match.group(1)
+            self._pending_minutes[user_id] = symbol
+            await self.telegram.send_message(
+                chat_id,
+                f"Сколько минут наблюдать за {short_symbol(symbol)}? "
+                f"Число от 1 до {watch.MAX_DURATION_MIN}.",
+                force_reply=True,
+            )
+            return
+        watch_match = re.fullmatch(r"watch-(now|stop):(.+)", action)
+        if watch_match:
+            what, watch_id = watch_match.groups()
+            if what == "now":
+                await self._watch_snapshot(chat_id, watch_id)
+            else:
+                await self._stop_watch(chat_id, watch_id)
+            return
+        if action == "watches":
+            await self._show_watches(chat_id)
             return
         if action.startswith("symbol-"):
             action_name, _, symbol = action.partition(":")
@@ -1330,6 +1370,21 @@ class Bot:
             )
             return
         if action == "observe":
+            running = [
+                row for row in await self._running_watches()
+                if str(row["symbol"]) == symbol
+            ]
+            if running:
+                # Ровно тот случай, что поймал владелец: два наблюдения по
+                # одной монете запустились подряд, а снять их было нечем.
+                watch_id = str(running[0]["watch_id"])
+                left = max(0, int(running[0]["ends_at"]) - now_ms()) // 60_000
+                await self.telegram.send_message(
+                    chat_id,
+                    f"👁 За {short_symbol(symbol)} уже наблюдаю, осталось {left} мин.",
+                    reply_markup=_running_watch_keyboard(watch_id, symbol),
+                )
+                return
             await self.telegram.send_message(
                 chat_id,
                 f"👁 Выберите длительность наблюдения за {short_symbol(symbol)}.",
@@ -1493,9 +1548,90 @@ class Bot:
         watch_id = str(session["watch_id"])
         self.store.remember_watch(watch_id, chat_id, symbol, now_ms())
         await self.telegram.send_message(
-            chat_id, f"👁 Наблюдаю за {short_symbol(symbol)} {duration_min} мин. Итог пришлю сам."
+            chat_id,
+            f"👁 Наблюдаю за {short_symbol(symbol)} {duration_min} мин. Итог пришлю сам.",
+            reply_markup=_running_watch_keyboard(watch_id, symbol),
         )
         asyncio.create_task(self._send_watch_summary(watch_id, chat_id, symbol))
+
+    async def _running_watches(self) -> list[dict[str, Any]]:
+        """Идущие наблюдения, запущенные этим ботом."""
+        mine = {
+            str(row["watch_id"]): row for row in self.store.unfinished_watches()
+        }
+        if not mine:
+            return []
+        con = watch.read_only()
+        try:
+            rows = [
+                row for row in watch.list_watches(con)
+                if str(row["watch_id"]) in mine and str(row["status"]) == "active"
+            ]
+        finally:
+            if con is not None:
+                con.close()
+        return rows
+
+    async def _show_watches(self, chat_id: int) -> None:
+        rows = await self._running_watches()
+        if not rows:
+            await self.telegram.send_message(
+                chat_id,
+                "Сейчас ничего не наблюдаю. Запустить — кнопка «👁 Наблюдение».",
+                reply_markup=with_back(),
+            )
+            return
+        lines = ["👁 Идут наблюдения:"]
+        keys: list[list[dict[str, str]]] = []
+        for row in rows:
+            left = max(0, int(row["ends_at"]) - now_ms()) // 60_000
+            lines.append(
+                f"{short_symbol(str(row['symbol']))} · осталось {left} мин · "
+                f"снимков {row['snapshot_count']}"
+            )
+            watch_id = str(row["watch_id"])
+            keys.append([
+                {
+                    "text": f"📸 {short_symbol(str(row['symbol']))}",
+                    "callback_data": encode_callback("watch-now", watch_id),
+                },
+                {
+                    "text": "⏹ Снять",
+                    "callback_data": encode_callback("watch-stop", watch_id),
+                },
+            ])
+        await self.telegram.send_message(
+            chat_id, "\n".join(lines), reply_markup=with_back(keys),
+        )
+
+    async def _watch_snapshot(self, chat_id: int, watch_id: str) -> None:
+        """Показать, что уже видно, не дожидаясь конца наблюдения."""
+        text = await self.templates.watch_summary(watch_id)
+        symbol = self._watch_symbol(watch_id)
+        await self.telegram.send_message(
+            chat_id, text,
+            reply_markup=(
+                _running_watch_keyboard(watch_id, symbol) if symbol else with_back()
+            ),
+        )
+
+    async def _stop_watch(self, chat_id: int, watch_id: str) -> None:
+        """Снять наблюдение и сразу показать, что успело набраться."""
+        from . import server
+
+        stopped = server.end_order_book_watch(watch_id)
+        text = await self.templates.watch_summary(watch_id)
+        self.store.finish_watch(watch_id, now_ms())
+        head = "⏹ Наблюдение снято." if stopped else "Это наблюдение уже не идёт."
+        await self.telegram.send_message(
+            chat_id, f"{head}\n\n{text}", reply_markup=with_back(),
+        )
+
+    def _watch_symbol(self, watch_id: str) -> str | None:
+        for row in self.store.unfinished_watches():
+            if str(row["watch_id"]) == watch_id:
+                return str(row["symbol"])
+        return None
 
     async def _send_watch_summary(self, watch_id: str, chat_id: int, symbol: str) -> None:
         from . import server
@@ -1596,10 +1732,31 @@ def _scenario_keyboard(name: str, symbol: str | None) -> list[list[dict[str, str
 
 
 def _observe_keyboard(symbol: str) -> list[list[dict[str, str]]]:
+    return with_back([
+        [
+            {"text": "15 мин", "callback_data": encode_callback("observe-15", symbol)},
+            {"text": "30 мин", "callback_data": encode_callback("observe-30", symbol)},
+            {"text": "60 мин", "callback_data": encode_callback("observe-60", symbol)},
+        ],
+        [
+            {
+                "text": "⌨️ Своё время",
+                "callback_data": encode_callback("observe-ask", symbol),
+            },
+            {
+                "text": "📊 Снимок сейчас",
+                "callback_data": encode_callback("symbol-book", symbol),
+            },
+        ],
+        [{"text": "👁 Мои наблюдения", "callback_data": encode_callback("watches")}],
+    ])
+
+
+def _running_watch_keyboard(watch_id: str, symbol: str) -> list[list[dict[str, str]]]:
+    """Что можно сделать с идущим наблюдением: посмотреть сейчас или снять."""
     return with_back([[
-        {"text": "15 мин", "callback_data": encode_callback("observe-15", symbol)},
-        {"text": "30 мин", "callback_data": encode_callback("observe-30", symbol)},
-        {"text": "60 мин", "callback_data": encode_callback("observe-60", symbol)},
+        {"text": "📸 Что уже видно", "callback_data": encode_callback("watch-now", watch_id)},
+        {"text": "⏹ Снять", "callback_data": encode_callback("watch-stop", watch_id)},
     ]])
 
 
