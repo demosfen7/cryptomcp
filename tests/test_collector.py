@@ -1137,6 +1137,82 @@ class TestAccumulationLogging:
 
         assert funding_annual([(self.NOW, 0.0001)]) is None
 
+    def fill_open_interest(self, con, symbol, *, end, jump_at=None):
+        """Открытый интерес с шагом 5m за двое суток до ``end``, со скачком."""
+        step = 300_000
+        rows = {}
+        for ts in range(end - 2 * 86_400_000, end + 1, step):
+            contracts = 1_000_000.0 * (1.5 if jump_at is not None and ts >= jump_at else 1.0)
+            rows[ts] = {"open_interest": contracts, "open_interest_value": contracts * 0.1}
+        storage.upsert_derivatives(con, symbol, rows)
+        con.commit()
+
+    def test_context_does_not_see_hourly_candles_after_close(self, con):
+        """Свеча, открывшаяся после закрытия строки, в признаки не попадает.
+
+        Строка по свече пишется позже её закрытия — у дневок в половине случаев
+        позже часа. Всплеск объёма в эти часы был бы заглядыванием вперёд.
+        """
+        from cryptomcp.collector import accumulation_context
+
+        self.fill_hourly(con, "AAAUSDT")
+        close = self.NOW - 3 * self.H1
+        before = accumulation_context(con, "AAAUSDT", close)
+
+        spike = [(self.NOW + i * self.H1, 100.0, 130.0, 99.0, 129.0, 10.0, 90_000.0, 10,
+                  5.0, 80_000.0) for i in range(3)]
+        storage.upsert_ohlcv(con, "AAAUSDT", "1h", "futures", spike)
+        con.commit()
+
+        assert accumulation_context(con, "AAAUSDT", close) == before
+
+    def test_context_does_not_see_open_interest_after_close(self, con):
+        """Разбор ONEUSDT 16.09: «приток +37%» в строке был самим выстрелом."""
+        from cryptomcp.collector import accumulation_context
+
+        self.fill_hourly(con, "AAAUSDT")
+        close = self.NOW - 3 * self.H1
+        self.fill_open_interest(con, "AAAUSDT", end=self.NOW, jump_at=close + self.H1)
+
+        context = accumulation_context(con, "AAAUSDT", close)
+        assert context["oi_change_24h"] == pytest.approx(0.0, abs=1e-9)
+
+        later = accumulation_context(con, "AAAUSDT", self.NOW)
+        assert later["oi_change_24h"] == pytest.approx(50.0, abs=0.01)
+
+    def test_scan_takes_context_at_candle_close_not_at_run_time(self, con):
+        """Строка 4h получает открытый интерес на своё закрытие.
+
+        Прогон идёт позже закрытия, и к этому моменту в архиве уже лежат точки
+        после свечи. Раньше контекст брался на время прогона, и у ONEUSDT
+        16.09 строка по свече 20:00, записанная в 23:45, получила «приток
+        +37%» — сам выстрел.
+        """
+        import random
+
+        from cryptomcp.collector import run_scan
+
+        step = 4 * self.H1
+        random.seed(5)
+        price, candles = 100.0, []
+        for i in range(400):
+            price *= 1 + random.gauss(0, 0.004)
+            candles.append((self.NOW - (400 - i) * step, price, price * 1.01, price * 0.99,
+                            price, 10.0, 1000.0, 5, 5.0, 500.0))
+        storage.upsert_ohlcv(con, "AAAUSDT", "4h", "futures", candles)
+        self.fill_hourly(con, "AAAUSDT")
+        self.fill_open_interest(
+            con, "AAAUSDT", end=self.NOW + 2 * self.H1, jump_at=self.NOW + self.H1
+        )
+
+        run_scan(con)
+
+        row = con.execute(
+            "SELECT closed_through_ms, oi_change_24h FROM scan_log WHERE tf = '4h'"
+        ).fetchone()
+        assert row["closed_through_ms"] == self.NOW - 1
+        assert row["oi_change_24h"] == pytest.approx(0.0, abs=1e-9)
+
     def test_hourly_rows_get_no_accumulation(self, con):
         """У записей 1h младшего ряда в архиве нет: колонки остаются пустыми."""
         from cryptomcp.collector import run_scan

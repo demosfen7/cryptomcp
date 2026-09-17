@@ -584,9 +584,19 @@ def funding_annual(settlements: list[tuple[int, float]]) -> float | None:
 
 
 def accumulation_context(
-    con: sqlite3.Connection, symbol: str, now_ms: int
+    con: sqlite3.Connection, symbol: str, as_of_ms: int
 ) -> dict[str, Any]:
-    """Признаки накопления по символу — всё из архива, ни одного запроса.
+    """Признаки накопления по символу на момент ``as_of_ms`` — всё из архива.
+
+    ``as_of_ms`` — закрытие свечи, к которой пишется строка журнала, а не время
+    прогона. Раньше сюда шло время прогона, и строка получала признаки из
+    будущего своей свечи: половина дневных строк пишется позже часа после
+    закрытия, а при доборе истории — через дни. У ONEUSDT 16.09 строка по
+    свече 20:00 записана в 23:45 с «притоком новых денег +37%»: это был сам
+    выстрел, начавшийся в 20:00, а до него открытый интерес снижался. На
+    поздних строках признак «OI за сутки > +10%» давал 57% исходов от +10%
+    против 45% на своевременных — калибровка по журналу училась бы на
+    заглядывании вперёд.
 
     Пишутся с первого дня по той же причине, по которой с первого дня пишется
     разложение индекса: через два месяца вопрос будет не «работает ли
@@ -600,8 +610,11 @@ def accumulation_context(
     """
     context: dict[str, Any] = {}
 
+    # Свеча входит в окно, только если закрылась к ``as_of_ms``: граница по
+    # времени открытия, потому что ts в архиве — открытие свечи.
     records = storage.load_candles(
-        con, symbol, ACCUMULATION_TF, required_candles(ACCUMULATION_TF) + WARMUP
+        con, symbol, ACCUMULATION_TF, required_candles(ACCUMULATION_TF) + WARMUP,
+        before_ms=as_of_ms - interval_ms(ACCUMULATION_TF) + 1,
     )
     series = series_from_records(records, symbol, ACCUMULATION_TF)
     if len(series) >= MIN_CANDLES:
@@ -620,12 +633,12 @@ def accumulation_context(
             wick_streak=data.wick_streak,
         )
 
-    settlements = storage.funding_window(con, symbol, now_ms, limit=60)
+    settlements = storage.funding_window(con, symbol, as_of_ms, limit=60)
     annual = funding_annual(settlements)
     if annual is not None:
         context["funding_annual"] = round(annual, 2)
 
-    rows = storage.derivatives_window(con, symbol, now_ms - 2 * 86_400_000, now_ms)
+    rows = storage.derivatives_window(con, symbol, as_of_ms - 2 * 86_400_000, as_of_ms)
     if len(rows) > 1:
         view = build_open_interest(
             symbol, rows, PERIOD_MS // 60_000, rows, PERIOD_MS // 60_000,
@@ -700,8 +713,7 @@ def run_scan(con: sqlite3.Connection) -> int:
     четыре раза и перевешивало бы дневное.
     """
     written = 0
-    now_ms = int(dt.datetime.now(dt.UTC).timestamp() * 1000)
-    accumulation: dict[str, dict[str, Any]] = {}
+    accumulation: dict[tuple[str, int], dict[str, Any]] = {}
     for tf in SCAN_TIMEFRAMES:
         for symbol, source in storage.archived_symbols(con, tf):
             # То же каноническое окно, что у сервера: иначе один и тот же
@@ -717,15 +729,20 @@ def run_scan(con: sqlite3.Connection) -> int:
             detector = distribution.analyse(
                 series, atr(series.high, series.low, series.close, 14)
             )
-            # Контекст накопления один на символ: он не зависит от таймфрейма
-            # записи, а пересчитывать его на каждый ТФ значило бы читать один и
-            # тот же ряд трижды.
-            if tf != ACCUMULATION_TF and symbol not in accumulation:
-                accumulation[symbol] = accumulation_context(con, symbol, now_ms)
+            # Контекст накопления снимается на закрытие СВОЕЙ свечи: у 4h и 1d
+            # моменты разные, поэтому ключ — символ и закрытие. Совпавшие
+            # закрытия (полночь у 4h и 1d) читают ряд один раз.
+            context = None
+            closed = view.meta.get("closed_through_ms")
+            if tf != ACCUMULATION_TF and closed is not None:
+                key = (symbol, int(closed))
+                if key not in accumulation:
+                    accumulation[key] = accumulation_context(con, symbol, int(closed))
+                context = accumulation[key]
             if storage.record_scan(
                 con, symbol, source, view,
                 formula_version=SQUEEZE_FORMULA_VERSION,
-                accumulation=accumulation.get(symbol) if tf != ACCUMULATION_TF else None,
+                accumulation=context,
                 distribution=_distribution_row(detector, _flow_row(series)),
             ):
                 written += 1
