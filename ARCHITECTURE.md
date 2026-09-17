@@ -31,7 +31,7 @@ flowchart LR
 
     DB[("SQLite<br/>market.sqlite")]
 
-    S1["cryptomcp<br/>MCP-сервер, 11 инструментов"]
+    S1["cryptomcp<br/>MCP-сервер, 17 инструментов"]
     TG["Telegram"]
     LLM["модель"]
 
