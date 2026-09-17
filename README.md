@@ -237,6 +237,8 @@ symbols.py     exchangeInfo, tickSize, точность цен
 app.py         Starlette-обвязка: health и совместимость старого x-api-key
 oauth.py       OAuth 2.1: вход владельца, DCR, PKCE, токены и SQLite-хранилище
 server.py      восемнадцать инструментов MCP
+bot.py         Telegram-бот: кнопки сценариев, шаблоны, учёт расходов
+assistant.py   сценарии через Claude: инструменты в процессе, цена по usage
 ```
 
 ## Решения, которые легко нарушить по неосторожности

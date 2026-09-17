@@ -437,3 +437,199 @@ def test_watchlist_tail_shows_move_and_stale_mark_for_manual_rows():
 
     assert "Ваши: PHA +10.0%" in text
     assert "(данные от" in text
+
+
+class FakeAssistant:
+    """Ассистент без сети: помнит вызовы и отдаёт заданный ответ."""
+
+    def __init__(self, text="🔍 ID · разбор", cost=0.058):
+        from cryptomcp.assistant import Answer, Usage
+
+        self.calls: list[tuple[str, dict]] = []
+        usage = Usage(input_tokens=1_000, output_tokens=1_000)
+        self._answer = Answer(text=text, usage=usage)
+        self._cost = cost
+
+    @property
+    def answer(self):
+        return self._answer
+
+    async def run(self, scenario, **params):
+        self.calls.append((scenario.name, params))
+        return self._answer
+
+
+def _bot_with(assistant, tmp_path, **config):
+    from cryptomcp.bot import Bot, BotConfig
+
+    settings = dict(
+        token="x", allowed_user_ids=(42,),
+        database_path=str(tmp_path / "bot.sqlite"),
+    )
+    settings.update(config)
+    telegram = FakeTelegram()
+    return Bot(BotConfig(**settings), telegram=telegram, assistant=assistant), telegram
+
+
+@pytest.mark.asyncio
+async def test_button_without_a_key_says_claude_is_not_configured(tmp_path):
+    """Без ключа кнопки с 🧠 честно молчат, а остальные работают (Б5)."""
+    worker, telegram = _bot_with(None, tmp_path)
+
+    await worker.handle_update(callback(42, "weekly"))
+
+    assert "Claude не настроен" in telegram.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_daily_limit_is_checked_before_the_request(tmp_path):
+    """Лимит проверяется ДО запроса: цена известна только после ответа (Б6)."""
+    assistant = FakeAssistant()
+    worker, telegram = _bot_with(assistant, tmp_path, daily_budget_usd=1.0)
+    from cryptomcp.bot import day_start_ms, now_ms
+
+    worker.store.add_expense(
+        scenario="analyse", symbol="IDUSDT", usage=assistant.answer.usage,
+        cost_usd=0.95, stamp_ms=max(now_ms(), day_start_ms("Europe/Berlin", now_ms())),
+    )
+
+    await worker.handle_update(callback(42, "weekly"))
+
+    assert assistant.calls == [], "запроса к Claude быть не должно"
+    assert "Лимит на сегодня исчерпан" in telegram.messages[-1]["text"]
+    assert "95" in telegram.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_answer_carries_its_price_and_is_written_to_the_ledger(tmp_path):
+    assistant = FakeAssistant(text="📈 Итоги недели")
+    worker, telegram = _bot_with(assistant, tmp_path)
+
+    await worker.handle_update(callback(42, "weekly"))
+
+    assert [name for name, _ in assistant.calls] == ["weekly"]
+    text = telegram.messages[-1]["text"]
+    assert text.startswith("📈 Итоги недели")
+    assert "─ итоги недели" in text and "сегодня" in text and "из $1" in text
+    from cryptomcp.bot import day_start_ms, now_ms
+    spent = worker.store.spent_since(day_start_ms("Europe/Berlin", now_ms()))
+    assert spent == pytest.approx(assistant.answer.cost_usd)
+
+
+@pytest.mark.asyncio
+async def test_second_press_while_busy_is_refused(tmp_path, monkeypatch):
+    """Два разбора подряд стоят вдвое и приходят вперемешку."""
+    import asyncio as aio
+
+    started = aio.Event()
+    release = aio.Event()
+
+    class SlowAssistant(FakeAssistant):
+        async def run(self, scenario, **params):
+            self.calls.append((scenario.name, params))
+            started.set()
+            await release.wait()
+            return self._answer
+
+    assistant = SlowAssistant()
+    worker, telegram = _bot_with(assistant, tmp_path)
+
+    first = aio.create_task(worker.handle_update(callback(42, "weekly")))
+    await started.wait()
+    await worker.handle_update(callback(42, "weekly"))
+    release.set()
+    await first
+
+    assert len(assistant.calls) == 1
+    assert any("Уже разбираю" in message["text"] for message in telegram.messages)
+
+
+@pytest.mark.asyncio
+async def test_explain_sends_exactly_what_was_shown(tmp_path):
+    """Кнопка «Объяснить» не ходит в инструменты: объясняет показанные числа."""
+    assistant = FakeAssistant(text="🧠 Что это значит")
+
+    class Templates:
+        async def book(self, symbol):
+            return "📊 Стакан ID · фьючерсы · 17.09 11:23 UTC"
+
+    worker, telegram = _bot_with(assistant, tmp_path)
+    worker.templates = Templates()
+
+    await worker.handle_update(callback(42, "symbol-book:IDUSDT"))
+    await worker.handle_update(callback(42, "explain-book:IDUSDT"))
+
+    name, params = assistant.calls[-1]
+    assert name == "explain"
+    assert "📊 Стакан ID" in params["payload"]
+
+
+@pytest.mark.asyncio
+async def test_explain_without_anything_shown_says_so(tmp_path):
+    assistant = FakeAssistant()
+    worker, telegram = _bot_with(assistant, tmp_path)
+
+    await worker.handle_update(callback(42, "explain-watch:ARBUSDT"))
+
+    assert assistant.calls == []
+    assert "Нечего объяснять" in telegram.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_morning_fires_once_a_day_and_is_not_sent_late(tmp_path):
+    """Пропущенное утро не досылается: вчерашний обзор никому не нужен (Б7)."""
+    import datetime as dt
+
+    assistant = FakeAssistant(text="🌅 Утренний обзор")
+    worker, telegram = _bot_with(assistant, tmp_path, morning_time="08:00")
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo("Europe/Berlin")
+    morning = int(dt.datetime(2026, 9, 18, 9, 0, tzinfo=zone).timestamp() * 1000)
+    night = int(dt.datetime(2026, 9, 18, 3, 0, tzinfo=zone).timestamp() * 1000)
+    next_day = int(dt.datetime(2026, 9, 19, 9, 0, tzinfo=zone).timestamp() * 1000)
+
+    assert await worker._morning_due(night) is False
+    assert await worker._morning_due(morning) is True
+    assert await worker._morning_due(morning) is False, "второй раз за сутки — нет"
+    assert await worker._morning_due(next_day) is True
+
+
+@pytest.mark.asyncio
+async def test_morning_goes_to_the_private_chat_of_the_owner(tmp_path):
+    assistant = FakeAssistant(text="🌅 Утренний обзор")
+    worker, telegram = _bot_with(assistant, tmp_path, morning_time="08:00")
+    worker.store.remember_user(42, 555, 1_789_870_000_000)
+
+    await worker._send_morning()
+
+    assert telegram.messages[-1]["chat_id"] == 555
+    assert [name for name, _ in assistant.calls] == ["morning"]
+
+
+@pytest.mark.asyncio
+async def test_morning_without_start_is_silent(tmp_path):
+    """Telegram не даёт писать человеку первым: без /start слать некуда."""
+    assistant = FakeAssistant()
+    worker, telegram = _bot_with(assistant, tmp_path, morning_time="08:00")
+
+    await worker._send_morning()
+
+    assert telegram.messages == []
+    assert assistant.calls == []
+
+
+@pytest.mark.asyncio
+async def test_claude_failure_says_no_money_was_spent(tmp_path):
+    class Broken(FakeAssistant):
+        async def run(self, scenario, **params):
+            raise RuntimeError("таймаут")
+
+    worker, telegram = _bot_with(Broken(), tmp_path)
+
+    await worker.handle_update(callback(42, "weekly"))
+
+    text = telegram.messages[-1]["text"]
+    assert "Claude не ответил" in text and "не списаны" in text
+    from cryptomcp.bot import day_start_ms, now_ms
+    assert worker.store.spent_since(day_start_ms("Europe/Berlin", now_ms())) == 0.0

@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from . import assistant as claude
 from . import manual, storage
 from . import orderbook_watch as watch
 from .errors import ToolError
@@ -228,6 +229,48 @@ class BotStore:
         finally:
             con.close()
 
+    def add_expense(
+        self,
+        *,
+        scenario: str,
+        symbol: str | None,
+        usage: Any,
+        cost_usd: float,
+        stamp_ms: int,
+    ) -> None:
+        """Записать расход по фактическому usage ответа, а не по оценке."""
+        con = self._con()
+        try:
+            con.execute(
+                "INSERT INTO bot_expenses(created_at, scenario, symbol, input_tokens, "
+                "cache_creation_tokens, cache_read_tokens, output_tokens, cost_usd) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    stamp_ms, scenario, symbol,
+                    int(getattr(usage, "input_tokens", 0)),
+                    int(getattr(usage, "cache_creation_tokens", 0)),
+                    int(getattr(usage, "cache_read_tokens", 0)),
+                    int(getattr(usage, "output_tokens", 0)),
+                    float(cost_usd),
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def spent_since(self, stamp_ms: int) -> float:
+        """Сколько потрачено начиная с момента — границу дня считает вызывающий."""
+        con = self._con()
+        try:
+            row = con.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0) AS total FROM bot_expenses "
+                "WHERE created_at >= ?",
+                (stamp_ms,),
+            ).fetchone()
+            return float(row["total"] or 0.0)
+        finally:
+            con.close()
+
     def remember_watch(self, watch_id: str, chat_id: int, symbol: str, stamp_ms: int) -> None:
         con = self._con()
         try:
@@ -262,6 +305,27 @@ class BotStore:
             con.commit()
         finally:
             con.close()
+
+
+def day_start_ms(timezone: str, stamp_ms: int) -> int:
+    """Начало календарных суток в часовом поясе бота.
+
+    День считается по месту жительства владельца, а не по UTC: «сегодня
+    потрачено» должно совпадать с его сегодня.
+    """
+    zone = ZoneInfo(timezone)
+    local = dt.datetime.fromtimestamp(stamp_ms / 1000, zone)
+    start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(start.timestamp() * 1000)
+
+
+def budget_refusal_text(spent: float, budget: float, timezone: str) -> str:
+    """Отказ по лимиту (MOCKUPS.md §4.5): что потрачено и когда обновится."""
+    return (
+        f"💸 Лимит на сегодня исчерпан: потрачено {claude.cost_words(spent)} "
+        f"из ${budget:.0f}.\n"
+        f"Кнопки без 🧠 работают. Лимит обновится в 00:00 ({timezone})."
+    )
 
 
 def is_allowed(user_id: int, allowed_user_ids: tuple[int, ...]) -> bool:
@@ -661,6 +725,16 @@ class TelegramAPI:
             payload["reply_markup"] = {"force_reply": True, "selective": True}
         return dict(await self.call("sendMessage", payload))
 
+    async def edit_message(self, chat_id: int, message_id: int, text: str,
+                           *, reply_markup: list[list[dict[str, str]]] | None = None) -> None:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id, "message_id": message_id,
+            "text": text, "parse_mode": "HTML",
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = {"inline_keyboard": reply_markup}
+        await self.call("editMessageText", payload)
+
     async def answer_callback(self, callback_id: str, text: str | None = None) -> None:
         payload: dict[str, Any] = {"callback_query_id": callback_id}
         if text:
@@ -873,14 +947,20 @@ class Bot:
         telegram: TelegramAPI | Any | None = None,
         store: BotStore | None = None,
         templates: TemplateService | Any | None = None,
+        assistant: Any | None = None,
     ) -> None:
         self.config = config
         self.telegram = telegram or TelegramAPI(config.token)
         self.store = store or BotStore(config.database_path)
         self.templates = templates or TemplateService()
+        # Без ключа ассистента нет, и это штатный режим: кнопки без 🧠
+        # работают, а кнопки с 🧠 честно говорят, что Claude не настроен.
+        self.assistant = assistant if assistant is not None else claude.Assistant.from_env()
         self._offset: int | None = None
         self._pending_symbol: dict[int, str] = {}
         self._pending_note: dict[int, tuple[str, str, str]] = {}
+        self._busy: set[int] = set()
+        self._last_texts: dict[int, tuple[str, str]] = {}
 
     async def run(self) -> None:
         if not self.config.token:
@@ -893,6 +973,8 @@ class Bot:
                 for update in updates:
                     self._offset = int(update["update_id"]) + 1
                     await self.handle_update(update)
+                if await self._morning_due(now_ms()):
+                    await self._send_morning()
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # noqa: BLE001 - сеть не должна завершить polling
@@ -1004,6 +1086,30 @@ class Bot:
         if action in {"analyse", "before", "book", "observe", "history"}:
             await self._ask_symbol(chat_id, action)
             return
+        if action in {"morning", "quiet", "weekly"}:
+            await self._run_scenario(chat_id, user_id, action)
+            return
+        explain_match = re.fullmatch(r"explain-(book|watch):(.+)", action)
+        if explain_match:
+            kind, symbol = explain_match.groups()
+            shown = self._last_texts.get(chat_id)
+            if shown is None or shown[0] != kind:
+                await self.telegram.send_message(
+                    chat_id, "Нечего объяснять: покажите стакан или итог наблюдения заново.",
+                )
+                return
+            await self._run_scenario(
+                chat_id, user_id, "explain", symbol=symbol, payload=shown[1],
+            )
+            return
+        history_match = re.fullmatch(r"hist-(1|7):(.+)", action)
+        if history_match:
+            days, symbol = int(history_match.group(1)), history_match.group(2)
+            await self._run_scenario(
+                chat_id, user_id, "history", symbol=symbol,
+                as_of_ms=now_ms() - days * 86_400_000,
+            )
+            return
         await self.telegram.send_message(chat_id, "Сценарий будет доступен после настройки данных.")
 
     async def _ask_symbol(self, chat_id: int, action: str) -> None:
@@ -1030,7 +1136,20 @@ class Bot:
     async def _use_symbol(self, chat_id: int, user_id: int, action: str, symbol: str) -> None:
         if action == "book":
             text = await self.templates.book(symbol)
+            # Запоминаем показанное: кнопка «Объяснить» отправляет Claude
+            # ровно те числа, которые человек видит, и ни одного лишнего.
+            self._last_texts[chat_id] = ("book", text)
             await self.telegram.send_message(chat_id, text, reply_markup=_book_keyboard(symbol))
+            return
+        if action in {"analyse", "before"}:
+            await self._run_scenario(chat_id, user_id, action, symbol=symbol)
+            return
+        if action == "history":
+            await self.telegram.send_message(
+                chat_id,
+                f"⏪ Каким был {short_symbol(symbol)} до движения?",
+                reply_markup=_history_keyboard(symbol),
+            )
             return
         if action == "observe":
             await self.telegram.send_message(
@@ -1057,6 +1176,116 @@ class Bot:
         await self.telegram.send_message(
             chat_id, "Сценарий с Claude будет добавлен на следующем этапе."
         )
+
+    async def _run_scenario(
+        self,
+        chat_id: int,
+        user_id: int,
+        name: str,
+        *,
+        symbol: str | None = None,
+        payload: str | None = None,
+        as_of_ms: int | None = None,
+    ) -> None:
+        """Провести сценарий Claude: лимит, работа, подпись стоимости.
+
+        Порядок проверок важен. Лимит — до запроса: фактическую цену узнаём
+        только после ответа, и пускать сценарий, зная, что денег нет, значит
+        тратить их сверх решения владельца. Занятость — на пользователя: два
+        разбора подряд стоят вдвое и приходят вперемешку.
+        """
+        scenario = claude.SCENARIOS.get(name)
+        if scenario is None:
+            await self.telegram.send_message(chat_id, "Такого сценария нет.")
+            return
+        if self.assistant is None:
+            await self.telegram.send_message(
+                chat_id,
+                "🧠 Claude не настроен: нет ключа. Кнопки без 🧠 работают.",
+            )
+            return
+        stamp = now_ms()
+        spent = self.store.spent_since(day_start_ms(self.config.timezone, stamp))
+        if spent + claude.SCENARIO_ESTIMATE_USD > self.config.daily_budget_usd:
+            await self.telegram.send_message(
+                chat_id,
+                budget_refusal_text(spent, self.config.daily_budget_usd, self.config.timezone),
+            )
+            return
+        if user_id in self._busy:
+            await self.telegram.send_message(chat_id, "Уже разбираю, подождите.")
+            return
+
+        self._busy.add(user_id)
+        title = f"{short_symbol(symbol)} " if symbol else ""
+        progress = await self.telegram.send_message(
+            chat_id, f"⏳ {scenario.title.capitalize()} {title}— считаю…".replace("  ", " ")
+        )
+        try:
+            params = {
+                "symbol": symbol or "",
+                "short": short_symbol(symbol) if symbol else "",
+                "stamp": utc_stamp(stamp),
+                "payload": claude.scenario_payload(payload or ""),
+                "as_of_ms": as_of_ms or 0,
+                "as_of_stamp": utc_stamp(as_of_ms) if as_of_ms else "",
+            }
+            answer = await self.assistant.run(scenario, **params)
+        except Exception as error:  # noqa: BLE001 - кнопка не должна ронять polling
+            log.warning("сценарий %s не отработал: %s", name, error)
+            await self.telegram.send_message(
+                chat_id, f"⚠️ Claude не ответил: {error}. Деньги за это не списаны.",
+            )
+            return
+        finally:
+            self._busy.discard(user_id)
+
+        self.store.add_expense(
+            scenario=name, symbol=symbol, usage=answer.usage,
+            cost_usd=answer.cost_usd, stamp_ms=stamp,
+        )
+        today = self.store.spent_since(day_start_ms(self.config.timezone, stamp))
+        footer = (
+            f"\n\n─ {scenario.title} {claude.cost_words(answer.cost_usd)} · "
+            f"сегодня {claude.cost_words(today)} из ${self.config.daily_budget_usd:.0f}"
+        )
+        text = (answer.text or "Claude вернул пустой ответ.") + footer
+        keyboard = _scenario_keyboard(name, symbol)
+        message_id = (progress or {}).get("message_id")
+        edit = getattr(self.telegram, "edit_message", None)
+        if edit is not None and message_id:
+            try:
+                await edit(chat_id, int(message_id), text, reply_markup=keyboard)
+                return
+            except Exception as error:  # noqa: BLE001 - правка не обязана удаться
+                log.debug("правка сообщения не удалась: %s", error)
+        await self.telegram.send_message(chat_id, text, reply_markup=keyboard)
+
+    async def _morning_due(self, stamp_ms: int) -> bool:
+        """Пора ли слать утренний обзор — раз в сутки и без досылки задним числом."""
+        if not self.config.morning_time:
+            return False
+        zone = ZoneInfo(self.config.timezone)
+        local = dt.datetime.fromtimestamp(stamp_ms / 1000, zone)
+        if local.time() < dt.time.fromisoformat(self.config.morning_time):
+            return False
+        today = local.date().isoformat()
+        if self.store.get_meta("last_morning_date") == today:
+            return False
+        # Отмечаем ДО отправки: неудачная попытка не должна превращаться в
+        # цикл повторов, который съест дневной лимит за одно утро.
+        self.store.set_meta("last_morning_date", today)
+        return True
+
+    async def _send_morning(self) -> None:
+        """Обзор уходит в личный чат владельца — первому, кто написал /start."""
+        for user_id in self.config.allowed_user_ids:
+            chat_id = self.store.chat_for_user(user_id)
+            if chat_id is None:
+                continue
+            await self._run_scenario(chat_id, user_id, "morning")
+            return
+        log.info("утренний обзор некому слать: владелец не писал боту /start")
 
     async def _start_watch(self, chat_id: int, symbol: str, duration_min: int) -> None:
         """Б8: запускает тот же тикер, но задача принадлежит процессу бота.
@@ -1090,6 +1319,7 @@ class Bot:
             if task is not None:
                 await task
             text = await self.templates.watch_summary(watch_id)
+            self._last_texts[chat_id] = ("watch", text)
             await self.telegram.send_message(
                 chat_id, text, reply_markup=_watch_summary_keyboard(symbol)
             )
@@ -1155,6 +1385,27 @@ def _book_keyboard(symbol: str) -> list[list[dict[str, str]]]:
         ],
         [{"text": "🧠 Объяснить", "callback_data": encode_callback("explain-book", symbol)}],
     ]
+
+
+def _history_keyboard(symbol: str) -> list[list[dict[str, str]]]:
+    return [[
+        {"text": "Сутки назад", "callback_data": encode_callback("hist-1", symbol)},
+        {"text": "Неделю назад", "callback_data": encode_callback("hist-7", symbol)},
+    ]]
+
+
+def _scenario_keyboard(name: str, symbol: str | None) -> list[list[dict[str, str]]] | None:
+    """Следующий шаг под ответом: разбор ведёт к проверке и стакану."""
+    if symbol is None:
+        return None
+    book = {"text": "📊 Стакан", "callback_data": encode_callback("symbol-book", symbol)}
+    if name == "analyse":
+        before = encode_callback("symbol-before", symbol)
+        return [[{"text": "✅ Перед сделкой 🧠", "callback_data": before}, book]]
+    if name in {"before", "history"}:
+        analyse = encode_callback("symbol-analyse", symbol)
+        return [[{"text": "🔍 Разбор 🧠", "callback_data": analyse}, book]]
+    return None
 
 
 def _observe_keyboard(symbol: str) -> list[list[dict[str, str]]]:
