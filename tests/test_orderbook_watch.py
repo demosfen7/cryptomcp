@@ -31,7 +31,7 @@ def db(tmp_path):
 def _book(ts=NOW, *, extra_bid=False):
     bids = [["100", "10"], ["99.8", "20"]]
     if extra_bid:
-        bids.append(["99.6", "7"])
+        bids.append(["99.9", "7"])
     return build_order_book(
         {"bids": bids, "asks": [["100.2", "15"], ["100.4", "25"]]},
         timestamp_ms=ts,
@@ -100,7 +100,7 @@ def test_b10_5_new_level_is_written_as_appeared_diff_during_second_snapshot(db):
     appeared = next(event for event in events if event["event_type"] == "appeared")
     assert appeared == {
         "watch_id": watch["watch_id"], "ts": NOW + 1, "side": "bid",
-        "price": 99.6, "qty_before": 0.0, "qty_after": 7.0, "event_type": "appeared",
+        "price": 99.9, "qty_before": 0.0, "qty_after": 7.0, "event_type": "appeared",
     }
 
 
