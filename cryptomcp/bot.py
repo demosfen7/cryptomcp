@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
+import json
 import logging
 import os
 import re
@@ -388,6 +389,24 @@ def _move(row: dict[str, Any], scan: dict[str, Any]) -> float | None:
     return (float(current) / float(entry) - 1) * 100
 
 
+def chart_name(symbol: str, tf: str | None = None, market: str | None = None,
+               width: int = 0) -> str:
+    """Тикер, открывающий график по нажатию.
+
+    В списке двенадцать монет, и двенадцать адресов целиком растянули бы
+    сообщение на три экрана. Поэтому здесь адрес прячется в сам тикер, а
+    видимым текстом он стоит там, где монета одна: под стаканом, под разбором
+    и в уведомлении о дельте (замечание владельца 17.09.2026).
+
+    Ширина добивается пробелами СНАРУЖИ ссылки: внутри они попали бы под
+    подчёркивание и столбец поехал бы.
+    """
+    short = short_symbol(symbol)
+    url = tradingview_url(symbol, tf, market)
+    padding = " " * max(0, width - len(short))
+    return f'<a href="{url}">{short}</a>{padding}'
+
+
 def _stale_days(scan: dict[str, Any], now: int) -> str | None:
     """Насколько устарела запись скана, если она перестала обновляться."""
     closed = scan.get("closed_through_ms")
@@ -446,7 +465,8 @@ def render_watchlist_message(
             badges.append("🟢")
             has_accumulation = True
         line = (
-            f"{position:>2}. {short_symbol(str(row['symbol'])):<7} "
+            f"{position:>2}. "
+            f"{chart_name(str(row['symbol']), str(row['tf']), row.get('market'), 7)} "
             f"{quiet} · с входа {movement_text}"
         )
         if badges:
@@ -461,7 +481,7 @@ def render_watchlist_message(
             scan = scans.get((str(row["symbol"]), str(row["tf"]))) or {}
             movement = _move(row, scan)
             stale = _stale_days(scan, now)
-            text = short_symbol(str(row["symbol"]))
+            text = chart_name(str(row["symbol"]), str(row["tf"]), row.get("market"))
             text += f" {movement:+.1f}%" if movement is not None else " нет свежей цены"
             if stale is not None:
                 text += f" (данные {stale})"
@@ -669,8 +689,8 @@ def render_manual_message(
         else:
             entry, move = "цена не сохранена", "нет свежей цены"
         lines.append(
-            f"{short_symbol(str(row['symbol']))} · {row['tf']} · {entry} · "
-            f"с добавления {move} · {note}"
+            f"{chart_name(str(row['symbol']), str(row['tf']))} · {row['tf']} · "
+            f"{entry} · с добавления {move} · {note}"
         )
     return "\n".join(lines)
 
@@ -706,6 +726,18 @@ BOT_COMMANDS = (
 )
 
 COMMAND_ACTIONS = {"/list": "watchlist", "/book": "book", "/morning": "morning"}
+
+#: Команды, принимающие тикер аргументом: `/book ICP`. В группе у ботов по
+#: умолчанию включён режим приватности, и обычный текст до них не доходит —
+#: только команды и ответы на их сообщения. Замечание владельца 17.09.2026:
+#: тикер, написанный в группе обычным сообщением, пропал молча.
+SYMBOL_COMMANDS = {
+    "/book": "book",
+    "/analyse": "analyse",
+    "/before": "before",
+    "/watch": "observe",
+    "/add": "manual-add",
+}
 
 
 def main_menu() -> list[list[dict[str, str]]]:
@@ -1012,6 +1044,33 @@ def _merge_manual_rows(
     return merged
 
 
+class _PendingStore:
+    """Ожидаемый ответ пользователя, переживающий перезапуск бота."""
+
+    def __init__(self, store: BotStore, kind: str) -> None:
+        self._store = store
+        self._kind = kind
+
+    def _key(self, user_id: int) -> str:
+        return f"pending:{self._kind}:{user_id}"
+
+    def __setitem__(self, user_id: int, value: Any) -> None:
+        self._store.set_meta(self._key(user_id), json.dumps(value, ensure_ascii=False))
+
+    def pop(self, user_id: int, default: Any = None) -> Any:
+        raw = self._store.get_meta(self._key(user_id))
+        if raw is None:
+            return default
+        self._store.set_meta(self._key(user_id), "")
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            return default
+        if value is None:
+            return default
+        return tuple(value) if isinstance(value, list) else value
+
+
 class Bot:
     """Long-polling процесс и общий диспетчер команд.
 
@@ -1037,9 +1096,11 @@ class Bot:
         # работают, а кнопки с 🧠 честно говорят, что Claude не настроен.
         self.assistant = assistant if assistant is not None else claude.Assistant.from_env()
         self._offset: int | None = None
-        self._pending_symbol: dict[int, str] = {}
-        self._pending_note: dict[int, tuple[str, str, str]] = {}
-        self._pending_minutes: dict[int, str] = {}
+        # Шаг диалога хранится в базе, а не в памяти процесса: выкат между
+        # вопросом и ответом стирал бы его, и сообщение пропадало бы молча.
+        self._pending_symbol = _PendingStore(self.store, "symbol")
+        self._pending_note = _PendingStore(self.store, "note")
+        self._pending_minutes = _PendingStore(self.store, "minutes")
         self._busy: set[int] = set()
         self._last_texts: dict[int, tuple[str, str]] = {}
 
@@ -1098,6 +1159,12 @@ class Bot:
         if command in {"/start", "/menu"}:
             await self._show_menu(chat_id, greeting=command == "/start")
             return
+        argument = text.split(maxsplit=1)[1].strip() if " " in text else ""
+        if command in SYMBOL_COMMANDS and argument:
+            await self._use_symbol(
+                chat_id, user_id, SYMBOL_COMMANDS[command], _normalise_symbol(argument),
+            )
+            return
         if command in COMMAND_ACTIONS:
             await self._dispatch_action(chat_id, user_id, COMMAND_ACTIONS[command])
             return
@@ -1136,6 +1203,15 @@ class Bot:
         pending = self._pending_symbol.pop(user_id, None)
         if pending and text:
             await self._use_symbol(chat_id, user_id, pending, _normalise_symbol(text))
+            return
+        # Ответ на просьбу «напишите тикер» узнаётся и без памяти о шаге:
+        # в группе бот видит ответы на свои сообщения всегда, а состояние
+        # могло не пережить выкат.
+        replied = str(
+            (message.get("reply_to_message") or {}).get("text") or ""
+        )
+        if ASK_SYMBOL_TEXT in replied and text:
+            await self._use_symbol(chat_id, user_id, "analyse", _normalise_symbol(text))
             return
         await self._show_menu(chat_id)
 
@@ -1258,7 +1334,7 @@ class Bot:
         if action.startswith("type-"):
             self._pending_symbol[user_id] = action.removeprefix("type-")
             await self.telegram.send_message(
-                chat_id, "Напишите тикер: можно ID или IDUSDT.", force_reply=True
+                chat_id, _ask_symbol_text(chat_id), force_reply=True
             )
             return
         if action == "kb-hide":
@@ -1346,9 +1422,7 @@ class Bot:
             {"text": "⌨️ Ввести тикер", "callback_data": encode_callback(f"type-{action}")}
         ])
         await self.telegram.send_message(
-            chat_id,
-            "Напишите тикер: можно ID или IDUSDT.",
-            reply_markup=with_back(rows),
+            chat_id, _ask_symbol_text(chat_id), reply_markup=with_back(rows),
         )
 
     async def _use_symbol(self, chat_id: int, user_id: int, action: str, symbol: str) -> None:
@@ -1662,6 +1736,25 @@ class Bot:
                 reply_markup=_observe_keyboard(symbol),
             )
             self.store.finish_watch(str(row["watch_id"]), now_ms())
+
+
+ASK_SYMBOL_TEXT = "Напишите тикер"
+
+
+def _ask_symbol_text(chat_id: int) -> str:
+    """В группе просьба сопровождается подсказкой про ответ на сообщение.
+
+    У ботов в группах по умолчанию включён режим приватности: обычный текст до
+    них не доходит вовсе, и человек видит тишину вместо ответа (замечание
+    владельца 17.09.2026). Отрицательный chat_id — это группа или канал.
+    """
+    base = f"{ASK_SYMBOL_TEXT}: можно ID или IDUSDT."
+    if chat_id < 0:
+        return (
+            f"{base}\nВ группе ответьте на это сообщение (свайп влево) или "
+            "напишите командой: /book ICP, /analyse ICP, /watch ICP."
+        )
+    return base
 
 
 def _normalise_symbol(text: str) -> str:

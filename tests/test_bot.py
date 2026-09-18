@@ -165,12 +165,12 @@ def test_b4_watchlist_template_is_short_plain_language_and_legends_are_condition
     text = render_watchlist_message(rows, scans, now=1_789_870_000_000)
 
     assert "📋 Список наблюдения" in text
-    assert "ID      затишье 21 день · с входа +19.0%   ⬆ ⚠️ 🟢" in text
+    assert ">ID</a>      затишье 21 день · с входа +19.0%   ⬆ ⚠️ 🟢" in text
     assert "⬆⬇ сдвинулась" in text
     assert "⚠️ цена ушла" in text
     assert "🟢 при входе" in text
-    assert "\n 2. EUL" in text
-    assert "\n 2. EUL     затишье 9 дней · с входа -3.0%   ⬇" not in text
+    assert ">EUL</a>" in text
+    assert ">EUL</a>     затишье 9 дней · с входа -3.0%   ⬇" not in text
     assert len(text) < 1500
     assert not forbidden_words(text)
 
@@ -214,7 +214,7 @@ def test_manual_template_keeps_note_without_market_tool_text():
     )
 
     assert "⭐ Мои находки" in text
-    assert "SKYAI · 4h" in text
+    assert ">SKYAI</a> · 4h" in text
     assert "длинный коридор" in text
     assert not forbidden_words(text)
 
@@ -437,7 +437,7 @@ def test_watchlist_tail_shows_move_and_stale_mark_for_manual_rows():
 
     text = render_watchlist_message(rows, scans, now=now)
 
-    assert "Ваши: PHA +10.0%" in text
+    assert ">PHA</a> +10.0%" in text
     assert "(данные от" in text
 
 
@@ -980,3 +980,141 @@ async def test_second_watch_on_the_same_coin_offers_the_running_one(tmp_path, mo
         for row in telegram.messages[-1]["reply_markup"] for button in row
     ]
     assert "⏹ Снять" in buttons
+
+
+def _plain_bot(tmp_path, templates=None):
+    from cryptomcp.bot import Bot, BotConfig
+
+    telegram = FakeTelegram()
+    worker = Bot(
+        BotConfig(token="x", allowed_user_ids=(42,),
+                  database_path=str(tmp_path / "bot.sqlite")),
+        telegram=telegram, templates=templates, assistant=None,
+    )
+    return worker, telegram
+
+
+class BookTemplates:
+    def __init__(self):
+        self.asked: list[str] = []
+
+    async def book(self, symbol):
+        self.asked.append(symbol)
+        return f"📊 Стакан {symbol}"
+
+    async def symbol_suggestions(self):
+        return []
+
+
+@pytest.mark.asyncio
+async def test_command_with_a_ticker_works_in_a_group(tmp_path):
+    """В группе обычный текст до бота не доходит — команда доходит всегда."""
+    templates = BookTemplates()
+    worker, telegram = _plain_bot(tmp_path, templates)
+
+    await worker.handle_update(message(42, "/book icpusdt", chat_id=-100500))
+
+    assert templates.asked == ["ICPUSDT"]
+
+
+@pytest.mark.asyncio
+async def test_ticker_command_accepts_short_name(tmp_path):
+    templates = BookTemplates()
+    worker, telegram = _plain_bot(tmp_path, templates)
+
+    await worker.handle_update(message(42, "/book icp"))
+
+    assert templates.asked == ["ICPUSDT"]
+
+
+@pytest.mark.asyncio
+async def test_group_prompt_explains_how_to_answer(tmp_path):
+    worker, telegram = _plain_bot(tmp_path, BookTemplates())
+
+    await worker.handle_update(callback(42, "type-book", chat_id=-100500))
+
+    text = telegram.messages[-1]["text"]
+    assert "ответьте на это сообщение" in text.lower()
+    assert "/book" in text
+
+
+@pytest.mark.asyncio
+async def test_pending_step_survives_a_restart(tmp_path):
+    """Выкат между вопросом и ответом стирал шаг, и тикер пропадал молча."""
+    templates = BookTemplates()
+    worker, telegram = _plain_bot(tmp_path, templates)
+    await worker.handle_update(callback(42, "type-book"))
+
+    from cryptomcp.bot import Bot, BotConfig
+
+    restarted = Bot(
+        BotConfig(token="x", allowed_user_ids=(42,),
+                  database_path=str(tmp_path / "bot.sqlite")),
+        telegram=telegram, templates=templates, assistant=None,
+    )
+    await restarted.handle_update(message(42, "icpusdt"))
+
+    assert templates.asked == ["ICPUSDT"]
+
+
+@pytest.mark.asyncio
+async def test_reply_to_the_prompt_is_understood_without_state(tmp_path):
+    templates = BookTemplates()
+
+    class Templates(BookTemplates):
+        async def analyse(self, symbol):
+            return "разбор"
+
+    worker, telegram = _plain_bot(tmp_path, templates)
+    update = message(42, "icpusdt", chat_id=-100500)
+    update["message"]["reply_to_message"] = {"text": "Напишите тикер: можно ID или IDUSDT."}
+
+    handled = []
+    async def use(chat_id, user_id, action, symbol):
+        handled.append((action, symbol))
+
+    worker._use_symbol = use
+    await worker.handle_update(update)
+
+    assert handled == [("analyse", "ICPUSDT")]
+
+
+def test_watchlist_lines_link_to_the_chart():
+    """Замечание владельца: список приходил без ссылок на график."""
+    now = 1_789_870_000_000
+    rows = [{
+        "symbol": "RESOLVUSDT", "tf": "1d", "market": "spot",
+        "entered_by": "scanner", "last_rank": 1, "rank_at_entry": 1,
+        "price_at_entry": 0.016,
+    }]
+    scans = {("RESOLVUSDT", "1d"): {
+        "narrow_bars": 27, "price": 0.0165, "closed_through_ms": now - 3_600_000,
+    }}
+
+    text = render_watchlist_message(rows, scans, now=now)
+
+    assert '<a href="https://tradingview.com/chart/?symbol=BINANCE:RESOLVUSDT">' in text
+    assert ">RESOLV</a>" in text
+
+
+def test_watchlist_columns_stay_aligned_with_links():
+    """Пробелы добиваются снаружи ссылки, иначе столбец уезжает."""
+    now = 1_789_870_000_000
+    rows = [{
+        "symbol": "IDUSDT", "tf": "1d", "market": "futures", "entered_by": "scanner",
+        "last_rank": 1, "rank_at_entry": 1, "price_at_entry": 0.03,
+    }]
+    scans = {("IDUSDT", "1d"): {"narrow_bars": 22, "price": 0.03}}
+
+    text = render_watchlist_message(rows, scans, now=now)
+
+    assert ">ID</a>      затишье" in text
+
+
+def test_manual_list_links_to_the_chart():
+    text = render_manual_message(
+        [{"symbol": "PHAUSDT", "tf": "4h", "price_at_entry": 0.027, "note": "пробой"}],
+        now=1_789_870_000_000,
+    )
+
+    assert "tradingview.com/chart/?symbol=BINANCE:PHAUSDT" in text
