@@ -932,6 +932,39 @@ async def test_stopping_a_watch_ends_it_and_shows_what_was_seen(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_watch_buttons_carry_the_id_unchanged(tmp_path, monkeypatch):
+    """18.09.2026: id уходил в кнопку в верхнем регистре и не находился в базе.
+
+    Строка callback здесь берётся из настоящей клавиатуры, а не пишется руками:
+    так тесты выше и пропустили поломку.
+    """
+    from cryptomcp import server
+
+    watch_id = "watch_ab12cd34"
+    worker, telegram, templates = _watch_bot(
+        tmp_path, monkeypatch, running=(_session(watch_id=watch_id),)
+    )
+    worker.store.remember_watch(watch_id, 777, "ARBUSDT", 1)
+    ended: list[str] = []
+    monkeypatch.setattr(
+        server, "end_order_book_watch", lambda value: ended.append(value) or True
+    )
+
+    await worker.handle_update(callback(42, "watches"))
+    data = {
+        button["text"]: button["callback_data"]
+        for row in telegram.messages[-1]["reply_markup"] for button in row
+    }
+    snapshot = next(value for text, value in data.items() if "📸" in text)
+
+    await worker.handle_update(callback(42, snapshot))
+    await worker.handle_update(callback(42, data["⏹ Снять"]))
+
+    assert templates.asked[0] == watch_id
+    assert ended == [watch_id]
+
+
+@pytest.mark.asyncio
 async def test_custom_duration_is_asked_and_used(tmp_path, monkeypatch):
     worker, telegram, _ = _watch_bot(tmp_path, monkeypatch)
     started: list[tuple[str, int]] = []

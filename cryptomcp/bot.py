@@ -356,6 +356,16 @@ def encode_callback(action: str, symbol: str | None = None, tf: str | None = Non
     return result
 
 
+def watch_callback(action: str, watch_id: str) -> str:
+    """Кнопка сессии наблюдения: id передаётся как есть.
+
+    `encode_callback` поднимает регистр — для тикера это нормализация, а id
+    вида `watch_ab12cd34` после неё в базе не находится (18.09.2026 кнопки
+    «Что уже видно» и «Снять» отвечали, что данные удалены).
+    """
+    return encode_callback(action) + ":" + watch_id
+
+
 def short_symbol(symbol: str) -> str:
     """Показать тикер без USDT, не испортив китайское имя монеты."""
     return symbol.removesuffix("USDT")
@@ -1667,11 +1677,11 @@ class Bot:
             keys.append([
                 {
                     "text": f"📸 {short_symbol(str(row['symbol']))}",
-                    "callback_data": encode_callback("watch-now", watch_id),
+                    "callback_data": watch_callback("watch-now", watch_id),
                 },
                 {
                     "text": "⏹ Снять",
-                    "callback_data": encode_callback("watch-stop", watch_id),
+                    "callback_data": watch_callback("watch-stop", watch_id),
                 },
             ])
         await self.telegram.send_message(
@@ -1848,8 +1858,8 @@ def _observe_keyboard(symbol: str) -> list[list[dict[str, str]]]:
 def _running_watch_keyboard(watch_id: str, symbol: str) -> list[list[dict[str, str]]]:
     """Что можно сделать с идущим наблюдением: посмотреть сейчас или снять."""
     return with_back([[
-        {"text": "📸 Что уже видно", "callback_data": encode_callback("watch-now", watch_id)},
-        {"text": "⏹ Снять", "callback_data": encode_callback("watch-stop", watch_id)},
+        {"text": "📸 Что уже видно", "callback_data": watch_callback("watch-now", watch_id)},
+        {"text": "⏹ Снять", "callback_data": watch_callback("watch-stop", watch_id)},
     ]])
 
 
