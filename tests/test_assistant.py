@@ -21,7 +21,8 @@ class FakeAPI:
 
     async def __call__(self, payload, headers):
         self.payloads.append(payload)
-        assert headers["x-api-key"], "ключ обязан уходить заголовком, не в теле"
+        key = headers.get("x-api-key") or headers.get("authorization")
+        assert key, "ключ обязан уходить заголовком, не в теле"
         return self._replies.pop(0) if self._replies else self._replies_exhausted()
 
     @staticmethod
@@ -57,7 +58,8 @@ def test_cost_is_counted_from_usage_with_cache_prices():
 
     assert usage.cost_usd == pytest.approx(expected)
     assert cost_words(usage.cost_usd) == "1.2¢"
-    assert cost_words(0.0001) == "<1¢"
+    # Без «<»: в HTML Telegram это читалось как тег, и ответ не уходил.
+    assert cost_words(0.0001) == "0.01¢"
 
 
 def test_usage_sums_over_all_rounds():
@@ -170,3 +172,76 @@ def test_without_a_key_there_is_no_assistant(monkeypatch):
 
 def test_answer_reports_zero_cost_without_usage():
     assert Answer(text="пусто").cost_usd == 0.0
+
+
+def test_openai_usage_splits_cached_and_written_input():
+    """input_tokens у OpenAI уже включает кеш — иначе он оплачивался бы дважды."""
+    usage = Usage(prices=claude.OPENAI_PRICES)
+    usage.add_openai({
+        "input_tokens": 1_500,
+        "input_tokens_details": {"cached_tokens": 1_200, "cache_write_tokens": 250},
+        "output_tokens": 100,
+    })
+
+    assert (usage.input_tokens, usage.cache_read_tokens) == (50, 1_200)
+    assert usage.cache_creation_tokens == 250
+    expected = (50 * 0.10 + 250 * 0.125 + 1_200 * 0.01 + 100 * 0.50) / 1_000_000
+    assert usage.cost_usd == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_openai_tool_loop_echoes_output_and_returns_results(monkeypatch):
+    calls = []
+
+    async def fake_tool(name, arguments):
+        calls.append((name, arguments))
+        return "пусто"
+
+    monkeypatch.setattr(claude, "call_tool", fake_tool)
+    usage = {"input_tokens": 100, "output_tokens": 10}
+    reasoning = {"type": "reasoning", "id": "rs_1", "encrypted_content": "x"}
+    call = {
+        "type": "function_call", "call_id": "call_1",
+        "name": "get_watchlist", "arguments": '{"status": "all"}',
+    }
+    message = {
+        "type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": "Итоги"}],
+    }
+    api = FakeAPI([
+        {"output": [reasoning, call], "usage": usage},
+        {"output": [message], "usage": usage},
+    ])
+    history = [{"role": "user", "content": "привет"}, {"role": "assistant", "content": "да"}]
+
+    answer = await claude.OpenAIAssistant("key", http=api).run(
+        claude.SCENARIOS["chat"], history=history, payload="что в списке?",
+    )
+
+    assert answer.text == "Итоги"
+    assert calls == [("get_watchlist", {"status": "all"})]
+    first, second = api.payloads
+    assert first["model"] == "gpt-6-luna"
+    assert first["input"][:2] == history
+    assert first["tools"][0]["type"] == "function"
+    assert first["instructions"] == claude.CHAT_SYSTEM_PROMPT
+    assert second["input"][-3:] == [
+        reasoning, call,
+        {"type": "function_call_output", "call_id": "call_1", "output": "пусто"},
+    ]
+    assert answer.usage.input_tokens == 200
+
+
+def test_openai_key_wins_over_claude(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "a-test")
+
+    assert isinstance(Assistant.from_env(), claude.OpenAIAssistant)
+
+
+def test_model_html_is_escaped_except_bold():
+    from cryptomcp.bot import telegram_html
+
+    assert telegram_html("<b>ID</b> <5% · 0.01¢ & <i>") == (
+        "<b>ID</b> &lt;5% · 0.01¢ &amp; &lt;i&gt;"
+    )

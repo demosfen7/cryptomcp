@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
+import html
 import json
 import logging
 import os
@@ -439,6 +440,16 @@ def amount_usd(value: float) -> str:
     if absolute >= 1_000:
         return f"{value / 1_000:.0f} тыс. $"
     return f"{value:.0f} $"
+
+
+def telegram_html(text: str) -> str:
+    """Ответ модели в HTML Telegram: разрешён только <b>, остальное экранируется.
+
+    Одна угловая скобка («<1¢», «<5%») — и Telegram отказывает всему
+    сообщению, а человек видит вечное «считаю…» (поймано 25.09.2026).
+    """
+    escaped = html.escape(text, quote=False)
+    return escaped.replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
 
 
 def forbidden_words(text: str) -> set[str]:
@@ -1640,7 +1651,7 @@ class Bot:
             + f"\n\n─ {scenario.title} {claude.cost_words(answer.cost_usd)} · "
             f"сегодня {claude.cost_words(today)} из ${self.config.daily_budget_usd:.0f}"
         )
-        text = (answer.text or "Claude вернул пустой ответ.") + footer
+        text = telegram_html((answer.text or "Модель вернула пустой ответ.") + footer)
         keyboard = _scenario_keyboard(name, symbol)
         message_id = (progress or {}).get("message_id")
         edit = getattr(self.telegram, "edit_message", None)

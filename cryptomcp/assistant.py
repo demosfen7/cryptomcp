@@ -48,13 +48,25 @@ MAX_TOKENS = 2000
 MAX_ROUNDS = 6
 
 #: Цены Haiku 4.5, $ за миллион токенов (platform.claude.com/docs/en/about-claude/pricing).
-#: Стоимость
-#: считается по фактическому `usage` ответа, а не по этой оценке, — таблица
-#: нужна только чтобы перевести токены в деньги.
+#: Стоимость считается по фактическому `usage` ответа, а не по этой оценке, —
+#: таблица нужна только чтобы перевести токены в деньги.
 PRICE_INPUT = 1.0
 PRICE_CACHE_WRITE = 1.25
 PRICE_CACHE_READ = 0.1
 PRICE_OUTPUT = 5.0
+
+#: OpenAI: владелец выбрал gpt-6-luna 25.09.2026 как самую дешёвую. Работает,
+#: когда задан OPENAI_API_KEY; без него бот остаётся на Claude.
+OPENAI_URL = "https://api.openai.com/v1/responses"
+OPENAI_MODEL = os.environ.get("BOT_OPENAI_MODEL", "gpt-6-luna")
+#: Рассуждение оплачивается как вывод; для пересказа данных инструментов
+#: хватает низкого уровня.
+OPENAI_REASONING = os.environ.get("BOT_OPENAI_REASONING", "low")
+
+#: Цены gpt-6-luna, $ за миллион токенов (developers.openai.com, 25.09.2026):
+#: вход, запись в кеш, чтение из кеша, вывод — тот же порядок, что у Claude.
+OPENAI_PRICES = (0.10, 0.125, 0.01, 0.50)
+ANTHROPIC_PRICES = (PRICE_INPUT, PRICE_CACHE_WRITE, PRICE_CACHE_READ, PRICE_OUTPUT)
 
 #: Самый дорогой сценарий на Sonnet стоил 4–7¢ (замер 17.09.2026); Haiku вдвое
 #: дешевле, оценка оставлена с запасом.
@@ -233,6 +245,19 @@ class Usage:
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
     output_tokens: int = 0
+    prices: tuple[float, float, float, float] = ANTHROPIC_PRICES
+
+    def add_openai(self, payload: dict[str, Any]) -> None:
+        """Usage Responses API: input_tokens уже включает кешированные и записанные."""
+        details = dict(payload.get("input_tokens_details") or {})
+        cached = int(details.get("cached_tokens") or 0)
+        written = int(details.get("cache_write_tokens") or 0)
+        total = int(payload.get("input_tokens") or 0)
+        self.input_tokens += max(0, total - cached - written)
+        self.cache_read_tokens += cached
+        self.cache_creation_tokens += written
+        # Токены рассуждения входят в output_tokens и оплачиваются как вывод.
+        self.output_tokens += int(payload.get("output_tokens") or 0)
 
     def add(self, payload: dict[str, Any]) -> None:
         self.input_tokens += int(payload.get("input_tokens") or 0)
@@ -242,11 +267,12 @@ class Usage:
 
     @property
     def cost_usd(self) -> float:
+        price_input, price_write, price_read, price_output = self.prices
         return (
-            self.input_tokens * PRICE_INPUT
-            + self.cache_creation_tokens * PRICE_CACHE_WRITE
-            + self.cache_read_tokens * PRICE_CACHE_READ
-            + self.output_tokens * PRICE_OUTPUT
+            self.input_tokens * price_input
+            + self.cache_creation_tokens * price_write
+            + self.cache_read_tokens * price_read
+            + self.output_tokens * price_output
         ) / 1_000_000
 
 
@@ -329,8 +355,11 @@ class Assistant:
         self._timeout = timeout
 
     @classmethod
-    def from_env(cls) -> Assistant | None:
-        """Без ключа ассистента нет, и это штатный режим, а не ошибка."""
+    def from_env(cls) -> Assistant | OpenAIAssistant | None:
+        """Ключ OpenAI важнее ключа Claude; без обоих ассистента нет, и это штатно."""
+        openai_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+        if openai_key:
+            return OpenAIAssistant(openai_key)
         key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
         return cls(key) if key else None
 
@@ -429,11 +458,131 @@ class Assistant:
         )
 
 
+class OpenAIAssistant:
+    """Тот же цикл сценария через OpenAI Responses API.
+
+    Запрос не хранится у OpenAI (`store: false`), поэтому рассуждение модели
+    приходит зашифрованным и отсылается обратно вместе с остальным выводом:
+    без него следующий круг после вызова инструмента не соберётся.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        model: str = OPENAI_MODEL,
+        http: Any | None = None,
+        timeout: float = 120.0,
+    ) -> None:
+        self._api_key = api_key
+        self._model = model
+        self._http = http
+        self._timeout = timeout
+
+    async def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        headers = {
+            "authorization": f"Bearer {self._api_key}",
+            "content-type": "application/json",
+        }
+        if self._http is not None:
+            return await self._http(payload, headers)
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            response = await client.post(OPENAI_URL, json=payload, headers=headers)
+        if response.status_code != 200:
+            raise AssistantError(
+                f"OpenAI ответил {response.status_code}: {response.text[:200]}"
+            )
+        return dict(response.json())
+
+    async def run(
+        self,
+        scenario: Scenario,
+        *,
+        history: list[dict[str, str]] | None = None,
+        **params: Any,
+    ) -> Answer:
+        tools = [
+            {
+                "type": "function",
+                "name": tool["name"],
+                "description": tool["description"] or "",
+                "parameters": tool["input_schema"],
+                # Схемы MCP не обязаны проходить строгий режим OpenAI.
+                "strict": False,
+            }
+            for tool in await tool_definitions(scenario.tools)
+        ]
+        items: list[dict[str, Any]] = [
+            *(history or []),
+            {"role": "user", "content": scenario.instruction.format(**params)},
+        ]
+        usage = Usage(prices=OPENAI_PRICES)
+        for round_number in range(1, MAX_ROUNDS + 1):
+            payload: dict[str, Any] = {
+                "model": self._model,
+                "instructions": scenario.system,
+                "input": list(items),
+                # Рассуждение тратит тот же лимит вывода, что и ответ.
+                "max_output_tokens": MAX_TOKENS * 2,
+                "reasoning": {"effort": OPENAI_REASONING},
+                "store": False,
+                "include": ["reasoning.encrypted_content"],
+            }
+            if tools:
+                payload["tools"] = tools
+            body = await self._post(payload)
+            usage.add_openai(dict(body.get("usage") or {}))
+            output = list(body.get("output") or [])
+            items.extend(output)
+            calls = [item for item in output if item.get("type") == "function_call"]
+            if not calls:
+                text = "\n".join(
+                    str(part.get("text", ""))
+                    for item in output if item.get("type") == "message"
+                    for part in item.get("content") or []
+                    if part.get("type") == "output_text"
+                ).strip()
+                return Answer(text=text, usage=usage, rounds=round_number)
+            results = await asyncio.gather(*(
+                call_tool(str(call.get("name")), _arguments(call.get("arguments")))
+                for call in calls
+            ))
+            items.extend(
+                {"type": "function_call_output", "call_id": call.get("call_id"), "output": result}
+                for call, result in zip(calls, results, strict=True)
+            )
+        return Answer(
+            text=(
+                "Не успел собрать ответ: данных запрошено больше, чем "
+                "помещается в один разбор. Попробуйте ещё раз или спросите "
+                "конкретнее."
+            ),
+            usage=usage,
+            rounds=MAX_ROUNDS,
+            truncated=True,
+        )
+
+
+def _arguments(raw: Any) -> dict[str, Any]:
+    """Аргументы вызова у OpenAI приходят строкой JSON."""
+    if isinstance(raw, dict):
+        return raw
+    try:
+        value = json.loads(raw or "{}")
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def cost_words(value: float) -> str:
-    """Стоимость в центах; ниже цента — «<1¢», иначе сотые доллара не читаются."""
+    """Стоимость в центах; ниже цента — сотые цента, иначе дешёвый ответ выглядит нулём.
+
+    Раньше здесь было «<1¢», и Telegram в режиме HTML принимал это за тег и
+    отказывался отправлять ответ целиком (25.09.2026).
+    """
     cents = value * 100
     if cents < 1:
-        return "<1¢"
+        return f"{cents:.2f}¢"
     return f"{cents:.1f}¢"
 
 
