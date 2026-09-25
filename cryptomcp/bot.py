@@ -930,6 +930,10 @@ class TelegramAPI:
             payload["text"] = text
         await self.call("answerCallbackQuery", payload)
 
+    async def send_typing(self, chat_id: int) -> None:
+        """Статус «печатает…» — Telegram держит его около пяти секунд."""
+        await self.call("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+
 
 class TemplateService:
     """Получает данные шаблонов из тех же структур, что и MCP-инструменты.
@@ -1610,10 +1614,19 @@ class Bot:
             return
 
         self._busy.add(user_id)
-        title = f"{short_symbol(symbol)} " if symbol else ""
-        progress = await self.telegram.send_message(
-            chat_id, f"⏳ {scenario.title.capitalize()} {title}— считаю…".replace("  ", " ")
-        )
+        # Разговор выглядит разговором: вместо «⏳ считаю…» — статус
+        # «печатает…», а под ответом ни цены, ни кнопок (владелец, 25.09.2026).
+        # Цена остаётся у кнопок меню, где запрос тяжёлый и выбран осознанно.
+        chat = name == "chat"
+        progress = None
+        typing_task: asyncio.Task[None] | None = None
+        if chat:
+            typing_task = await self._start_typing(chat_id)
+        else:
+            title = f"{short_symbol(symbol)} " if symbol else ""
+            progress = await self.telegram.send_message(
+                chat_id, f"⏳ {scenario.title.capitalize()} {title}— считаю…".replace("  ", " ")
+            )
         try:
             params = {
                 "symbol": symbol or "",
@@ -1631,11 +1644,13 @@ class Bot:
         except Exception as error:  # noqa: BLE001 - кнопка не должна ронять polling
             log.warning("сценарий %s не отработал: %s", name, error)
             await self.telegram.send_message(
-                chat_id, f"⚠️ Claude не ответил: {error}. Деньги за это не списаны.",
+                chat_id, f"⚠️ ИИ не ответил: {error}. Деньги за это не списаны.",
             )
             return
         finally:
             self._busy.discard(user_id)
+            if typing_task is not None:
+                typing_task.cancel()
 
         self.store.add_expense(
             scenario=name, symbol=symbol, usage=answer.usage,
@@ -1651,8 +1666,10 @@ class Bot:
             + f"\n\n─ {scenario.title} {claude.cost_words(answer.cost_usd)} · "
             f"сегодня {claude.cost_words(today)} из ${self.config.daily_budget_usd:.0f}"
         )
+        if chat:
+            footer = ""
         text = telegram_html((answer.text or "Модель вернула пустой ответ.") + footer)
-        keyboard = _scenario_keyboard(name, symbol)
+        keyboard = None if chat else _scenario_keyboard(name, symbol)
         message_id = (progress or {}).get("message_id")
         edit = getattr(self.telegram, "edit_message", None)
         if edit is not None and message_id:
@@ -1662,6 +1679,27 @@ class Bot:
             except Exception as error:  # noqa: BLE001 - правка не обязана удаться
                 log.debug("правка сообщения не удалась: %s", error)
         await self.telegram.send_message(chat_id, text, reply_markup=keyboard)
+
+    async def _keep_typing(self, chat_id: int) -> None:
+        """Держать «печатает…», пока модель думает: сам статус гаснет за ~5 с."""
+        typing = getattr(self.telegram, "send_typing", None)
+        if typing is None:
+            return
+        while True:
+            try:
+                await typing(chat_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - статус не важнее ответа
+                log.debug("статус «печатает» не отправлен: %s", error)
+                return
+            await asyncio.sleep(4)
+
+    async def _start_typing(self, chat_id: int) -> asyncio.Task[None]:
+        """Первый статус — сразу, продление — в фоне, пока идёт ответ."""
+        task = asyncio.create_task(self._keep_typing(chat_id))
+        await asyncio.sleep(0)  # Дать задаче отправить первый статус до запроса.
+        return task
 
     async def _morning_due(self, stamp_ms: int) -> bool:
         """Пора ли слать утренний обзор — раз в сутки и без досылки задним числом."""

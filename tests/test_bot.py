@@ -635,7 +635,7 @@ async def test_claude_failure_says_no_money_was_spent(tmp_path):
     await worker.handle_update(callback(42, "weekly"))
 
     text = telegram.messages[-1]["text"]
-    assert "Claude не ответил" in text and "не списаны" in text
+    assert "ИИ не ответил" in text and "не списаны" in text
     from cryptomcp.bot import day_start_ms, now_ms
     assert worker.store.spent_since(day_start_ms("Europe/Berlin", now_ms())) == 0.0
 
@@ -1186,6 +1186,39 @@ async def test_free_text_is_a_conversation_with_memory(tmp_path):
     await worker.handle_update(message(42, "/new"))
     await worker.handle_update(message(42, "снова"))
     assert seen[-1] == []
+
+
+@pytest.mark.asyncio
+async def test_conversation_reply_has_no_progress_price_or_buttons(tmp_path):
+    """Разговор без «⏳ считаю…», подписи с ценой и кнопки меню (25.09.2026)."""
+    typed = []
+
+    class Telegram(FakeTelegram):
+        async def send_typing(self, chat_id):
+            typed.append(chat_id)
+
+    from cryptomcp.bot import Bot, BotConfig
+
+    telegram = Telegram()
+    worker = Bot(
+        BotConfig(token="x", allowed_user_ids=(42,), database_path=str(tmp_path / "b.sqlite")),
+        telegram=telegram, assistant=FakeAssistant(text="Привет 🙂"),
+    )
+
+    await worker.handle_update(message(42, "привет"))
+
+    assert [m["text"] for m in telegram.messages] == ["Привет 🙂"]
+    assert telegram.messages[0].get("reply_markup") is None
+    assert typed == [777]
+
+
+@pytest.mark.asyncio
+async def test_menu_scenario_still_shows_its_price(tmp_path):
+    worker, telegram = _bot_with(FakeAssistant(), tmp_path)
+
+    await worker.handle_update(callback(42, "weekly"))
+
+    assert "сегодня" in telegram.messages[-1]["text"]
 
 
 @pytest.mark.asyncio
