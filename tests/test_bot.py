@@ -492,14 +492,14 @@ async def test_daily_limit_is_checked_before_the_request(tmp_path):
 
     worker.store.add_expense(
         scenario="analyse", symbol="IDUSDT", usage=assistant.answer.usage,
-        cost_usd=0.95, stamp_ms=max(now_ms(), day_start_ms("Europe/Berlin", now_ms())),
+        cost_usd=0.97, stamp_ms=max(now_ms(), day_start_ms("Europe/Berlin", now_ms())),
     )
 
     await worker.handle_update(callback(42, "weekly"))
 
     assert assistant.calls == [], "запроса к Claude быть не должно"
     assert "Лимит на сегодня исчерпан" in telegram.messages[-1]["text"]
-    assert "95" in telegram.messages[-1]["text"]
+    assert "97" in telegram.messages[-1]["text"]
 
 
 @pytest.mark.asyncio
@@ -1151,3 +1151,46 @@ def test_manual_list_links_to_the_chart():
     )
 
     assert "tradingview.com/chart/?symbol=BINANCE:PHAUSDT" in text
+
+
+@pytest.mark.asyncio
+async def test_free_text_is_a_conversation_with_memory(tmp_path):
+    """Обычный текст — разговор; прошлые реплики уходят модели вместе с новой."""
+    from cryptomcp.assistant import DIALOG_MEMORY
+
+    seen = []
+
+    class Talker(FakeAssistant):
+        async def run(self, scenario, *, history=None, **params):
+            seen.append(list(history or []))
+            return await super().run(scenario, **params)
+
+    assistant = Talker(text="привет")
+    worker, telegram = _bot_with(assistant, tmp_path)
+
+    await worker.handle_update(message(42, "как дела"))
+    await worker.handle_update(message(42, "а что с 1000rats"))
+
+    assert [name for name, _ in assistant.calls] == ["chat", "chat"]
+    assert seen[0] == []
+    assert seen[1] == [
+        {"role": "user", "content": "как дела"},
+        {"role": "assistant", "content": "привет"},
+    ]
+
+    for index in range(DIALOG_MEMORY):
+        await worker.handle_update(message(42, f"вопрос {index}"))
+    assert len(seen[-1]) == DIALOG_MEMORY
+    assert seen[-1][0]["role"] == "user"
+
+    await worker.handle_update(message(42, "/new"))
+    await worker.handle_update(message(42, "снова"))
+    assert seen[-1] == []
+
+
+@pytest.mark.asyncio
+async def test_morning_is_off_by_default(tmp_path):
+    """Утренний обзор тратил деньги каждый день — по умолчанию его нет."""
+    worker, _ = _bot_with(FakeAssistant(), tmp_path)
+
+    assert await worker._morning_due(10**13) is False

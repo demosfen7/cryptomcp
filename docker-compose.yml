@@ -106,7 +106,7 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       BOT_DAILY_BUDGET_USD: ${BOT_DAILY_BUDGET_USD:-1.0}
       BOT_TIMEZONE: ${BOT_TIMEZONE:-Europe/Berlin}
-      BOT_MORNING_TIME: ${BOT_MORNING_TIME:-08:00}
+      BOT_MORNING_TIME: ${BOT_MORNING_TIME:-}
     volumes:
       - cryptomcp_data:/app/data
     healthcheck:

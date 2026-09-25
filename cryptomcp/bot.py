@@ -41,7 +41,9 @@ POLL_TIMEOUT_S = 30
 CALLBACK_LIMIT_BYTES = 64
 DEFAULT_DAILY_BUDGET_USD = 1.0
 DEFAULT_TIMEZONE = "Europe/Berlin"
-DEFAULT_MORNING_TIME = "08:00"
+#: Пусто — утренний обзор выключен: владелец отключил его 25.09.2026, он тратил
+#: деньги каждое утро. Включить — BOT_MORNING_TIME=08:00.
+DEFAULT_MORNING_TIME = ""
 
 #: Сколько часов после назначенного времени обзор ещё имеет смысл. Вечером он
 #: уже не утренний, а пропущенное утро не досылается (Б7).
@@ -94,6 +96,16 @@ CREATE TABLE IF NOT EXISTS bot_expenses (
 );
 
 CREATE INDEX IF NOT EXISTS bot_expenses_created_at ON bot_expenses (created_at);
+
+CREATE TABLE IF NOT EXISTS bot_dialog (
+    id INTEGER PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS bot_dialog_chat ON bot_dialog (chat_id, id);
 
 CREATE TABLE IF NOT EXISTS bot_watches (
     watch_id TEXT PRIMARY KEY,
@@ -274,6 +286,49 @@ class BotStore:
                 (stamp_ms,),
             ).fetchone()
             return float(row["total"] or 0.0)
+        finally:
+            con.close()
+
+    def add_dialog(self, chat_id: int, role: str, text: str, stamp_ms: int) -> None:
+        """Реплика диалога; хвост старше памяти модели сразу стирается."""
+        con = self._con()
+        try:
+            con.execute(
+                "INSERT INTO bot_dialog(chat_id, role, text, created_at) VALUES (?, ?, ?, ?)",
+                (chat_id, role, text, stamp_ms),
+            )
+            con.execute(
+                "DELETE FROM bot_dialog WHERE chat_id = ? AND id NOT IN ("
+                "SELECT id FROM bot_dialog WHERE chat_id = ? ORDER BY id DESC LIMIT ?)",
+                (chat_id, chat_id, claude.DIALOG_MEMORY),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def dialog(self, chat_id: int) -> list[dict[str, str]]:
+        """Последние реплики в формате Messages API, начиная с реплики человека."""
+        con = self._con()
+        try:
+            rows = con.execute(
+                "SELECT role, text FROM bot_dialog WHERE chat_id = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (chat_id, claude.DIALOG_MEMORY),
+            ).fetchall()
+        finally:
+            con.close()
+        turns = [{"role": str(row["role"]), "content": str(row["text"])} for row in reversed(rows)]
+        # API требует начинать с user и чередовать роли; обрезка по лимиту
+        # могла оставить первым ответ модели.
+        while turns and turns[0]["role"] != "user":
+            turns.pop(0)
+        return turns
+
+    def clear_dialog(self, chat_id: int) -> None:
+        con = self._con()
+        try:
+            con.execute("DELETE FROM bot_dialog WHERE chat_id = ?", (chat_id,))
+            con.commit()
         finally:
             con.close()
 
@@ -732,6 +787,7 @@ BOT_COMMANDS = (
     ("list", "список наблюдения"),
     ("book", "стакан монеты"),
     ("morning", "утренний обзор"),
+    ("new", "забыть разговор"),
     ("id", "показать мой id"),
 )
 
@@ -775,7 +831,7 @@ def reply_menu() -> dict[str, Any]:
         "keyboard": rows,
         "resize_keyboard": True,
         "is_persistent": True,
-        "input_field_placeholder": "Выберите кнопку или напишите тикер",
+        "input_field_placeholder": "Кнопка или вопрос обычным текстом",
     }
 
 
@@ -1169,6 +1225,10 @@ class Bot:
         if command in {"/start", "/menu"}:
             await self._show_menu(chat_id, greeting=command == "/start")
             return
+        if command == "/new":
+            self.store.clear_dialog(chat_id)
+            await self.telegram.send_message(chat_id, "Разговор забыт, начнём заново.")
+            return
         argument = text.split(maxsplit=1)[1].strip() if " " in text else ""
         if command in SYMBOL_COMMANDS and argument:
             await self._use_symbol(
@@ -1222,6 +1282,11 @@ class Bot:
         )
         if ASK_SYMBOL_TEXT in replied and text:
             await self._use_symbol(chat_id, user_id, "analyse", _normalise_symbol(text))
+            return
+        # Всё остальное — разговор с Claude. Неизвестная команда не в счёт:
+        # это опечатка, а не вопрос.
+        if text and not text.startswith("/"):
+            await self._run_scenario(chat_id, user_id, "chat", payload=text)
             return
         await self._show_menu(chat_id)
 
@@ -1547,7 +1612,11 @@ class Bot:
                 "as_of_ms": as_of_ms or 0,
                 "as_of_stamp": utc_stamp(as_of_ms) if as_of_ms else "",
             }
-            answer = await self.assistant.run(scenario, **params)
+            history = self.store.dialog(chat_id) if name == "chat" else None
+            if history is None:
+                answer = await self.assistant.run(scenario, **params)
+            else:
+                answer = await self.assistant.run(scenario, history=history, **params)
         except Exception as error:  # noqa: BLE001 - кнопка не должна ронять polling
             log.warning("сценарий %s не отработал: %s", name, error)
             await self.telegram.send_message(
@@ -1561,6 +1630,9 @@ class Bot:
             scenario=name, symbol=symbol, usage=answer.usage,
             cost_usd=answer.cost_usd, stamp_ms=stamp,
         )
+        if name == "chat" and answer.text and not answer.truncated:
+            self.store.add_dialog(chat_id, "user", params["payload"], stamp)
+            self.store.add_dialog(chat_id, "assistant", answer.text, now_ms())
         today = self.store.spent_since(day_start_ms(self.config.timezone, stamp))
         chart = f"{tradingview_url(symbol, market='futures')}" if symbol else ""
         footer = (

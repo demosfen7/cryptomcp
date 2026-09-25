@@ -53,10 +53,10 @@ def test_cost_is_counted_from_usage_with_cache_prices():
         cache_read_tokens=10_000, output_tokens=1_500,
     )
 
-    expected = (1_000 * 2.0 + 2_000 * 2.5 + 10_000 * 0.2 + 1_500 * 10.0) / 1_000_000
+    expected = (1_000 * 1.0 + 2_000 * 1.25 + 10_000 * 0.1 + 1_500 * 5.0) / 1_000_000
 
     assert usage.cost_usd == pytest.approx(expected)
-    assert cost_words(usage.cost_usd) == "2.4¢"
+    assert cost_words(usage.cost_usd) == "1.2¢"
     assert cost_words(0.0001) == "<1¢"
 
 

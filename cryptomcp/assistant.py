@@ -33,9 +33,10 @@ log = logging.getLogger("cryptomcp.assistant")
 API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
 
-#: Модель выбрана владельцем 17.09.2026: разборы Haiku получались пересказом
-#: цифр, Opus стоил бы втрое дороже при том же объёме ответа.
-MODEL = os.environ.get("BOT_CLAUDE_MODEL", "claude-sonnet-5")
+#: Модель выбрана владельцем 25.09.2026: самая дешёвая. До этого стоял Sonnet 5
+#: (разборы Haiku получались пересказом цифр) — вернуть его можно переменной
+#: BOT_CLAUDE_MODEL=claude-sonnet-5, но тогда поправить и цены ниже.
+MODEL = os.environ.get("BOT_CLAUDE_MODEL", "claude-haiku-4-5")
 
 #: Ответ в одно сообщение Telegram — это около 2000 символов; дальше модель
 #: начинает пересказывать сама себя.
@@ -46,19 +47,23 @@ MAX_TOKENS = 2000
 #: зацикливание на инструменте перестаёт стоить денег.
 MAX_ROUNDS = 6
 
-#: Цены Sonnet 5, $ за миллион токенов. Сняты со страницы
-#: platform.claude.com/docs/en/about-claude/pricing 17.09.2026. Стоимость
+#: Цены Haiku 4.5, $ за миллион токенов (platform.claude.com/docs/en/about-claude/pricing). Стоимость
 #: считается по фактическому `usage` ответа, а не по этой оценке, — таблица
 #: нужна только чтобы перевести токены в деньги.
-PRICE_INPUT = 2.0
-PRICE_CACHE_WRITE = 2.5
-PRICE_CACHE_READ = 0.2
-PRICE_OUTPUT = 10.0
+PRICE_INPUT = 1.0
+PRICE_CACHE_WRITE = 1.25
+PRICE_CACHE_READ = 0.1
+PRICE_OUTPUT = 5.0
 
-#: Столько стоил самый дорогой сценарий на замере 17.09.2026 (4–7¢) с запасом.
+#: Самый дорогой сценарий на Sonnet стоил 4–7¢ (замер 17.09.2026); Haiku вдвое
+#: дешевле, оценка оставлена с запасом.
 #: Нужна до запроса: фактическую цену узнаём только после ответа, а решать,
 #: пускать ли сценарий в дневной лимит, надо заранее.
-SCENARIO_ESTIMATE_USD = 0.10
+SCENARIO_ESTIMATE_USD = 0.05
+
+#: Сколько прошлых реплик диалога уходит модели вместе с новой: вопрос и ответ
+#: — две реплики, так что это последние семь обменов.
+DIALOG_MEMORY = 14
 
 SYSTEM_PROMPT = """Ты — аналитик рынка криптовалют в Telegram-боте. Тебе дают инструменты с
 данными Binance. Отвечаешь человеку, который не хочет тонуть в цифрах.
@@ -83,6 +88,20 @@ SYSTEM_PROMPT = """Ты — аналитик рынка криптовалют �
 9. Когда два признака противоречат друг другу, скажи об этом, а не выбирай
    удобный."""
 
+#: Свободный разговор: без жёсткого шаблона ответа, но с теми же запретами.
+CHAT_SYSTEM_PROMPT = """Ты — помощник по рынку криптовалют в Telegram-боте владельца. С тобой
+разговаривают обычными сообщениями; в переписке есть память о последних репликах.
+Отвечай по-русски, по существу и коротко — как в мессенджере. На болтовню
+отвечай просто, без инструментов. Когда спрашивают про рынок или монету —
+бери данные Binance инструментами, а не из головы. Тикер пиши без USDT, в
+инструменты передавай с USDT (1000rats → 1000RATSUSDT).
+
+Не используй жаргон индикаторов (перцентиль, ATR, BBW, EMA, RSI, OI, squeeze
+и т. п.) — объясняй смысл словами. Никогда не пиши «купи», «продай», «вход»,
+«цель», «стоп» и не давай вероятностей роста: говори о готовности к движению
+и уровнях. Если данных не хватает — так и скажи. Ответ до 2000 символов,
+разметка Telegram HTML: только <b>."""
+
 
 @dataclass(frozen=True)
 class Scenario:
@@ -93,6 +112,7 @@ class Scenario:
     tools: tuple[str, ...]
     instruction: str
     needs_symbol: bool = False
+    system: str = SYSTEM_PROMPT
 
 
 SCENARIOS: dict[str, Scenario] = {
@@ -180,6 +200,16 @@ SCENARIOS: dict[str, Scenario] = {
             "из коридора и в какую сторону, сколько просто выпало, лучшая и "
             "худшая монета. Списки бери со status='all'."
         ),
+    ),
+    "chat": Scenario(
+        name="chat",
+        title="ответ",
+        tools=(
+            "get_market_snapshot", "get_squeeze_metrics", "get_key_levels",
+            "get_derivatives", "get_watchlist", "get_accumulation",
+        ),
+        system=CHAT_SYSTEM_PROMPT,
+        instruction="{payload}",
     ),
     "explain": Scenario(
         name="explain",
@@ -319,21 +349,33 @@ class Assistant:
             )
         return dict(response.json())
 
-    async def run(self, scenario: Scenario, **params: Any) -> Answer:
-        """Провести сценарий: инструменты, ответ и цена по фактическому usage."""
+    async def run(
+        self,
+        scenario: Scenario,
+        *,
+        history: list[dict[str, str]] | None = None,
+        **params: Any,
+    ) -> Answer:
+        """Провести сценарий: инструменты, ответ и цена по фактическому usage.
+
+        `history` — прошлые реплики диалога ({"role", "content"}), только
+        тексты: вызовы инструментов в память не попадают, иначе каждая
+        реплика тащила бы за собой килобайты данных.
+        """
         tools = await tool_definitions(scenario.tools)
         # Кешируется постоянная часть запроса: инструкция и описания
         # инструментов. Внутри сценария идут 2–3 обращения, и повтор префикса
         # стоит десятую часть цены.
         system = [{
             "type": "text",
-            "text": SYSTEM_PROMPT,
+            "text": scenario.system,
             "cache_control": {"type": "ephemeral"},
         }]
         if tools:
             tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
         messages: list[dict[str, Any]] = [
-            {"role": "user", "content": scenario.instruction.format(**params)}
+            *(history or []),
+            {"role": "user", "content": scenario.instruction.format(**params)},
         ]
         usage = Usage()
         for round_number in range(1, MAX_ROUNDS + 1):
