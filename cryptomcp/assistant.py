@@ -47,7 +47,8 @@ MAX_TOKENS = 2000
 #: зацикливание на инструменте перестаёт стоить денег.
 MAX_ROUNDS = 6
 
-#: Цены Haiku 4.5, $ за миллион токенов (platform.claude.com/docs/en/about-claude/pricing). Стоимость
+#: Цены Haiku 4.5, $ за миллион токенов (platform.claude.com/docs/en/about-claude/pricing).
+#: Стоимость
 #: считается по фактическому `usage` ответа, а не по этой оценке, — таблица
 #: нужна только чтобы перевести токены в деньги.
 PRICE_INPUT = 1.0
