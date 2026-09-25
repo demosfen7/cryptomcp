@@ -575,15 +575,15 @@ def _arguments(raw: Any) -> dict[str, Any]:
 
 
 def cost_words(value: float) -> str:
-    """Стоимость в центах; ниже цента — сотые цента, иначе дешёвый ответ выглядит нулём.
+    """Стоимость в долларах — так попросил владелец 25.09.2026 вместо центов.
 
-    Раньше здесь было «<1¢», и Telegram в режиме HTML принимал это за тег и
-    отказывался отправлять ответ целиком (25.09.2026).
+    Точность растёт по мере убывания суммы, иначе ответ за четверть цента
+    выглядел бы нулём: $0.0023, $0.062, $1.25. Без «<»: в HTML Telegram это
+    читалось как тег, и ответ не отправлялся целиком.
     """
-    cents = value * 100
-    if cents < 1:
-        return f"{cents:.2f}¢"
-    return f"{cents:.1f}¢"
+    digits = 4 if value < 0.01 else 3 if value < 1 else 2
+    text = f"{value:.{digits}f}".rstrip("0").rstrip(".")
+    return f"${text or '0'}"
 
 
 def scenario_payload(text: str, limit: int = 4000) -> str:
